@@ -1,0 +1,79 @@
+{
+  "id": "quiz_sync_mastery",
+  "title": "Mental Model Check: Realtime Sync Engine v2",
+  "topic": "Architecture & Drift Detection",
+  "description": "Verify your understanding of the latest storage, transport, and staleness decisions.",
+  "questions": [
+    {
+      "id": "q1",
+      "prompt": "Which persistence layer did dec_003 adopt to replace the earlier Redis Pub/Sub proposal?",
+      "type": "multiple_choice",
+      "options": [
+        "Managed Postgres with pgvector",
+        "Git-backed plain YAML/Markdown files + append-only events.jsonl",
+        "Browser IndexedDB synced via WebRTC",
+        "In-memory Redis Cluster"
+      ],
+      "correctIndex": 1,
+      "explanation": "dec_003 superseded dec_001 to eliminate external daemon dependencies and make every context update git-diffable and merge-friendly.",
+      "relatedDecisionIds": [
+        "dec_003"
+      ]
+    },
+    {
+      "id": "q2",
+      "prompt": "What happens automatically when a new Decision supersedes an older Decision ID?",
+      "type": "multiple_choice",
+      "options": [
+        "Old diagrams and videos are permanently deleted",
+        "Artifacts referencing the old Decision are flagged as Stale, and behind Sessions show revision lag",
+        "Nothing until you manually edit every Markdown file",
+        "All connected agents are immediately terminated"
+      ],
+      "correctIndex": 1,
+      "explanation": "ContextDeck preserves history while surfacing exact staleness reasons on dependent artifacts and missed events on drifted sessions.",
+      "relatedDecisionIds": [
+        "dec_003"
+      ]
+    },
+    {
+      "id": "q3",
+      "prompt": "How can a web-only harness like Grok (without local MCP support) stay synced with a board?",
+      "type": "multiple_choice",
+      "options": [
+        "It cannot connect at all",
+        "By copying the 1-click Context Pack into chat and pasting back its structured JSON update",
+        "By installing a browser kernel driver",
+        "Only by committing directly to GitHub"
+      ],
+      "correctIndex": 1,
+      "explanation": "Context Packs + Paste Update let zero-tool web chats read the current mental model and contribute decisions, tasks, and summaries back.",
+      "relatedDecisionIds": [
+        "dec_002"
+      ]
+    }
+  ],
+  "attempts": [
+    {
+      "id": "att_a3851a92",
+      "takenAt": "2026-11-25T23:31:58.075Z",
+      "score": 2,
+      "total": 3,
+      "percentage": 67,
+      "confidence": 4,
+      "answers": {
+        "q1": 1,
+        "q2": 1,
+        "q3": 0
+      }
+    }
+  ],
+  "basedOnDecisions": [
+    "dec_002",
+    "dec_003"
+  ],
+  "sessionId": "sess_grok_research",
+  "boardRevisionAtUpdate": 17,
+  "createdAt": "2026-11-25T23:31:58.072Z",
+  "updatedAt": "2026-11-25T23:31:58.075Z"
+}

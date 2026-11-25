@@ -1,0 +1,15 @@
+id: sess_claude_storage
+title: Refactor Storage to Git-Backed Files
+harness: claude-code
+parentSessionId: sess_arch_root
+relatedSessionIds: []
+status: active
+summary: >-
+  Replaced Redis proposal with plain Git-backed files + append-only events.jsonl; recorded dec_003
+  superseding dec_001.
+focusFiles:
+  - packages/core/src/store.ts
+  - packages/core/src/drift.ts
+lastSyncedRevision: 3
+createdAt: '2026-11-25T23:31:57.975Z'
+updatedAt: '2026-11-25T23:31:57.975Z'

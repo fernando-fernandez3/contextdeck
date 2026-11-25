@@ -1,0 +1,12 @@
+id: sess_codex_bench
+title: Benchmark SSE Fan-Out & File Watcher
+harness: codex
+parentSessionId: sess_claude_storage
+relatedSessionIds: []
+status: completed
+summary: Verified <12ms local propagation with chokidar + SSE across 25 concurrent tabs.
+focusFiles:
+  - packages/server/src/app.ts
+lastSyncedRevision: 4
+createdAt: '2026-11-25T23:31:57.983Z'
+updatedAt: '2026-11-25T23:31:57.983Z'

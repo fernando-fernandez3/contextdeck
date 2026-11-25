@@ -1,0 +1,12 @@
+id: sess_grok_research
+title: Compare Drift Detection Patterns
+harness: grok
+parentSessionId: sess_arch_root
+relatedSessionIds:
+  - sess_claude_storage
+status: paused
+summary: Explored ADR dependency graphs and mental-model staleness indicators.
+focusFiles: []
+lastSyncedRevision: 5
+createdAt: '2026-11-25T23:31:57.989Z'
+updatedAt: '2026-11-25T23:31:58.083Z'

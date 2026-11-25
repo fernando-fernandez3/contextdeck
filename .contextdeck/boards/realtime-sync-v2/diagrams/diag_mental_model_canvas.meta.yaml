@@ -1,0 +1,11 @@
+id: diag_mental_model_canvas
+title: Mental Model Whiteboard (Excalidraw)
+kind: excalidraw
+description: Editable visual canvas shared between you and connected agents.
+basedOnDecisions:
+  - dec_002
+  - dec_003
+sessionId: sess_claude_storage
+boardRevisionAtUpdate: 10
+createdAt: '2026-11-25T23:31:58.032Z'
+updatedAt: '2026-11-25T23:31:58.032Z'

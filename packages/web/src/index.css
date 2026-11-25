@@ -1,0 +1,83 @@
+@import "tailwindcss";
+@import "@xyflow/react/dist/style.css";
+@import "@excalidraw/excalidraw/index.css";
+
+@layer base {
+  body {
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+}
+
+/* Clean Markdown prose styling */
+.md-prose h1 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  margin-bottom: 0.75rem;
+  color: #f4f4f5;
+}
+.md-prose h2 {
+  font-size: 1.125rem;
+  font-weight: 600;
+  margin-top: 1.25rem;
+  margin-bottom: 0.5rem;
+  color: #e4e4e7;
+  border-bottom: 1px solid #27272a;
+  padding-bottom: 0.25rem;
+}
+.md-prose h3 {
+  font-size: 0.975rem;
+  font-weight: 600;
+  margin-top: 1rem;
+  margin-bottom: 0.35rem;
+  color: #d4d4d8;
+}
+.md-prose p {
+  margin-bottom: 0.75rem;
+  line-height: 1.65;
+  color: #d4d4d8;
+}
+.md-prose ul,
+.md-prose ol {
+  margin-bottom: 0.75rem;
+  padding-left: 1.25rem;
+  color: #d4d4d8;
+}
+.md-prose ul {
+  list-style-type: disc;
+}
+.md-prose ol {
+  list-style-type: decimal;
+}
+.md-prose li {
+  margin-bottom: 0.3rem;
+  line-height: 1.6;
+}
+.md-prose code {
+  background: #27272a;
+  color: #a5b4fc;
+  padding: 0.1rem 0.35rem;
+  border-radius: 0.3rem;
+  font-size: 0.85em;
+}
+.md-prose pre {
+  background: #18181b;
+  border: 1px solid #27272a;
+  border-radius: 0.5rem;
+  padding: 0.85rem 1rem;
+  overflow-x: auto;
+  margin-bottom: 0.9rem;
+}
+.md-prose pre code {
+  background: transparent;
+  padding: 0;
+  color: #e4e4e7;
+}
+.md-prose blockquote {
+  border-left: 3px solid #6366f1;
+  padding-left: 0.85rem;
+  color: #a1a1aa;
+  margin-bottom: 0.75rem;
+}
+.md-prose strong {
+  color: #fafafa;
+}

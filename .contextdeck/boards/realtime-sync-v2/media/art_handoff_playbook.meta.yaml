@@ -1,0 +1,16 @@
+id: art_handoff_playbook
+title: Multi-Harness Handoff Playbook
+kind: doc
+filePath: art_handoff_playbook.md
+chapters: []
+tags:
+  - playbook
+  - onboarding
+basedOnDecisions:
+  - dec_002
+  - dec_003
+sessionId: sess_claude_storage
+boardRevisionAtUpdate: 15
+metadata: {}
+createdAt: '2026-11-25T23:31:58.060Z'
+updatedAt: '2026-11-25T23:31:58.060Z'

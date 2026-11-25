@@ -1,0 +1,103 @@
+{
+  "type": "excalidraw",
+  "version": 2,
+  "source": "contextdeck",
+  "elements": [
+    {
+      "id": "box-human",
+      "type": "rectangle",
+      "x": 80,
+      "y": 120,
+      "width": 200,
+      "height": 80,
+      "strokeColor": "#38bdf8",
+      "backgroundColor": "#0c4a6e",
+      "fillStyle": "solid",
+      "strokeWidth": 2,
+      "roughness": 1,
+      "opacity": 100,
+      "roundness": {
+        "type": 3
+      }
+    },
+    {
+      "id": "txt-human",
+      "type": "text",
+      "x": 112,
+      "y": 148,
+      "width": 140,
+      "height": 25,
+      "text": "Human Mental Model",
+      "fontSize": 18,
+      "fontFamily": 1,
+      "textAlign": "center",
+      "verticalAlign": "middle",
+      "strokeColor": "#e0f2fe"
+    },
+    {
+      "id": "box-board",
+      "type": "rectangle",
+      "x": 360,
+      "y": 100,
+      "width": 240,
+      "height": 120,
+      "strokeColor": "#a78bfa",
+      "backgroundColor": "#3b0764",
+      "fillStyle": "solid",
+      "strokeWidth": 2,
+      "roughness": 1,
+      "opacity": 100,
+      "roundness": {
+        "type": 3
+      }
+    },
+    {
+      "id": "txt-board",
+      "type": "text",
+      "x": 390,
+      "y": 145,
+      "width": 180,
+      "height": 30,
+      "text": "ContextDeck (.contextdeck/)",
+      "fontSize": 18,
+      "fontFamily": 1,
+      "textAlign": "center",
+      "verticalAlign": "middle",
+      "strokeColor": "#f3e8ff"
+    },
+    {
+      "id": "box-agents",
+      "type": "rectangle",
+      "x": 680,
+      "y": 120,
+      "width": 220,
+      "height": 80,
+      "strokeColor": "#34d399",
+      "backgroundColor": "#064e3b",
+      "fillStyle": "solid",
+      "strokeWidth": 2,
+      "roughness": 1,
+      "opacity": 100,
+      "roundness": {
+        "type": 3
+      }
+    },
+    {
+      "id": "txt-agents",
+      "type": "text",
+      "x": 705,
+      "y": 148,
+      "width": 170,
+      "height": 25,
+      "text": "Cursor + Claude + Grok",
+      "fontSize": 18,
+      "fontFamily": 1,
+      "textAlign": "center",
+      "verticalAlign": "middle",
+      "strokeColor": "#d1fae5"
+    }
+  ],
+  "appState": {
+    "viewBackgroundColor": "#0f172a"
+  }
+}

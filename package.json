@@ -1,0 +1,17 @@
+{
+  "name": "contextdeck-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first, Git-backed shared context board for humans and multiple AI coding agent harnesses.",
+  "scripts": {
+    "build": "pnpm -r --filter ./packages/core --filter ./packages/server --filter ./packages/cli --filter ./packages/web build",
+    "build:backend": "pnpm --filter @contextdeck/core build && pnpm --filter @contextdeck/server build && pnpm --filter @contextdeck/cli build",
+    "build:web": "pnpm --filter @contextdeck/web build",
+    "dev:web": "pnpm --filter @contextdeck/web dev",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

@@ -1,0 +1,16 @@
+id: sess_arch_root
+title: System Architecture & Tradeoffs
+harness: cursor
+externalRef: cursor://thread/arch-sync-v2
+parentSessionId: null
+relatedSessionIds: []
+status: active
+summary: >-
+  Designed initial storage model and real-time transport options. Needs to pull latest SQLite/SSE
+  decision.
+focusFiles:
+  - packages/core/src/store.ts
+  - packages/server/src/app.ts
+lastSyncedRevision: 3
+createdAt: '2026-11-25T23:31:57.968Z'
+updatedAt: '2026-11-25T23:31:58.080Z'

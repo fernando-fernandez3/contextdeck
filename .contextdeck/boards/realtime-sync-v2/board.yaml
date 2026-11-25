@@ -1,0 +1,35 @@
+id: brd_6ca485c3
+slug: realtime-sync-v2
+title: Realtime Sync Engine v2
+description: >-
+  Cross-harness demo board showing hierarchical sessions, superseded decisions, staleness detection,
+  Mermaid + Excalidraw diagrams, Kanban tasks, and quizzes.
+revision: 20
+lenses:
+  - id: brief
+    title: Brief
+    kind: brief
+    enabled: true
+    icon: compass
+  - id: sessions
+    title: Sessions
+    kind: sessions
+    enabled: true
+    icon: git-branch
+  - id: decisions
+    title: Architecture & Decisions
+    kind: decisions_canvas
+    enabled: true
+    icon: network
+  - id: tasks
+    title: Tasks
+    kind: tasks
+    enabled: true
+    icon: kanban
+  - id: media
+    title: Media & Mastery
+    kind: media_mastery
+    enabled: true
+    icon: play-circle
+createdAt: '2026-11-25T23:31:57.951Z'
+updatedAt: '2026-11-25T23:31:58.085Z'

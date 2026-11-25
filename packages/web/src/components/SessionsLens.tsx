@@ -1,0 +1,452 @@
+import { useMemo, useState } from 'react';
+import {
+  Background,
+  Controls,
+  Handle,
+  MarkerType,
+  Position,
+  ReactFlow,
+  type Edge,
+  type Node,
+  type NodeProps,
+} from '@xyflow/react';
+import { GitBranch, Plus, RefreshCw, Trash2, X } from 'lucide-react';
+import type { BoardSnapshot, Session, SessionStatus } from '../types';
+import { api } from '../api';
+import { HarnessBadge, StatusBadge } from './Badge';
+
+interface SessionsLensProps {
+  snapshot: BoardSnapshot;
+  onRefresh: () => void;
+}
+
+interface SessionNodeData extends Record<string, unknown> {
+  session: Session;
+  currentRevision: number;
+  selected: boolean;
+}
+
+function SessionNodeCard({ data }: NodeProps<Node<SessionNodeData>>) {
+  const { session, currentRevision, selected } = data;
+  const lag =
+    session.status === 'archived' || session.status === 'completed'
+      ? 0
+      : Math.max(0, currentRevision - session.lastSyncedRevision);
+
+  return (
+    <div
+      className={`w-72 rounded-xl border p-3.5 shadow-lg transition cursor-pointer ${
+        selected
+          ? 'border-indigo-400 bg-zinc-900 ring-2 ring-indigo-500/30'
+          : 'border-zinc-700/80 bg-zinc-900/95 hover:border-zinc-500'
+      }`}
+    >
+      <Handle type="target" position={Position.Top} className="!bg-indigo-400 !w-2.5 !h-2.5" />
+      <div className="flex items-center justify-between gap-2 mb-1.5">
+        <HarnessBadge harness={session.harness} />
+        <StatusBadge status={session.status} />
+      </div>
+      <div className="text-sm font-semibold text-zinc-100 leading-snug mb-1">{session.title}</div>
+      {session.summary && (
+        <p className="text-[11px] text-zinc-400 line-clamp-2 leading-relaxed">{session.summary}</p>
+      )}
+      <div className="mt-2.5 pt-2 border-t border-zinc-800 flex items-center justify-between text-[11px]">
+        <span className="font-mono text-zinc-500">{session.id}</span>
+        {lag > 0 ? (
+          <span className="text-amber-300 font-medium">Behind by {lag}</span>
+        ) : (
+          <span className="text-emerald-400">Synced (r{session.lastSyncedRevision})</span>
+        )}
+      </div>
+      <Handle type="source" position={Position.Bottom} className="!bg-indigo-400 !w-2.5 !h-2.5" />
+    </div>
+  );
+}
+
+const nodeTypes = { sessionNode: SessionNodeCard };
+
+function computeHierarchyLayout(sessions: Session[], currentRevision: number, selectedId: string | null) {
+  const byId = new Map(sessions.map((s) => [s.id, s]));
+  const depthMap = new Map<string, number>();
+
+  const getDepth = (s: Session, seen = new Set<string>()): number => {
+    if (depthMap.has(s.id)) return depthMap.get(s.id)!;
+    if (!s.parentSessionId || !byId.has(s.parentSessionId) || seen.has(s.id)) {
+      depthMap.set(s.id, 0);
+      return 0;
+    }
+    seen.add(s.id);
+    const d = getDepth(byId.get(s.parentSessionId)!, seen) + 1;
+    depthMap.set(s.id, d);
+    return d;
+  };
+
+  for (const s of sessions) getDepth(s);
+
+  const byLevel = new Map<number, Session[]>();
+  for (const s of sessions) {
+    const d = depthMap.get(s.id) ?? 0;
+    const arr = byLevel.get(d) ?? [];
+    arr.push(s);
+    byLevel.set(d, arr);
+  }
+
+  const nodes: Node<SessionNodeData>[] = [];
+  for (const [level, group] of byLevel.entries()) {
+    const spacingX = 330;
+    const totalWidth = (group.length - 1) * spacingX;
+    group.forEach((s, idx) => {
+      nodes.push({
+        id: s.id,
+        type: 'sessionNode',
+        position: { x: idx * spacingX - totalWidth / 2 + 320, y: level * 200 + 30 },
+        data: {
+          session: s,
+          currentRevision,
+          selected: s.id === selectedId,
+        },
+      });
+    });
+  }
+
+  const edges: Edge[] = [];
+  for (const s of sessions) {
+    if (s.parentSessionId && byId.has(s.parentSessionId)) {
+      edges.push({
+        id: `parent-${s.parentSessionId}-${s.id}`,
+        source: s.parentSessionId,
+        target: s.id,
+        animated: s.status === 'active',
+        style: { stroke: '#818cf8', strokeWidth: 2 },
+        markerEnd: { type: MarkerType.ArrowClosed, color: '#818cf8' },
+      });
+    }
+    for (const rel of s.relatedSessionIds) {
+      if (byId.has(rel)) {
+        edges.push({
+          id: `rel-${s.id}-${rel}`,
+          source: s.id,
+          target: rel,
+          label: 'linked',
+          style: { stroke: '#52525b', strokeDasharray: '5 4', strokeWidth: 1.5 },
+          labelStyle: { fill: '#a1a1aa', fontSize: 10 },
+          labelBgStyle: { fill: '#18181b' },
+        });
+      }
+    }
+  }
+
+  return { nodes, edges };
+}
+
+export function SessionsLens({ snapshot, onRefresh }: SessionsLensProps) {
+  const [selectedId, setSelectedId] = useState<string | null>(snapshot.sessions[0]?.id ?? null);
+  const [showCreate, setShowCreate] = useState(false);
+
+  // Create form state
+  const [newTitle, setNewTitle] = useState('');
+  const [newHarness, setNewHarness] = useState('cursor');
+  const [newParent, setNewParent] = useState('');
+  const [newSummary, setNewSummary] = useState('');
+  const [newRef, setNewRef] = useState('');
+
+  const selectedSession = snapshot.sessions.find((s) => s.id === selectedId) ?? null;
+
+  const { nodes, edges } = useMemo(
+    () => computeHierarchyLayout(snapshot.sessions, snapshot.config.revision, selectedId),
+    [snapshot.sessions, snapshot.config.revision, selectedId],
+  );
+
+  const handleCreate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newTitle.trim()) return;
+    const created = await api.registerSession(snapshot.config.slug, {
+      title: newTitle.trim(),
+      harness: newHarness,
+      parentSessionId: newParent || null,
+      summary: newSummary.trim(),
+      externalRef: newRef.trim() || undefined,
+    });
+    setNewTitle('');
+    setNewSummary('');
+    setNewRef('');
+    setShowCreate(false);
+    setSelectedId(created.id);
+    onRefresh();
+  };
+
+  const handleUpdateField = async (patch: Partial<Session>) => {
+    if (!selectedSession) return;
+    await api.updateSession(snapshot.config.slug, selectedSession.id, patch);
+    onRefresh();
+  };
+
+  const handleSync = async () => {
+    if (!selectedSession) return;
+    await api.syncSession(snapshot.config.slug, selectedSession.id);
+    onRefresh();
+  };
+
+  const handleDelete = async () => {
+    if (!selectedSession) return;
+    await api.deleteSession(snapshot.config.slug, selectedSession.id);
+    setSelectedId(null);
+    onRefresh();
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-base font-semibold text-zinc-100 flex items-center gap-2">
+            <GitBranch className="w-4 h-4 text-indigo-400" />
+            Hierarchical Agent Session Graph
+          </h2>
+          <p className="text-xs text-zinc-400">
+            Link parent/child and cross-harness sessions from Cursor, Claude Code, Codex, Grok, or local skills.
+          </p>
+        </div>
+        <button
+          onClick={() => setShowCreate(true)}
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white transition"
+        >
+          <Plus className="w-3.5 h-3.5" /> Register Session
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+        <div className="lg:col-span-8 h-[560px] rounded-xl border border-zinc-800 bg-zinc-950 overflow-hidden">
+          <ReactFlow
+            nodes={nodes}
+            edges={edges}
+            nodeTypes={nodeTypes}
+            fitView
+            onNodeClick={(_, node) => setSelectedId(node.id)}
+            proOptions={{ hideAttribution: true }}
+          >
+            <Background color="#27272a" gap={20} />
+            <Controls className="!bg-zinc-900 !border-zinc-700 !text-zinc-200" />
+          </ReactFlow>
+        </div>
+
+        <div className="lg:col-span-4 rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 space-y-4 h-[560px] overflow-y-auto">
+          {selectedSession ? (
+            <>
+              <div className="flex items-start justify-between gap-2">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <HarnessBadge harness={selectedSession.harness} />
+                    <StatusBadge status={selectedSession.status} />
+                  </div>
+                  <h3 className="text-sm font-semibold text-zinc-100">{selectedSession.title}</h3>
+                  <div className="font-mono text-[11px] text-zinc-500">{selectedSession.id}</div>
+                </div>
+                <button
+                  onClick={handleDelete}
+                  className="p-1.5 text-zinc-500 hover:text-rose-400 rounded-md hover:bg-zinc-800"
+                  title="Delete session"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              <div className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-3 flex items-center justify-between">
+                <div className="text-xs">
+                  <div className="text-zinc-400">Sync State</div>
+                  <div className="font-mono text-zinc-200 mt-0.5">
+                    rev {selectedSession.lastSyncedRevision} / rev {snapshot.config.revision}
+                  </div>
+                </div>
+                <button
+                  onClick={handleSync}
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-zinc-800 hover:bg-zinc-700 text-xs text-zinc-100"
+                >
+                  <RefreshCw className="w-3 h-3" /> Mark Synced
+                </button>
+              </div>
+
+              <div className="space-y-2">
+                <label className="block text-[11px] uppercase tracking-wider text-zinc-400">
+                  Status
+                </label>
+                <select
+                  value={selectedSession.status}
+                  onChange={(e) => handleUpdateField({ status: e.target.value as SessionStatus })}
+                  className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 text-xs text-zinc-100"
+                >
+                  <option value="active">active</option>
+                  <option value="paused">paused</option>
+                  <option value="completed">completed</option>
+                  <option value="archived">archived</option>
+                </select>
+              </div>
+
+              <div className="space-y-2">
+                <label className="block text-[11px] uppercase tracking-wider text-zinc-400">
+                  Parent Session
+                </label>
+                <select
+                  value={selectedSession.parentSessionId ?? ''}
+                  onChange={(e) => handleUpdateField({ parentSessionId: e.target.value || null })}
+                  className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 text-xs text-zinc-100"
+                >
+                  <option value="">(Root Session)</option>
+                  {snapshot.sessions
+                    .filter((s) => s.id !== selectedSession.id)
+                    .map((s) => (
+                      <option key={s.id} value={s.id}>
+                        [{s.harness}] {s.title}
+                      </option>
+                    ))}
+                </select>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="block text-[11px] uppercase tracking-wider text-zinc-400">
+                  Summary
+                </label>
+                <textarea
+                  defaultValue={selectedSession.summary}
+                  key={selectedSession.id + selectedSession.updatedAt}
+                  onBlur={(e) => {
+                    if (e.target.value !== selectedSession.summary) {
+                      handleUpdateField({ summary: e.target.value });
+                    }
+                  }}
+                  rows={4}
+                  className="w-full rounded-lg border border-zinc-800 bg-zinc-950 p-2.5 text-xs text-zinc-200 focus:outline-none focus:border-indigo-500"
+                />
+              </div>
+
+              {selectedSession.externalRef && (
+                <div className="text-xs">
+                  <span className="text-zinc-500">External Ref: </span>
+                  <span className="font-mono text-zinc-300 break-all">
+                    {selectedSession.externalRef}
+                  </span>
+                </div>
+              )}
+
+              {selectedSession.focusFiles.length > 0 && (
+                <div>
+                  <div className="text-[11px] uppercase tracking-wider text-zinc-400 mb-1.5">
+                    Focus Files
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {selectedSession.focusFiles.map((f) => (
+                      <span
+                        key={f}
+                        className="font-mono text-[10px] px-2 py-0.5 rounded bg-zinc-800 text-zinc-300"
+                      >
+                        {f}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="text-xs text-zinc-500">Select a session node to inspect or re-parent.</div>
+          )}
+        </div>
+      </div>
+
+      {showCreate && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+          <form
+            onSubmit={handleCreate}
+            className="w-full max-w-md rounded-xl border border-zinc-800 bg-zinc-900 p-5 space-y-4 shadow-2xl"
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-zinc-100">Register Agent Session</h3>
+              <button type="button" onClick={() => setShowCreate(false)} className="text-zinc-400 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs text-zinc-400 mb-1">Session Title</label>
+                <input
+                  required
+                  value={newTitle}
+                  onChange={(e) => setNewTitle(e.target.value)}
+                  placeholder="e.g. Implement OAuth PKCE flow"
+                  className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-100"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs text-zinc-400 mb-1">Harness</label>
+                  <select
+                    value={newHarness}
+                    onChange={(e) => setNewHarness(e.target.value)}
+                    className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-2.5 py-2 text-xs text-zinc-100"
+                  >
+                    <option value="cursor">cursor</option>
+                    <option value="claude-code">claude-code</option>
+                    <option value="codex">codex</option>
+                    <option value="grok">grok</option>
+                    <option value="windsurf">windsurf</option>
+                    <option value="antigravity">antigravity</option>
+                    <option value="chatgpt">chatgpt</option>
+                    <option value="skill">skill</option>
+                    <option value="custom">custom</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs text-zinc-400 mb-1">Parent Session</label>
+                  <select
+                    value={newParent}
+                    onChange={(e) => setNewParent(e.target.value)}
+                    className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-2.5 py-2 text-xs text-zinc-100"
+                  >
+                    <option value="">None (Root)</option>
+                    {snapshot.sessions.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.title}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+              <div>
+                <label className="block text-xs text-zinc-400 mb-1">Summary</label>
+                <textarea
+                  rows={3}
+                  value={newSummary}
+                  onChange={(e) => setNewSummary(e.target.value)}
+                  placeholder="What is this thread working on?"
+                  className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-100"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-zinc-400 mb-1">External Thread Ref / URL (optional)</label>
+                <input
+                  value={newRef}
+                  onChange={(e) => setNewRef(e.target.value)}
+                  placeholder="cursor://... or https://..."
+                  className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-100"
+                />
+              </div>
+            </div>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setShowCreate(false)}
+                className="px-3 py-1.5 rounded-lg text-xs text-zinc-400 hover:text-zinc-200"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white"
+              >
+                Register
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,25 @@
+{
+  "name": "@contextdeck/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "contextdeck": "./dist/index.js",
+    "cdeck": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && chmod +x dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "echo \"cli uses core/server tests\""
+  },
+  "dependencies": {
+    "@contextdeck/core": "workspace:*",
+    "@contextdeck/server": "workspace:*",
+    "commander": "^14.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.3"
+  }
+}

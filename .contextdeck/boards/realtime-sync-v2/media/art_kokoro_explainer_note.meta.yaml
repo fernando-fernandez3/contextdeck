@@ -1,0 +1,29 @@
+id: art_kokoro_explainer_note
+title: 'Concept Explainer: Why Supersession Beats Static Docs (Attach Your .mp4 Here)'
+kind: video
+transcript: >-
+  Welcome! When you run five parallel agent chats across Cursor and Claude Code, the hardest failure
+  mode is silent drift: one thread changes the architecture while your mental model—and your other
+  chats—still assume the old design. By linking every diagram, video explainer, and quiz to specific
+  Decision IDs, ContextDeck tells you the exact moment an artifact goes stale. (Drop any local
+  .mp4/.webm from your idea-to-video skill via the Upload button or `cdeck media add --type video
+  --file ...` to play it right here!)
+chapters:
+  - timeSec: 0
+    title: The Multi-Thread Amnesia Problem
+  - timeSec: 32
+    title: Decisions as Versioned Anchors
+  - timeSec: 68
+    title: Automatic Staleness Propagation
+durationSec: 95
+tags:
+  - explainer
+  - kokoro-tts
+  - idea-to-video
+basedOnDecisions:
+  - dec_001
+sessionId: sess_grok_research
+boardRevisionAtUpdate: 16
+metadata: {}
+createdAt: '2026-11-25T23:31:58.065Z'
+updatedAt: '2026-11-25T23:31:58.065Z'

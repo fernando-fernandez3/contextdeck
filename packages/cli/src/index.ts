@@ -1,0 +1,348 @@
+#!/usr/bin/env node
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { Command } from 'commander';
+import {
+  ContextDeckStore,
+  generateContextPack,
+  seedDemoBoard,
+  type DecisionStatus,
+  type DiagramKind,
+  type MediaKind,
+  type TaskColumn,
+  type TaskPriority,
+} from '@contextdeck/core';
+import { startServer, startStdioMcpServer } from '@contextdeck/server';
+import { setupHarness, type HarnessTarget } from './setup.js';
+
+const program = new Command();
+
+program
+  .name('cdeck')
+  .description('ContextDeck — Local-first, Git-backed shared context board for humans and AI agents')
+  .version('0.1.0');
+
+function getStore(dir?: string): ContextDeckStore {
+  return new ContextDeckStore(dir ? path.resolve(dir) : process.cwd());
+}
+
+program
+  .command('init')
+  .description('Initialize a .contextdeck workspace in the current directory')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-t, --title <title>', 'Default board title', 'Project Context')
+  .option('-s, --slug <slug>', 'Default board slug', 'main')
+  .option('--demo', 'Also seed the interactive Realtime Sync Engine v2 demo board')
+  .action(async (opts) => {
+    const store = getStore(opts.dir);
+    if (opts.demo) {
+      const demoSlug = await seedDemoBoard(store);
+      console.log(`Initialized ContextDeck with demo board "${demoSlug}" in ${store.deckDir}`);
+      return;
+    }
+    const board = await store.createBoard({
+      title: opts.title,
+      slug: opts.slug,
+      setAsDefault: true,
+    });
+    console.log(`Initialized ContextDeck board "${board.title}" (${board.slug}) in ${store.deckDir}`);
+  });
+
+program
+  .command('serve')
+  .description('Start the local ContextDeck web UI, REST/SSE API, and Streamable HTTP MCP server')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-p, --port <number>', 'Port to listen on', '4310')
+  .option('-H, --host <host>', 'Host to bind', '127.0.0.1')
+  .option('--demo', 'Seed the demo board if the workspace is empty')
+  .action(async (opts) => {
+    const store = getStore(opts.dir);
+    if (opts.demo && (await store.listBoards()).length === 0) {
+      await seedDemoBoard(store);
+    }
+    const srv = await startServer({
+      rootDir: store.rootDir,
+      port: Number.parseInt(opts.port, 10),
+      host: opts.host,
+    });
+    console.log(`ContextDeck running:`);
+    console.log(`  Web UI & API : ${srv.url}`);
+    console.log(`  MCP (HTTP)   : ${srv.mcpUrl}`);
+    console.log(`  Workspace    : ${store.deckDir}`);
+
+    const shutdown = async () => {
+      await srv.close();
+      process.exit(0);
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+  });
+
+program
+  .command('mcp')
+  .description('Run ContextDeck as a stdio MCP server (for Cursor, Claude Code, Codex, etc.)')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-b, --board <slug>', 'Default board slug')
+  .action(async (opts) => {
+    const store = getStore(opts.dir);
+    await store.ensureDefaultBoard();
+    await startStdioMcpServer(store, opts.board);
+  });
+
+program
+  .command('status')
+  .description('Show current board revision, session drift, and stale artifacts')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-b, --board <slug>', 'Board slug')
+  .option('--brief-hook', 'Print a concise hook-friendly summary (exits 0 even if uninitialized)')
+  .action(async (opts) => {
+    const store = getStore(opts.dir);
+    if (!store.isInitialized()) {
+      if (opts.briefHook) return;
+      console.log('No .contextdeck workspace found. Run `cdeck init` or `cdeck init --demo`.');
+      return;
+    }
+    const snapshot = await store.getSnapshot(opts.board);
+    if (opts.briefHook) {
+      console.log(
+        `[ContextDeck] Board "${snapshot.config.title}" (${snapshot.config.slug}) is at rev ${snapshot.config.revision} | ${snapshot.decisions.filter((d) => d.status === 'accepted').length} active decisions | ${snapshot.drift.staleArtifacts.length} stale artifacts | ${snapshot.drift.driftedSessions.length} drifted sessions. Call board_get_brief to sync.`,
+      );
+      return;
+    }
+    console.log(`Board: ${snapshot.config.title} (${snapshot.config.slug}) — rev ${snapshot.config.revision}`);
+    console.log(`Sessions: ${snapshot.sessions.length} (${snapshot.drift.driftedSessions.length} behind)`);
+    console.log(`Decisions: ${snapshot.decisions.length}`);
+    console.log(`Tasks: ${snapshot.tasks.length} | Diagrams: ${snapshot.diagrams.length} | Media: ${snapshot.media.length} | Quizzes: ${snapshot.quizzes.length}`);
+    if (snapshot.drift.staleArtifacts.length > 0) {
+      console.log('\nStale Artifacts:');
+      for (const s of snapshot.drift.staleArtifacts) {
+        console.log(`  - [${s.artifactType}] ${s.title} (${s.artifactId}): ${s.reasons.join('; ')}`);
+      }
+    }
+    if (snapshot.drift.driftedSessions.length > 0) {
+      console.log('\nDrifted Sessions:');
+      for (const ds of snapshot.drift.driftedSessions) {
+        console.log(`  - ${ds.sessionId} [${ds.harness}] ${ds.title}: behind by ${ds.behindBy}`);
+      }
+    }
+  });
+
+program
+  .command('brief')
+  .description('Print the living brief or a copy-ready Context Pack for any agent/chat')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-b, --board <slug>', 'Board slug')
+  .option('--pack', 'Output full Context Pack including active decisions, tasks, and web-chat update protocol')
+  .action(async (opts) => {
+    const store = getStore(opts.dir);
+    const snapshot = await store.getSnapshot(opts.board);
+    if (opts.pack) {
+      console.log(generateContextPack(snapshot, { includeUpdateProtocol: true }));
+    } else {
+      console.log(snapshot.brief);
+    }
+  });
+
+// Board subcommands
+const boardCmd = program.command('board').description('Manage topic/project boards');
+boardCmd
+  .command('list')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .action(async (opts) => {
+    const store = getStore(opts.dir);
+    const boards = await store.listBoards();
+    const def = await store.getDefaultBoardSlug();
+    for (const b of boards) {
+      console.log(`${b.slug === def ? '*' : ' '} ${b.slug} — ${b.title} (rev ${b.revision})`);
+    }
+  });
+
+boardCmd
+  .command('create <title>')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-s, --slug <slug>', 'Custom slug')
+  .option('--description <text>', 'Description')
+  .action(async (title, opts) => {
+    const store = getStore(opts.dir);
+    const b = await store.createBoard({ title, slug: opts.slug, description: opts.description });
+    console.log(`Created board "${b.title}" (${b.slug})`);
+  });
+
+// Session subcommands
+const sessionCmd = program.command('session').description('Register or sync agent sessions');
+sessionCmd
+  .command('register <title>')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-b, --board <slug>', 'Board slug')
+  .option('--harness <name>', 'Agent harness (cursor, claude-code, codex, grok, skill, etc.)', 'custom')
+  .option('--parent <sessionId>', 'Parent session ID')
+  .option('--summary <text>', 'Session summary')
+  .action(async (title, opts) => {
+    const store = getStore(opts.dir);
+    const s = await store.registerSession(opts.board, {
+      title,
+      harness: opts.harness,
+      parentSessionId: opts.parent ?? null,
+      summary: opts.summary,
+    });
+    console.log(JSON.stringify(s, null, 2));
+  });
+
+sessionCmd
+  .command('sync <sessionId>')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-b, --board <slug>', 'Board slug')
+  .action(async (sessionId, opts) => {
+    const store = getStore(opts.dir);
+    const res = await store.syncSession(opts.board, sessionId);
+    console.log(JSON.stringify(res, null, 2));
+  });
+
+// Decision subcommands
+const decisionCmd = program.command('decision').description('Record or list decisions');
+decisionCmd
+  .command('add <title>')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-b, --board <slug>', 'Board slug')
+  .option('--summary <text>', 'One-line summary', '')
+  .option('--rationale <text>', 'Detailed rationale', '')
+  .option('--status <status>', 'proposed | accepted | deprecated', 'accepted')
+  .option('--supersedes <decisionId>', 'Decision ID superseded by this decision')
+  .option('--session <sessionId>', 'Originating session ID')
+  .option('--tags <csv>', 'Comma-separated tags')
+  .action(async (title, opts) => {
+    const store = getStore(opts.dir);
+    const dec = await store.recordDecision(opts.board, {
+      title,
+      summary: opts.summary,
+      rationale: opts.rationale,
+      status: opts.status as DecisionStatus,
+      supersedes: opts.supersedes ?? null,
+      sessionId: opts.session ?? null,
+      tags: opts.tags ? String(opts.tags).split(',').map((t) => t.trim()).filter(Boolean) : [],
+    });
+    console.log(JSON.stringify(dec, null, 2));
+  });
+
+// Task subcommands
+const taskCmd = program.command('task').description('Create or move Kanban tasks');
+taskCmd
+  .command('add <title>')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-b, --board <slug>', 'Board slug')
+  .option('--column <col>', 'backlog | in_progress | in_review | done', 'backlog')
+  .option('--priority <prio>', 'low | medium | high | urgent', 'medium')
+  .option('--assignee <name>', 'Assignee', 'unassigned')
+  .option('--based-on <csv>', 'Comma-separated linked decision IDs')
+  .option('--description <text>', 'Description', '')
+  .action(async (title, opts) => {
+    const store = getStore(opts.dir);
+    const task = await store.upsertTask(opts.board, {
+      title,
+      column: opts.column as TaskColumn,
+      priority: opts.priority as TaskPriority,
+      assignee: opts.assignee,
+      linkedDecisionIds: opts.basedOn
+        ? String(opts.basedOn).split(',').map((s) => s.trim()).filter(Boolean)
+        : [],
+      description: opts.description,
+    });
+    console.log(JSON.stringify(task, null, 2));
+  });
+
+// Diagram subcommand
+const diagramCmd = program.command('diagram').description('Attach Mermaid or Excalidraw diagrams');
+diagramCmd
+  .command('add <title>')
+  .requiredOption('--file <path>', 'Path to .mmd or .excalidraw file')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-b, --board <slug>', 'Board slug')
+  .option('--kind <kind>', 'mermaid | excalidraw', 'mermaid')
+  .option('--based-on <csv>', 'Comma-separated decision IDs')
+  .action(async (title, opts) => {
+    const store = getStore(opts.dir);
+    const content = await fs.readFile(path.resolve(opts.file), 'utf8');
+    const diag = await store.upsertDiagram(opts.board, {
+      title,
+      kind: opts.kind as DiagramKind,
+      content,
+      basedOnDecisions: opts.basedOn
+        ? String(opts.basedOn).split(',').map((s) => s.trim()).filter(Boolean)
+        : [],
+    });
+    console.log(JSON.stringify(diag, null, 2));
+  });
+
+// Media subcommand (great for idea-to-video + Kokoro TTS skill!)
+const mediaCmd = program.command('media').description('Attach videos, audio, docs, or custom artifacts');
+mediaCmd
+  .command('add <title>')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-b, --board <slug>', 'Board slug')
+  .option('--type <kind>', 'video | audio | doc | link | html | json | custom', 'video')
+  .option('--file <path>', 'Local file to copy into the board')
+  .option('--url <url>', 'External URL')
+  .option('--transcript <text>', 'Transcript text or path to .txt/.md file')
+  .option('--based-on <csv>', 'Comma-separated decision IDs')
+  .option('--tags <csv>', 'Comma-separated tags')
+  .action(async (title, opts) => {
+    const store = getStore(opts.dir);
+    let transcript = opts.transcript as string | undefined;
+    if (transcript && (transcript.endsWith('.txt') || transcript.endsWith('.md'))) {
+      try {
+        transcript = await fs.readFile(path.resolve(transcript), 'utf8');
+      } catch {
+        // treat as literal text
+      }
+    }
+    const artifact = await store.addMedia(opts.board, {
+      title,
+      kind: opts.type as MediaKind,
+      sourceFilePath: opts.file ? path.resolve(opts.file) : undefined,
+      externalUrl: opts.url,
+      transcript,
+      basedOnDecisions: opts.basedOn
+        ? String(opts.basedOn).split(',').map((s) => s.trim()).filter(Boolean)
+        : [],
+      tags: opts.tags ? String(opts.tags).split(',').map((s) => s.trim()).filter(Boolean) : [],
+    });
+    console.log(JSON.stringify(artifact, null, 2));
+  });
+
+// Quiz subcommand (great for quiz generator skill!)
+const quizCmd = program.command('quiz').description('Publish interactive quizzes to the board');
+quizCmd
+  .command('add')
+  .requiredOption('--file <path>', 'Path to a quiz JSON file')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-b, --board <slug>', 'Board slug')
+  .action(async (opts) => {
+    const store = getStore(opts.dir);
+    const raw = JSON.parse(await fs.readFile(path.resolve(opts.file), 'utf8'));
+    const quiz = await store.createQuiz(opts.board, raw);
+    console.log(JSON.stringify(quiz, null, 2));
+  });
+
+// Setup harness adapters
+program
+  .command('setup <harness>')
+  .description('Configure harness integration (claude-code | cursor | codex | agents-md)')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('--cli <cmd>', 'CLI command name for MCP config', 'cdeck')
+  .action(async (harness: string, opts) => {
+    const valid: HarnessTarget[] = ['claude-code', 'cursor', 'codex', 'agents-md'];
+    if (!valid.includes(harness as HarnessTarget)) {
+      console.error(`Unknown harness "${harness}". Choose one of: ${valid.join(', ')}`);
+      process.exit(1);
+    }
+    const rootDir = opts.dir ? path.resolve(opts.dir) : process.cwd();
+    const res = await setupHarness(rootDir, harness as HarnessTarget, { cliCommand: opts.cli });
+    console.log(`Configured ${harness}:`);
+    for (const f of res.filesWritten) console.log(`  wrote ${f}`);
+    for (const n of res.notes) console.log(`  note: ${n}`);
+  });
+
+program.parseAsync(process.argv).catch((err) => {
+  console.error(err instanceof Error ? err.message : String(err));
+  process.exit(1);
+});

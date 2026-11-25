@@ -1,0 +1,7 @@
+flowchart LR
+    Cursor["Cursor IDE (MCP)"] --> Server["ContextDeck Local Server"]
+    Claude["Claude Code (MCP + Hooks)"] --> Server
+    Grok["Grok / Web Chat (Context Pack)"] -.-> UI["ContextDeck Web App"]
+    Skills["idea-to-video / Quiz Skills (CLI)"] --> Server
+    Server --> Store["Redis Pub/Sub (OUTDATED - update to Git Store!)"]
+    Server -->|SSE Live Push| UI

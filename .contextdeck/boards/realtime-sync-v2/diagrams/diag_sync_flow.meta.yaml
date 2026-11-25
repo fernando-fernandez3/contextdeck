@@ -1,0 +1,11 @@
+id: diag_sync_flow
+title: Sync & Context Propagation Architecture
+kind: mermaid
+description: High-level flow showing how external agent harnesses synchronize through ContextDeck.
+basedOnDecisions:
+  - dec_001
+  - dec_002
+sessionId: sess_arch_root
+boardRevisionAtUpdate: 9
+createdAt: '2026-11-25T23:31:58.024Z'
+updatedAt: '2026-11-25T23:31:58.024Z'
