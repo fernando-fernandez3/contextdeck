@@ -9,6 +9,7 @@ import {
   UNTRUSTED_BOARD_CONTENT_HEADER,
   capSingleLine,
   isMeaningfulEvent,
+  isSessionDriftEvaluated,
   neutralizeUntrustedDelimiters,
 } from './drift.js';
 
@@ -16,6 +17,7 @@ export interface ContextPackOptions {
   includeUpdateProtocol?: boolean;
   maxRecentEvents?: number;
   maxChars?: number;
+  now?: Date;
 }
 
 const DEFAULT_MAX_CHARS = 12_000;
@@ -109,10 +111,11 @@ export function generateContextPack(
     capSingleLine(String(snapshot.config.updatedAt), 64),
   );
   const headerLines = [
-    `# ContextDeck Shared Context: ${safeTitle}`,
+    '# ContextDeck Shared Context',
     `> Board: \`${safeSlug}\` | Revision: \`rev ${snapshot.config.revision}\` | Updated: ${safeUpdatedAt}`,
   ];
   const header = neutralizeUntrustedDelimiters(headerLines.join('\n'));
+  const titleLine = neutralizeUntrustedDelimiters(`Board Title: ${safeTitle}`);
   const protocolBlock = includeUpdateProtocol
     ? `\n\n${buildUpdateProtocolBlock(snapshot.config.revision)}`
     : '';
@@ -122,6 +125,8 @@ export function generateContextPack(
     2 + // \n\n before untrusted header
     UNTRUSTED_BOARD_CONTENT_HEADER.length +
     2 + // \n\n
+    titleLine.length +
+    2 + // \n\n before body sections
     2 + // \n\n before footer
     UNTRUSTED_BOARD_CONTENT_FOOTER.length +
     protocolBlock.length;
@@ -200,23 +205,37 @@ export function generateContextPack(
     remaining = appendSectionWithinBudget(bodySections, briefBlock, remaining, true);
   }
 
-  // Priority 5: Active Sessions (using honest drift counts)
+  // Priority 5: Active Sessions (using honest drift counts; omit sync label when drift was not
+  // computed or when a session was excluded from drift evaluation — R2-5, R3-3)
   const activeSessions = snapshot.sessions.filter(
     (s) => s.status !== 'archived' && s.status !== 'completed',
   );
   if (activeSessions.length > 0) {
-    const driftBySession = new Map(
-      snapshot.drift.driftedSessions.map((d) => [d.sessionId, d.behindBy]),
-    );
+    const sessionDriftComputed = snapshot.drift.sessionDriftComputed !== false;
+    const driftBySession = sessionDriftComputed
+      ? new Map(snapshot.drift.driftedSessions.map((d) => [d.sessionId, d.behindBy]))
+      : null;
+    const evaluatedAtMs = snapshot.drift.evaluatedAt
+      ? Date.parse(snapshot.drift.evaluatedAt)
+      : Number.NaN;
+    const driftNow =
+      options.now ?? (Number.isFinite(evaluatedAtMs) ? new Date(evaluatedAtMs) : new Date());
     const lines = ['## Linked Agent Sessions'];
     for (const s of activeSessions) {
-      const lag = driftBySession.get(s.id) ?? 0;
-      const syncLabel = lag > 0 ? `behind by ${lag}` : 'synced';
+      let statusLabel: string = s.status;
+      if (driftBySession !== null) {
+        const behindBy = driftBySession.get(s.id);
+        if (behindBy !== undefined && behindBy > 0) {
+          statusLabel = `${s.status}, behind by ${behindBy}`;
+        } else if (isSessionDriftEvaluated(s, driftNow)) {
+          statusLabel = `${s.status}, synced`;
+        }
+      }
       const parentLabel = s.parentSessionId ? ` (child of ${s.parentSessionId})` : '';
       const title = capSingleLine(s.title, MAX_TITLE_CHARS);
       const summary = s.summary ? `: ${capSingleLine(s.summary, MAX_SUMMARY_CHARS)}` : '';
       lines.push(
-        `- **${s.id}** [${capSingleLine(s.harness, 40)}] ${title}${parentLabel} — _${s.status}, ${syncLabel}_${summary}`,
+        `- **${s.id}** [${capSingleLine(s.harness, 40)}] ${title}${parentLabel} — _${statusLabel}_${summary}`,
       );
     }
     remaining = appendSectionWithinBudget(bodySections, lines.join('\n'), remaining, true);
@@ -246,7 +265,7 @@ export function generateContextPack(
     remaining = appendSectionWithinBudget(bodySections, lines.join('\n'), remaining, true);
   }
 
-  const innerBody = neutralizeUntrustedDelimiters(bodySections.join('\n\n'));
+  const innerBody = neutralizeUntrustedDelimiters([titleLine, ...bodySections].join('\n\n'));
   const full = `${header}\n\n${UNTRUSTED_BOARD_CONTENT_HEADER}\n\n${innerBody}\n\n${UNTRUSTED_BOARD_CONTENT_FOOTER}${protocolBlock}`;
   if (full.length <= maxChars) {
     return full;

@@ -14,6 +14,8 @@ export interface BoardConfig {
   description: string;
   revision: number;
   lenses: LensConfig[];
+  parentBoard?: string | null;
+  paths?: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -25,12 +27,14 @@ export interface Session {
   title: string;
   harness: string;
   externalRef?: string;
+  board?: string;
   parentSessionId: string | null;
   relatedSessionIds: string[];
   status: SessionStatus;
   summary: string;
   focusFiles: string[];
   lastSyncedRevision: number;
+  lastActiveAt?: string;
   createdAt: string;
   updatedAt: string;
 }

@@ -228,4 +228,138 @@ describe('@contextdeck/cli B1 commands', () => {
       await srv.close();
     }
   });
+
+  it('AC5.8: cdeck mcp stdio resolves workspace via cwd (no --dir), advertises resources.subscribe, and sends notifications/resources/updated on board changes', async () => {
+    const repo = await makeTempDir('cdeck-mcp-stdio-');
+    expect((await runCli(['init', '--title', 'Stdio MCP', '--slug', 'main'], { cwd: repo })).code).toBe(
+      0,
+    );
+
+    const child = spawn(process.execPath, [CLI_BIN, 'mcp'], {
+      cwd: repo,
+      env: { ...process.env, CONTEXTDECK_DIR: undefined, CLAUDE_PROJECT_DIR: undefined },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    const messages: Array<Record<string, unknown>> = [];
+    let buffer = '';
+    child.stdout.on('data', (chunk) => {
+      buffer += String(chunk);
+      let idx: number;
+      while ((idx = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        if (line) {
+          try {
+            messages.push(JSON.parse(line) as Record<string, unknown>);
+          } catch {
+            // ignore non-JSON
+          }
+        }
+      }
+    });
+
+    const waitForMsg = async (
+      pred: (m: Record<string, unknown>) => boolean,
+      timeoutMs = 3000,
+    ): Promise<Record<string, unknown>> => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const found = messages.find(pred);
+        if (found) return found;
+        await new Promise((r) => setTimeout(r, 30));
+      }
+      throw new Error(`Timed out waiting for MCP message. Saw: ${JSON.stringify(messages)}`);
+    };
+
+    try {
+      child.stdin.write(
+        `${JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: {
+            protocolVersion: '2025-03-26',
+            capabilities: {},
+            clientInfo: { name: 'cli-test', version: '0.1.0' },
+          },
+        })}\n`,
+      );
+      const initResp = await waitForMsg((m) => m.id === 1);
+      const result = initResp.result as { capabilities?: { resources?: { subscribe?: boolean } } };
+      expect(result.capabilities?.resources?.subscribe).toBe(true);
+
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
+      child.stdin.write(
+        `${JSON.stringify({
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'resources/subscribe',
+          params: { uri: 'contextdeck://brief' },
+        })}\n`,
+      );
+      await waitForMsg((m) => m.id === 2);
+
+      // Give watcher a moment to be ready, then mutate via a separate CLI process
+      await new Promise((r) => setTimeout(r, 250));
+      expect((await runCli(['decision', 'add', 'Stdio Watch Decision'], { cwd: repo })).code).toBe(0);
+
+      const notif = await waitForMsg(
+        (m) =>
+          m.method === 'notifications/resources/updated' &&
+          (m.params as { uri?: string } | undefined)?.uri === 'contextdeck://brief',
+        3000,
+      );
+      expect(notif).toBeDefined();
+
+      // H4: Closing stdin (EOF) must cleanly shut down watcher + server and exit without child.kill
+      const exitResult = await new Promise<{ exited: boolean; code: number | null; signal: NodeJS.Signals | null }>(
+        (resolve) => {
+          const timer = setTimeout(() => {
+            resolve({ exited: false, code: null, signal: null });
+          }, 2500);
+          child.once('exit', (code, signal) => {
+            clearTimeout(timer);
+            resolve({ exited: true, code, signal });
+          });
+          child.stdin.end();
+        },
+      );
+      expect(exitResult.exited).toBe(true);
+      expect(exitResult.code).toBe(0);
+    } finally {
+      child.stdin.end();
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL');
+      }
+    }
+  });
+
+  it('H5: cdeck board use <slug> switches default board in --global workspace mode (AC6.4)', async () => {
+    const base = await makeTempDir('cdeck-h5-global-');
+    const fakeHome = path.join(base, 'home');
+    const repo = path.join(base, 'repo');
+    await fs.mkdir(repo, { recursive: true });
+    const env = { CONTEXTDECK_HOME: fakeHome };
+
+    expect((await runCli(['init', '--global', 'myws', '--slug', 'main'], { cwd: repo, env })).code).toBe(0);
+    expect((await runCli(['board', 'create', 'Web', '--slug', 'web'], { cwd: repo, env })).code).toBe(0);
+    expect((await runCli(['board', 'use', 'web'], { cwd: repo, env })).code).toBe(0);
+
+    const listRes = await runCli(['board', 'list'], { cwd: repo, env });
+    expect(listRes.code).toBe(0);
+    expect(listRes.stdout).toMatch(/^\*\s+web\b/m);
+    expect(listRes.stdout).not.toMatch(/^\*\s+main\b/m);
+
+    const decRes = await runCli(['decision', 'add', 'Should go to web'], { cwd: repo, env });
+    expect(decRes.code).toBe(0);
+
+    const webStatus = await runCli(['status', '--board', 'web'], { cwd: repo, env });
+    expect(webStatus.code).toBe(0);
+    expect(webStatus.stdout).toContain('Decisions: 1');
+
+    const mainStatus = await runCli(['status', '--board', 'main'], { cwd: repo, env });
+    expect(mainStatus.code).toBe(0);
+    expect(mainStatus.stdout).toContain('Decisions: 0');
+  });
 });

@@ -106,7 +106,13 @@ export const api = {
 
   listBoards: () => req<{ defaultBoard: string | null; boards: BoardConfig[] }>('/api/boards'),
 
-  createBoard: (input: { title: string; slug?: string; description?: string }) =>
+  createBoard: (input: {
+    title: string;
+    slug?: string;
+    description?: string;
+    parentBoard?: string | null;
+    paths?: string[];
+  }) =>
     req<BoardConfig>('/api/boards', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

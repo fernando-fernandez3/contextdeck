@@ -1,0 +1,419 @@
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { ResourceUpdatedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
+import {
+  ContextDeckStore,
+  initGlobalWorkspacePointer,
+  resolveWorkspace,
+  updateGlobalWorkspacePointerBoard,
+} from '@contextdeck/core';
+import { createApp } from '../src/app.js';
+import { createContextDeckMcpServer, attachMcpResourceWatcher } from '../src/mcp.js';
+
+const tmpDirs: string[] = [];
+
+async function makeTempDir(prefix = 'cdeck-mcp-b2-'): Promise<string> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(async () => {
+  while (tmpDirs.length > 0) {
+    await fs.rm(tmpDirs.pop()!, { recursive: true, force: true });
+  }
+});
+
+describe('AC5.8 + AC6.1 + D10 MCP live sync, resource subscriptions, and session-bound board routing', () => {
+  it('advertises resources.subscribe capability and sends notifications/resources/updated on board.yaml changes', async () => {
+    const dir = await makeTempDir();
+    const store = new ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main' });
+
+    const mcpServer = createContextDeckMcpServer(store, { defaultBoard: 'main' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client(
+      { name: 'vitest-client', version: '0.1.0' },
+      { capabilities: {} },
+    );
+
+    const receivedUris: string[] = [];
+    client.setNotificationHandler(ResourceUpdatedNotificationSchema, (notification) => {
+      receivedUris.push(notification.params.uri);
+    });
+
+    const watcherHandle = attachMcpResourceWatcher(mcpServer, store, { debounceMs: 50 });
+
+    try {
+      await Promise.all([mcpServer.connect(serverTransport), client.connect(clientTransport)]);
+
+      const caps = client.getServerCapabilities();
+      expect(caps?.resources?.subscribe).toBe(true);
+
+      await client.subscribeResource({ uri: 'contextdeck://brief' });
+      // Allow chokidar watcher to finish initial ready scan
+      await new Promise((r) => setTimeout(r, 200));
+
+      await store.recordDecision('main', { title: 'Trigger resource update notification' });
+
+      // Wait up to 2s for debounced watcher notification
+      const deadline = Date.now() + 2000;
+      while (receivedUris.length === 0 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 40));
+      }
+      expect(receivedUris).toContain('contextdeck://brief');
+
+      // After unsubscribe, subsequent updates must NOT notify for contextdeck://brief
+      await client.unsubscribeResource({ uri: 'contextdeck://brief' });
+      const countAfterUnsub = receivedUris.length;
+      await store.recordDecision('main', { title: 'Should not trigger after unsubscribe' });
+      await new Promise((r) => setTimeout(r, 350));
+      expect(receivedUris.length).toBe(countAfterUnsub);
+    } finally {
+      await watcherHandle?.close();
+      await client.close();
+      await mcpServer.close();
+    }
+  });
+
+  it('defaults MCP tools to the session bound board when sessionId is passed (AC6.1) and dedupes externalRef', async () => {
+    const dir = await makeTempDir();
+    const store = new ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main', setAsDefault: true });
+    await store.createBoard({ title: 'Frontend', slug: 'frontend' });
+
+    const mcpServer = createContextDeckMcpServer(store, { defaultBoard: 'main' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'vitest-routing', version: '0.1.0' }, { capabilities: {} });
+
+    try {
+      await Promise.all([mcpServer.connect(serverTransport), client.connect(clientTransport)]);
+
+      // Register session on 'frontend' with externalRef
+      const reg1 = await client.callTool({
+        name: 'session_register',
+        arguments: {
+          board: 'frontend',
+          title: 'Frontend Agent',
+          harness: 'antigravity',
+          externalRef: 'antigravity:conv-1',
+        },
+      });
+      const sess1 = JSON.parse((reg1.content as Array<{ text: string }>)[0].text) as {
+        id: string;
+        board: string;
+      };
+      expect(sess1.board).toBe('frontend');
+
+      // Repeating session_register with same externalRef reuses the session (no bloat)
+      const reg2 = await client.callTool({
+        name: 'session_register',
+        arguments: {
+          board: 'frontend',
+          title: 'Frontend Agent',
+          harness: 'antigravity',
+          externalRef: 'antigravity:conv-1',
+        },
+      });
+      const sess2 = JSON.parse((reg2.content as Array<{ text: string }>)[0].text) as { id: string };
+      expect(sess2.id).toBe(sess1.id);
+
+      // H9: Repeating session_register with same externalRef and OMITTED board must keep existing 'frontend' binding (not rebind to 'main')
+      const reg3 = await client.callTool({
+        name: 'session_register',
+        arguments: {
+          title: 'Frontend Agent Resumed',
+          harness: 'antigravity',
+          externalRef: 'antigravity:conv-1',
+        },
+      });
+      const sess3 = JSON.parse((reg3.content as Array<{ text: string }>)[0].text) as {
+        id: string;
+        board: string;
+      };
+      expect(sess3.id).toBe(sess1.id);
+      expect(sess3.board).toBe('frontend');
+
+      // Call board_get_brief with sessionId and NO board -> must return Frontend board!
+      const briefRes = await client.callTool({
+        name: 'board_get_brief',
+        arguments: { sessionId: sess1.id },
+      });
+      const briefText = (briefRes.content as Array<{ text: string }>)[0].text;
+      expect(briefText).toContain('Board: `frontend`');
+
+      // Record decision with sessionId and NO board -> must land on frontend, NOT main
+      await client.callTool({
+        name: 'decision_record',
+        arguments: {
+          title: 'Use CSS Grid for layout',
+          sessionId: sess1.id,
+        },
+      });
+
+      // Upsert task with sessionId and NO board -> must land on frontend, NOT main
+      await client.callTool({
+        name: 'task_upsert',
+        arguments: {
+          title: 'Implement responsive grid',
+          sessionId: sess1.id,
+        },
+      });
+
+      // Update brief with sessionId and NO board -> must update frontend brief
+      const feSnapBeforeBrief = await store.getSnapshot('frontend');
+      await client.callTool({
+        name: 'board_update_brief',
+        arguments: {
+          brief: '# Updated Frontend Brief\n',
+          baseRevision: feSnapBeforeBrief.config.revision,
+          sessionId: sess1.id,
+        },
+      });
+
+      // Explicit board override still works even when sessionId is passed
+      await client.callTool({
+        name: 'decision_record',
+        arguments: {
+          board: 'main',
+          title: 'Main platform decision',
+          sessionId: sess1.id,
+        },
+      });
+
+      const mainSnap = await store.getSnapshot('main');
+      const feSnap = await store.getSnapshot('frontend');
+
+      expect(mainSnap.decisions.map((d) => d.title)).toEqual(['Main platform decision']);
+      expect(mainSnap.tasks).toHaveLength(0);
+
+      expect(feSnap.decisions.map((d) => d.title)).toEqual(['Use CSS Grid for layout']);
+      expect(feSnap.tasks.map((t) => t.title)).toEqual(['Implement responsive grid']);
+      expect(feSnap.brief).toContain('# Updated Frontend Brief');
+    } finally {
+      await client.close();
+      await mcpServer.close();
+    }
+  });
+
+  it('supports board parentBoard/paths via REST API and rejects hierarchy cycles', async () => {
+    const dir = await makeTempDir();
+    const store = new ContextDeckStore(dir);
+    const { app, token, close } = createApp({ store, port: 4310 });
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    };
+
+    try {
+      const r1 = await app.request('http://127.0.0.1:4310/api/boards', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ title: 'Root', slug: 'root', paths: ['**'] }),
+      });
+      expect(r1.status).toBe(201);
+
+      const r2 = await app.request('http://127.0.0.1:4310/api/boards', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          title: 'Child',
+          slug: 'child',
+          parentBoard: 'root',
+          paths: ['packages/web/**'],
+        }),
+      });
+      expect(r2.status).toBe(201);
+      const child = (await r2.json()) as { parentBoard?: string; paths?: string[] };
+      expect(child.parentBoard).toBe('root');
+      expect(child.paths).toEqual(['packages/web/**']);
+
+      // Setting root.parentBoard = 'child' must be rejected as a cycle
+      const cycleRes = await app.request('http://127.0.0.1:4310/api/boards/root', {
+        method: 'PATCH',
+        headers,
+        body: JSON.stringify({ parentBoard: 'child' }),
+      });
+      expect(cycleRes.status).toBe(400);
+    } finally {
+      await close();
+    }
+  });
+
+  it('H13: stateless HTTP /mcp does not advertise resources.subscribe while stdio MCP still does', async () => {
+    const dir = await makeTempDir('cdeck-h13-');
+    const store = new ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main' });
+
+    const { app, token, close } = createApp({ store, port: 4310 });
+    try {
+      const initRes = await app.request('http://127.0.0.1:4310/mcp', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: {
+            protocolVersion: '2025-03-26',
+            capabilities: {},
+            clientInfo: { name: 'http-test', version: '0.1.0' },
+          },
+        }),
+      });
+      expect(initRes.status).toBe(200);
+      const body = (await initRes.json()) as {
+        result?: { capabilities?: { resources?: { subscribe?: boolean } } };
+      };
+      expect(body.result?.capabilities?.resources?.subscribe).not.toBe(true);
+    } finally {
+      await close();
+    }
+  });
+
+  it('R2-7: long-running global-mode MCP server reflects cdeck board use in board_list while explicit defaultBoard stays pinned', async () => {
+    const base = await makeTempDir('cdeck-r2-7-mcp-');
+    const fakeHome = path.join(base, 'home');
+    const repo = path.join(base, 'repo');
+    await fs.mkdir(repo, { recursive: true });
+    const env = { CONTEXTDECK_HOME: fakeHome };
+
+    await initGlobalWorkspacePointer({
+      projectRoot: repo,
+      workspaceName: 'mcp-r2-7',
+      boardSlug: 'main',
+      env,
+    });
+
+    const resolved = resolveWorkspace({ cwd: repo, env });
+    const store = new ContextDeckStore(resolved);
+    await store.createBoard({ title: 'Main Board', slug: 'main', setAsDefault: true });
+    await store.createBoard({ title: 'Web Board', slug: 'web' });
+
+    const mcpServer = createContextDeckMcpServer(store);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'r2-7-client', version: '0.1.0' });
+
+    // Also create an explicitly pinned MCP server (`cdeck mcp --board main`)
+    const pinnedServer = createContextDeckMcpServer(store, { defaultBoard: 'main' });
+    const [pinnedClientTransport, pinnedServerTransport] = InMemoryTransport.createLinkedPair();
+    const pinnedClient = new Client({ name: 'r2-7-pinned', version: '0.1.0' });
+
+    await Promise.all([
+      mcpServer.connect(serverTransport),
+      client.connect(clientTransport),
+      pinnedServer.connect(pinnedServerTransport),
+      pinnedClient.connect(pinnedClientTransport),
+    ]);
+
+    try {
+      const before = await client.callTool({ name: 'board_list', arguments: {} });
+      const beforeJson = JSON.parse(
+        (before.content as Array<{ text: string }>)[0].text,
+      ) as { defaultBoard: string };
+      expect(beforeJson.defaultBoard).toBe('main');
+
+      // Another process switches default board via `cdeck board use web`
+      const otherStore = new ContextDeckStore(resolveWorkspace({ cwd: repo, env }));
+      await otherStore.setDefaultBoard('web');
+      await updateGlobalWorkspacePointerBoard(resolved.pointerPath!, 'web');
+
+      const after = await client.callTool({ name: 'board_list', arguments: {} });
+      const afterJson = JSON.parse(
+        (after.content as Array<{ text: string }>)[0].text,
+      ) as { defaultBoard: string };
+      expect(afterJson.defaultBoard).toBe('web');
+
+      // Pinned `--board main` server still serves `main` on board_get_brief
+      const pinnedBrief = await pinnedClient.callTool({ name: 'board_get_brief', arguments: {} });
+      expect((pinnedBrief.content as Array<{ text: string }>)[0].text).toContain('Board: `main`');
+    } finally {
+      await Promise.all([
+        client.close(),
+        mcpServer.close(),
+        pinnedClient.close(),
+        pinnedServer.close(),
+      ]);
+    }
+  });
+
+  it('R3-2: MCP session_register surfaces ValidationError cleanly on conflicting externalRef/id and preserves board and harness when attaching ref by id', async () => {
+    const dir = await makeTempDir();
+    const store = new ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main', setAsDefault: true });
+    await store.createBoard({ title: 'Frontend', slug: 'frontend' });
+
+    await store.registerSession('frontend', {
+      id: 'sess_mcp_existing',
+      externalRef: 'codex:old',
+      title: 'Existing MCP Session',
+      harness: 'codex',
+      summary: 'Keep me intact',
+    });
+
+    await store.registerSession('frontend', {
+      id: 'sess_mcp_noref',
+      title: 'No Ref MCP Session',
+      harness: 'cursor',
+      summary: 'Preserved on attach',
+    });
+
+    const mcpServer = createContextDeckMcpServer(store, { defaultBoard: 'main' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'vitest-r3-2', version: '0.1.0' }, { capabilities: {} });
+
+    try {
+      await Promise.all([mcpServer.connect(serverTransport), client.connect(clientTransport)]);
+
+      // Conflicting externalRef reassignment via MCP returns an error tool result without clobbering
+      const conflictRes = await client.callTool({
+        name: 'session_register',
+        arguments: {
+          id: 'sess_mcp_existing',
+          externalRef: 'codex:new',
+          title: 'Clobber Attempt',
+        },
+      });
+      expect(conflictRes.isError).toBe(true);
+      const errText = (conflictRes.content as Array<{ text: string }>)[0]?.text ?? '';
+      expect(errText).toMatch(/externalRef|conflict|reassign/i);
+      const intact = await store.getSession('sess_mcp_existing');
+      expect(intact?.externalRef).toBe('codex:old');
+      expect(intact?.summary).toBe('Keep me intact');
+
+      // Attaching externalRef to ref-less session by id with omitted board preserves board, harness, and summary
+      const attachRes = await client.callTool({
+        name: 'session_register',
+        arguments: {
+          id: 'sess_mcp_noref',
+          externalRef: 'cursor:attached-mcp',
+          title: 'Attached MCP Session',
+        },
+      });
+      expect(attachRes.isError).not.toBe(true);
+      const attached = JSON.parse((attachRes.content as Array<{ text: string }>)[0].text) as {
+        id: string;
+        board: string;
+        harness: string;
+        externalRef: string;
+        summary: string;
+      };
+      expect(attached.id).toBe('sess_mcp_noref');
+      expect(attached.board).toBe('frontend');
+      expect(attached.harness).toBe('cursor');
+      expect(attached.externalRef).toBe('cursor:attached-mcp');
+      expect(attached.summary).toBe('Preserved on attach');
+    } finally {
+      await client.close();
+      await mcpServer.close();
+    }
+  });
+});

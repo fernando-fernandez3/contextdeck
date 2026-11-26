@@ -6,27 +6,35 @@ import {
   ContextDeckStore,
   ValidationError,
   WorkspaceNotFoundError,
+  capSingleLine,
   ensureContextDeckGitignore,
   generateContextPack,
   initGlobalWorkspacePointer,
+  neutralizeUntrustedDelimiters,
   resolveWorkspace,
   seedDemoBoard,
+  updateGlobalWorkspacePointerBoard,
   validateBoardSlug,
   type Actor,
   type DecisionStatus,
   type DiagramKind,
   type MediaKind,
+  type ResolvedWorkspace,
   type TaskColumn,
   type TaskPriority,
 } from '@contextdeck/core';
-import {
-  formatHostForUrl,
-  readWorkspaceToken,
-  startServer,
-  startStdioMcpServer,
-} from '@contextdeck/server';
-import { setupHarness, type HarnessTarget } from './setup.js';
+import { runHookCli } from './hooks.js';
+import { HARNESS_TARGETS, setupHarness, type HarnessTarget } from './setup.js';
 
+// Fast-path hook execution: avoids Commander error output and lazy-loads server deps,
+// guaranteeing silent exit 0 on unknown harness/event or any runtime failure (C5, D12)
+// without force-exiting before stdout drains.
+if (process.argv[2] === 'hook') {
+  process.exitCode = 0;
+  void runHookCli(process.argv[3], process.argv[4], process.env, {
+    exitOnHardDeadline: true,
+  }).catch(() => {});
+} else {
 const program = new Command();
 
 program
@@ -50,17 +58,38 @@ function parseStrictIntFlag(raw: unknown, flagName: string, min: number, max?: n
   return value;
 }
 
-function resolveStore(dir?: string): { store: ContextDeckStore; defaultBoard?: string } {
+function resolveStore(dir?: string): { store: ContextDeckStore; resolved: ResolvedWorkspace } {
   const resolved = resolveWorkspace({ dir });
   return {
     store: new ContextDeckStore({
       deckDir: resolved.deckDir,
       projectRoot: resolved.projectRoot,
       defaultBoard: resolved.defaultBoard,
+      pointerPath: resolved.pointerPath,
     }),
-    defaultBoard: resolved.defaultBoard,
+    resolved,
   };
 }
+
+async function resolveTargetBoard(
+  store: ContextDeckStore,
+  explicitBoard: string | undefined,
+  sessionId: string | undefined,
+): Promise<string | undefined> {
+  if (explicitBoard) return explicitBoard;
+  if (sessionId) {
+    const sess = await store.getSession(sessionId);
+    if (sess?.board) return sess.board;
+  }
+  return undefined;
+}
+
+program
+  .command('hook <harness> <event>')
+  .description('Handle harness lifecycle hooks (claude-code | codex | cursor)')
+  .action(async (harness: string, event: string) => {
+    await runHookCli(harness, event);
+  });
 
 program
   .command('init')
@@ -84,6 +113,7 @@ program
         deckDir: resolved.deckDir,
         projectRoot: resolved.projectRoot,
         defaultBoard: resolved.defaultBoard,
+        pointerPath: resolved.pointerPath,
       });
       if (opts.demo) {
         const demoSlug = await seedDemoBoard(store);
@@ -134,11 +164,13 @@ program
   .action(async (opts) => {
     let store: ContextDeckStore;
     let defaultBoard: string | undefined;
+    let pointerPath: string | undefined;
 
     try {
-      const resolved = resolveStore(opts.dir);
-      store = resolved.store;
+      const { store: resolvedStore, resolved } = resolveStore(opts.dir);
+      store = resolvedStore;
       defaultBoard = resolved.defaultBoard;
+      pointerPath = resolved.pointerPath;
     } catch (err) {
       if (opts.demo && err instanceof WorkspaceNotFoundError) {
         const targetDir = opts.dir ? path.resolve(opts.dir) : process.cwd();
@@ -164,10 +196,12 @@ program
           .filter(Boolean)
       : [];
 
+    const { startServer } = await import('@contextdeck/server');
     const srv = await startServer({
       deckDir: store.deckDir,
       projectRoot: store.projectRoot,
       defaultBoard,
+      pointerPath,
       port: Number.parseInt(opts.port, 10),
       host: opts.host,
       allowRemote: Boolean(opts.allowRemote),
@@ -196,6 +230,7 @@ program
   .option('-H, --host <host>', 'Host where ContextDeck server is running', '127.0.0.1')
   .action(async (opts) => {
     const { store } = resolveStore(opts.dir);
+    const { formatHostForUrl, readWorkspaceToken } = await import('@contextdeck/server');
     const token = await readWorkspaceToken(store.runtimeDir);
     const port = Number.parseInt(opts.port, 10);
     const hostUrl = formatHostForUrl(String(opts.host));
@@ -221,8 +256,9 @@ program
   .option('-b, --board <slug>', 'Default board slug')
   .action(async (opts) => {
     // D4 / D9: Resolve workspace via E4; never auto-initialize
-    const { store, defaultBoard } = resolveStore(opts.dir);
-    await startStdioMcpServer(store, opts.board ?? defaultBoard);
+    const { store } = resolveStore(opts.dir);
+    const { startStdioMcpServer } = await import('@contextdeck/server');
+    await startStdioMcpServer(store, opts.board);
   });
 
 program
@@ -233,11 +269,9 @@ program
   .option('--brief-hook', 'Print a concise hook-friendly summary (exits 0 even if uninitialized)')
   .action(async (opts) => {
     let store: ContextDeckStore;
-    let defaultBoard: string | undefined;
     try {
-      const resolved = resolveStore(opts.dir);
-      store = resolved.store;
-      defaultBoard = resolved.defaultBoard;
+      const { store: resolvedStore } = resolveStore(opts.dir);
+      store = resolvedStore;
     } catch (err) {
       if (opts.briefHook) return;
       console.log(err instanceof Error ? err.message : 'No ContextDeck workspace found. Run `cdeck init`.');
@@ -248,10 +282,11 @@ program
       console.log('No .contextdeck workspace found. Run `cdeck init` or `cdeck init --demo`.');
       return;
     }
-    const snapshot = await store.getSnapshot(opts.board ?? defaultBoard);
+    const snapshot = await store.getSnapshot(opts.board);
     if (opts.briefHook) {
+      const safeTitle = neutralizeUntrustedDelimiters(capSingleLine(snapshot.config.title, 160));
       console.log(
-        `[ContextDeck] Board "${snapshot.config.title}" (${snapshot.config.slug}) is at rev ${snapshot.config.revision} | ${snapshot.decisions.filter((d) => d.status === 'accepted').length} active decisions | ${snapshot.drift.staleArtifacts.length} stale artifacts | ${snapshot.drift.driftedSessions.length} drifted sessions. Call board_get_brief to sync.`,
+        `[ContextDeck] Board "${safeTitle}" (${snapshot.config.slug}) is at rev ${snapshot.config.revision} | ${snapshot.decisions.filter((d) => d.status === 'accepted').length} active decisions | ${snapshot.drift.staleArtifacts.length} stale artifacts | ${snapshot.drift.driftedSessions.length} drifted sessions. Call board_get_brief to sync.`,
       );
       return;
     }
@@ -286,8 +321,8 @@ program
   .option('--base-revision <n>', 'Expected board revision for optimistic concurrency check')
   .option('--session <sessionId>', 'Originating session ID')
   .action(async (opts) => {
-    const { store, defaultBoard } = resolveStore(opts.dir);
-    const board = opts.board ?? defaultBoard;
+    const { store } = resolveStore(opts.dir);
+    const board = await resolveTargetBoard(store, opts.board, opts.session);
     if (opts.set !== undefined || opts.file !== undefined) {
       const nextBrief =
         opts.file !== undefined ? await fs.readFile(path.resolve(opts.file), 'utf8') : String(opts.set);
@@ -329,10 +364,48 @@ boardCmd
   .option('-d, --dir <path>', 'Workspace directory')
   .option('-s, --slug <slug>', 'Custom slug')
   .option('--description <text>', 'Description')
+  .option('--parent <slug>', 'Parent board slug')
+  .option('--paths <csv>', 'Comma-separated relative path globs for automatic hook routing')
   .action(async (title, opts) => {
     const { store } = resolveStore(opts.dir);
-    const b = await store.createBoard({ title, slug: opts.slug, description: opts.description });
+    const paths = opts.paths
+      ? String(opts.paths)
+          .split(',')
+          .map((p) => p.trim())
+          .filter(Boolean)
+      : undefined;
+    const b = await store.createBoard({
+      title,
+      slug: opts.slug,
+      description: opts.description,
+      ...(opts.parent ? { parentBoard: String(opts.parent) } : {}),
+      ...(paths && paths.length > 0 ? { paths } : {}),
+    });
     console.log(`Created board "${b.title}" (${b.slug})`);
+  });
+
+boardCmd
+  .command('use <slug>')
+  .description('Switch the workspace default board, or rebind a specific session to a board (AC6.4)')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('--session <sessionId>', 'Rebind this session ID instead of changing the workspace default')
+  .action(async (slug: string, opts) => {
+    const { store, resolved } = resolveStore(opts.dir);
+    const validSlug = validateBoardSlug(slug);
+    await store.readBoardConfig(validSlug);
+    if (opts.session) {
+      const rebound = await store.rebindSession(String(opts.session), validSlug, {
+        type: 'human',
+        label: 'cli',
+      });
+      console.log(JSON.stringify(rebound, null, 2));
+      return;
+    }
+    await store.setDefaultBoard(validSlug);
+    if (resolved.mode === 'global' && resolved.pointerPath) {
+      await updateGlobalWorkspacePointerBoard(resolved.pointerPath, validSlug);
+    }
+    console.log(`Switched default board to "${validSlug}".`);
   });
 
 // Session subcommands
@@ -345,8 +418,8 @@ sessionCmd
   .option('--parent <sessionId>', 'Parent session ID')
   .option('--summary <text>', 'Session summary')
   .action(async (title, opts) => {
-    const { store, defaultBoard } = resolveStore(opts.dir);
-    const s = await store.registerSession(opts.board ?? defaultBoard, {
+    const { store } = resolveStore(opts.dir);
+    const s = await store.registerSession(opts.board, {
       title,
       harness: opts.harness,
       parentSessionId: opts.parent ?? null,
@@ -361,12 +434,13 @@ sessionCmd
   .option('-b, --board <slug>', 'Board slug')
   .option('--ack-revision <n>', 'Acknowledge a specific board revision')
   .action(async (sessionId, opts) => {
-    const { store, defaultBoard } = resolveStore(opts.dir);
+    const { store } = resolveStore(opts.dir);
     const ackRevision =
       opts.ackRevision !== undefined
         ? parseStrictIntFlag(opts.ackRevision, '--ack-revision', 0)
         : undefined;
-    const res = await store.syncSession(opts.board ?? defaultBoard, sessionId, { ackRevision });
+    const board = await resolveTargetBoard(store, opts.board, sessionId);
+    const res = await store.syncSession(board, sessionId, { ackRevision });
     console.log(JSON.stringify(res, null, 2));
   });
 
@@ -383,12 +457,13 @@ decisionCmd
   .option('--session <sessionId>', 'Originating session ID')
   .option('--tags <csv>', 'Comma-separated tags')
   .action(async (title, opts) => {
-    const { store, defaultBoard } = resolveStore(opts.dir);
+    const { store } = resolveStore(opts.dir);
+    const board = await resolveTargetBoard(store, opts.board, opts.session);
     const actor: Actor = opts.session
       ? { type: 'agent', sessionId: String(opts.session), label: 'cli' }
       : { type: 'human', label: 'cli' };
     const dec = await store.recordDecision(
-      opts.board ?? defaultBoard,
+      board,
       {
         title,
         summary: opts.summary,
@@ -416,12 +491,13 @@ taskCmd
   .option('--session <sessionId>', 'Originating session ID')
   .option('--description <text>', 'Description', '')
   .action(async (title, opts) => {
-    const { store, defaultBoard } = resolveStore(opts.dir);
+    const { store } = resolveStore(opts.dir);
+    const board = await resolveTargetBoard(store, opts.board, opts.session);
     const actor: Actor = opts.session
       ? { type: 'agent', sessionId: String(opts.session), label: 'cli' }
       : { type: 'human', label: 'cli' };
     const task = await store.upsertTask(
-      opts.board ?? defaultBoard,
+      board,
       {
         title,
         column: opts.column as TaskColumn,
@@ -448,13 +524,14 @@ diagramCmd
   .option('--based-on <csv>', 'Comma-separated decision IDs')
   .option('--session <sessionId>', 'Originating session ID')
   .action(async (title, opts) => {
-    const { store, defaultBoard } = resolveStore(opts.dir);
+    const { store } = resolveStore(opts.dir);
+    const board = await resolveTargetBoard(store, opts.board, opts.session);
     const content = await fs.readFile(path.resolve(opts.file), 'utf8');
     const actor: Actor = opts.session
       ? { type: 'agent', sessionId: String(opts.session), label: 'cli' }
       : { type: 'human', label: 'cli' };
     const diag = await store.upsertDiagram(
-      opts.board ?? defaultBoard,
+      board,
       {
         title,
         kind: opts.kind as DiagramKind,
@@ -483,7 +560,8 @@ mediaCmd
   .option('--tags <csv>', 'Comma-separated tags')
   .option('--session <sessionId>', 'Originating session ID')
   .action(async (title, opts) => {
-    const { store, defaultBoard } = resolveStore(opts.dir);
+    const { store } = resolveStore(opts.dir);
+    const board = await resolveTargetBoard(store, opts.board, opts.session);
     let transcript = opts.transcript as string | undefined;
     if (transcript && (transcript.endsWith('.txt') || transcript.endsWith('.md'))) {
       try {
@@ -496,7 +574,7 @@ mediaCmd
       ? { type: 'agent', sessionId: String(opts.session), label: 'cli' }
       : { type: 'human', label: 'cli' };
     const artifact = await store.addMedia(
-      opts.board ?? defaultBoard,
+      board,
       {
         title,
         kind: opts.type as MediaKind,
@@ -523,31 +601,40 @@ quizCmd
   .option('-b, --board <slug>', 'Board slug')
   .option('--session <sessionId>', 'Originating session ID')
   .action(async (opts) => {
-    const { store, defaultBoard } = resolveStore(opts.dir);
+    const { store } = resolveStore(opts.dir);
+    const board = await resolveTargetBoard(store, opts.board, opts.session);
     const raw = JSON.parse(await fs.readFile(path.resolve(opts.file), 'utf8'));
     const actor: Actor = opts.session
       ? { type: 'agent', sessionId: String(opts.session), label: 'cli' }
       : { type: 'human', label: 'cli' };
-    const quiz = await store.createQuiz(opts.board ?? defaultBoard, raw, actor);
+    const quiz = await store.createQuiz(board, raw, actor);
     console.log(JSON.stringify(quiz, null, 2));
   });
 
 // Setup harness adapters
 program
   .command('setup <harness>')
-  .description('Configure harness integration (claude-code | cursor | codex | agents-md)')
-  .option('-d, --dir <path>', 'Workspace directory')
-  .option('--cli <cmd>', 'CLI command name for MCP config', 'cdeck')
+  .description(
+    'Configure or remove harness integration (claude-code | cursor | codex | grok | antigravity | agents-md)',
+  )
+  .option('-d, --dir <path>', 'Project root directory')
+  .option('--uninstall', 'Remove only ContextDeck-managed entries from target config files', false)
+  .option('--apply', 'Execute external CLI registration commands (used by antigravity)', false)
   .action(async (harness: string, opts) => {
-    const valid: HarnessTarget[] = ['claude-code', 'cursor', 'codex', 'agents-md'];
-    if (!valid.includes(harness as HarnessTarget)) {
-      console.error(`Unknown harness "${harness}". Choose one of: ${valid.join(', ')}`);
+    if (!HARNESS_TARGETS.includes(harness as HarnessTarget)) {
+      console.error(
+        `Unknown harness "${harness}". Choose one of: ${HARNESS_TARGETS.join(', ')}`,
+      );
       process.exit(1);
     }
     const rootDir = opts.dir ? path.resolve(opts.dir) : process.cwd();
-    const res = await setupHarness(rootDir, harness as HarnessTarget, { cliCommand: opts.cli });
-    console.log(`Configured ${harness}:`);
+    const res = await setupHarness(rootDir, harness as HarnessTarget, {
+      uninstall: Boolean(opts.uninstall),
+      apply: Boolean(opts.apply),
+    });
+    console.log(`${opts.uninstall ? 'Uninstalled' : 'Configured'} ${harness}:`);
     for (const f of res.filesWritten) console.log(`  wrote ${f}`);
+    for (const f of res.filesRemoved) console.log(`  removed ${f}`);
     for (const n of res.notes) console.log(`  note: ${n}`);
   });
 
@@ -555,3 +642,4 @@ program.parseAsync(process.argv).catch((err) => {
   console.error(err instanceof Error ? err.message : String(err));
   process.exit(1);
 });
+}

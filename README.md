@@ -68,29 +68,78 @@ Then open **http://127.0.0.1:4310** in your browser!
 
 ## Connecting Any Agent Harness
 
+All generated project configs (`cdeck setup <target>`) merge idempotently into existing files, never write absolute machine paths (the workspace resolver automatically locates `.contextdeck/`, `.contextdeck.yaml`, and linked git worktrees), and support `--uninstall` to remove only ContextDeck-managed entries. Setup ownership is determined by shape: an entry identical to what `cdeck setup` writes (or a legacy v0.1 `--dir <repo>` MCP entry) is treated as ContextDeck-managed and removed by `--uninstall`, while customized entries (extra fields, custom flags, or other servers/hooks) are left alone.
+
+> **Team prerequisite:** Committed project hook configs (`.claude/settings.json`, `.codex/hooks.json`, `.cursor/hooks.json`) invoke `cdeck` directly, so `cdeck` must be available on every teammate's `PATH` (a missing binary will surface a hook error in the host harness).
+
+### Harness Capabilities at a Glance
+
+| Harness | Setup Command | Automatic | Manual / Not Supported |
+| :--- | :--- | :--- | :--- |
+| **Claude Code** | `cdeck setup claude-code` | Stdio MCP (`.mcp.json`), startup Context Pack (`SessionStart`), per-prompt drift digest (`UserPromptSubmit`), auto-idle (`SessionEnd`) | Requires `cdeck` on `PATH` |
+| **Codex CLI** | `cdeck setup codex` (+ `agents-md`) | Project MCP (`.codex/config.toml`), startup Context Pack (`SessionStart`), per-prompt drift digest (`UserPromptSubmit`), auto-idle (`SessionEnd`) respecting `additionalContextLimit` | Requires `cdeck` on `PATH`; Codex executes project `.codex/hooks.json` hooks only in a trusted project |
+| **Cursor** | `cdeck setup cursor` | Stdio MCP (`.cursor/mcp.json`), startup Context Pack (`sessionStart`), throttled post-tool drift digest (`postToolUse`, max once per 60s), auto-idle (`sessionEnd`), always-apply rule | **No prompt-submit injection** — Cursor's `beforeSubmitPrompt` hook cannot inject additional context (as of Cursor docs fetched 2026-11-25); mid-session push happens via `postToolUse` |
+| **Grok Bot** | `cdeck setup grok` | Project MCP (`.grok/config.toml`) + `AGENTS.md` protocol | **No lifecycle hooks** — syncs via MCP tools (`board_get_brief`, `decision_record`, etc.) guided by `AGENTS.md` |
+| **Gemini / Antigravity** | `cdeck setup antigravity [--apply]` | Stdio MCP (`agy mcp add contextdeck cdeck mcp`) + `AGENTS.md` protocol | **No lifecycle hooks** — syncs via MCP tools guided by `AGENTS.md` |
+| **Web Chats** (Grok Web, ChatGPT, Claude Web) | _(no setup needed)_ | — | **Copy Context Pack** / **Paste Update** in the web UI (or `cdeck brief --pack`) |
+
 ### Claude Code
 ```bash
 cdeck setup claude-code
+# Remove only ContextDeck entries:
+cdeck setup claude-code --uninstall
 ```
-Writes `.mcp.json` (stdio MCP server) and a lightweight `SessionStart` hook in `.claude/settings.local.json` that alerts Claude Code of the current board revision and drift state.
-
-### Cursor
-```bash
-cdeck setup cursor
-```
-Writes `.cursor/mcp.json` and `.cursor/rules/contextdeck.mdc` so every Cursor chat automatically orients from and updates the active board.
+Merges the `contextdeck` stdio server into `.mcp.json` (`cdeck mcp`, no `--dir`) and adds `SessionStart`, `UserPromptSubmit`, and `SessionEnd` hooks into `.claude/settings.json`. Pre-existing hooks and servers are preserved untouched.
 
 ### Codex CLI
 ```bash
 cdeck setup codex
+cdeck setup agents-md
+# Remove only ContextDeck entries:
+cdeck setup codex --uninstall
 ```
-Generates a ready-to-paste MCP server block (both stdio and Streamable HTTP options) for `~/.codex/config.toml`.
+Merges `[mcp_servers.contextdeck]` inside `# contextdeck:start` / `# contextdeck:end` markers in `.codex/config.toml` and adds `SessionStart`, `UserPromptSubmit`, and `SessionEnd` hooks into `.codex/hooks.json` (with `additionalContextLimit` on context-emitting events and `timeout: 3` on `SessionEnd`; Codex enables hooks by default, but only runs project `.codex/hooks.json` hooks in a trusted project and requires `cdeck` on every teammate's `PATH`).
+
+### Cursor
+```bash
+cdeck setup cursor
+# Remove only ContextDeck entries:
+cdeck setup cursor --uninstall
+```
+Merges `.cursor/mcp.json`, `.cursor/hooks.json` (`version: 1` with `sessionStart`, throttled `postToolUse`, and `sessionEnd`), and `.cursor/rules/contextdeck.mdc`. Because Cursor's `beforeSubmitPrompt` hook cannot inject `additional_context` (as of docs fetched 2026-11-25), live drift digests are injected via `postToolUse` (at most once every 60 seconds per session, never advancing the sync cursor when throttled).
+
+### Grok Bot
+```bash
+cdeck setup grok
+# Equivalent Grok CLI command:
+grok mcp add --scope project contextdeck -- cdeck mcp
+```
+Merges `[mcp_servers.contextdeck]` into project-scope `.grok/config.toml` and updates `AGENTS.md`. Grok Bot has no lifecycle hooks configured here; it relies on MCP tools and `AGENTS.md`.
+
+### Gemini / Antigravity
+```bash
+# Print the registration command and update AGENTS.md:
+cdeck setup antigravity
+# Or also execute `agy mcp add contextdeck cdeck mcp`:
+cdeck setup antigravity --apply
+```
+Antigravity has no lifecycle hooks; it connects via MCP and `AGENTS.md`. Passing a stable `externalRef` on `session_register` deduplicates repeat calls without creating duplicate session records.
 
 ### Universal (`AGENTS.md`)
 ```bash
 cdeck setup agents-md
 ```
-Injects a clean protocol section into `AGENTS.md` for any coding agent that reads repository instructions.
+Merges a marker-bounded ContextDeck protocol block into `AGENTS.md` instructing agents to reuse hook-injected `sessionId`s (without calling `session_register` again) and record decisions/supersessions via MCP.
+
+### Multi-Board Routing & Switching
+- Sessions are workspace-scoped under `.contextdeck/sessions/<id>.yaml` (metadata only); volatile sync cursors live in gitignored `.contextdeck/.runtime/cursors/<id>.json` so hooks never dirty `git status`.
+- Boards may declare `paths` globs (e.g. `packages/web/**`) and `parentBoard` in `board.yaml`. Hooks automatically route new sessions to the most specific matching board (longest literal prefix, then segment count, then slug).
+- Rebind the workspace default board or a specific session anytime:
+  ```bash
+  cdeck board use <slug>
+  cdeck board use <slug> --session <sessionId>
+  ```
+- In `--global` mode, `cdeck board use <slug>` rewrites the project's `.contextdeck.yaml` pointer (in addition to the global workspace's `workspace.yaml`), which shows up as a working-tree change if `.contextdeck.yaml` is committed; each linked git worktree has its own copy of `.contextdeck.yaml`.
 
 ### Grok / ChatGPT Web / Claude Web
 Click **Copy Context Pack** in the top bar and paste it into any browser chat. When the chat reaches new decisions or tasks, copy its fenced JSON update block and click **Paste Update** in ContextDeck.

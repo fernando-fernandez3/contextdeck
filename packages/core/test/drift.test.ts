@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as core from '../src/index.js';
 
 const tmpDirs: string[] = [];
@@ -550,5 +550,183 @@ describe('E3 honest drift, bounded digest, fast tail reader, and context pack', 
     expect(pack.split(header).length - 1).toBe(1);
     expect(pack.split(footer).length - 1).toBe(1);
     expect(pack).toContain('Keep arrow → and ellipsis … intact.');
+  });
+
+  it('R2-3: readContextPackSnapshot never returns uncommitted content while a transaction journal is in flight', async () => {
+    const dir = await makeTempDir('cdeck-r2-3-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Txn Consistency', slug: 'main' });
+    await store.updateBrief('main', '# Committed Brief v1\n');
+    const committedRev = (await store.readBoardConfig('main')).revision;
+
+    // Simulate an in-flight brief transaction holding the workspace lock:
+    // txn.json exists, brief.md has been renamed to uncommitted content, board.yaml still at old revision.
+    let releaseWriter!: () => void;
+    const writerReady = new Promise<void>((resolve) => {
+      void core.withWorkspaceLock(
+        store.runtimeDir,
+        async () => {
+          const txnPath = path.join(store.runtimeDir, core.TXN_FILENAME);
+          await fs.writeFile(
+            txnPath,
+            JSON.stringify({ id: 'txn_in_flight', boardSlug: 'main', ops: [], events: [] }),
+            'utf8',
+          );
+          await fs.writeFile(
+            path.join(store.boardPath('main'), 'brief.md'),
+            'UNCOMMITTED_BRIEF_FROM_IN_FLIGHT_TXN',
+            'utf8',
+          );
+          resolve();
+          await new Promise<void>((r) => {
+            releaseWriter = r;
+          });
+          // Clean up simulated journal & restore committed brief before releasing lock
+          await fs.writeFile(
+            path.join(store.boardPath('main'), 'brief.md'),
+            '# Committed Brief v1\n',
+            'utf8',
+          );
+          await fs.rm(txnPath, { force: true });
+        },
+        store.deckDir,
+      );
+    });
+
+    await writerReady;
+    try {
+      // Bounded readContextPackSnapshot MUST NOT return the uncommitted brief under the old revision
+      await expect(
+        store.readContextPackSnapshot('main', { maxWaitMs: 120 }),
+      ).rejects.toThrow(core.LockTimeoutError);
+    } finally {
+      releaseWriter();
+    }
+
+    // Once the transaction is finished and journal removed, readContextPackSnapshot succeeds cleanly
+    const cleanSnap = await store.readContextPackSnapshot('main');
+    expect(cleanSnap.config.revision).toBe(committedRev);
+    expect(cleanSnap.brief).toContain('# Committed Brief v1');
+
+    // Also verify revision-change detection retries when board.yaml advances mid-read
+    const origReadConfig = store.readBoardConfig.bind(store);
+    let readConfigCalls = 0;
+    const origBrief = await fs.readFile(path.join(store.boardPath('main'), 'brief.md'), 'utf8');
+    const spy = vi.spyOn(store, 'readBoardConfig').mockImplementation(async (s) => {
+      readConfigCalls += 1;
+      const cfg = await origReadConfig(s);
+      if (readConfigCalls === 1) {
+        // First attempt sees stale revision; second call (verification) sees newer revision -> must retry!
+        return { ...cfg, revision: cfg.revision - 1 };
+      }
+      return cfg;
+    });
+    try {
+      const retriedSnap = await store.readContextPackSnapshot('main');
+      expect(readConfigCalls).toBeGreaterThanOrEqual(4);
+      expect(retriedSnap.config.revision).toBe(committedRev);
+      expect(retriedSnap.brief).toBe(origBrief);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('R2-5: lightweight startup pack omits "synced" claim for unmeasured behind sessions while full snapshot prints "behind by 9"', async () => {
+    const dir = await makeTempDir('cdeck-r2-5-');
+    const store = new core.ContextDeckStore(dir);
+    const demoSlug = await core.seedDemoBoard(store);
+
+    const fullSnap = await store.getSnapshot(demoSlug);
+    const archDrift = fullSnap.drift.driftedSessions.find((d) => d.sessionId === 'sess_arch_root');
+    const claudeDrift = fullSnap.drift.driftedSessions.find(
+      (d) => d.sessionId === 'sess_claude_storage',
+    );
+    expect(archDrift?.behindBy).toBeGreaterThan(0);
+    expect(claudeDrift?.behindBy).toBeGreaterThan(0);
+
+    const fullPack = core.generateContextPack(fullSnap, {
+      includeUpdateProtocol: false,
+      maxChars: 6_000,
+    });
+    expect(fullPack).toContain(`sess_arch_root`);
+    expect(fullPack).toContain(`behind by ${archDrift!.behindBy}`);
+    expect(fullPack).toContain(`behind by ${claudeDrift!.behindBy}`);
+
+    const lightSnap = await store.readContextPackSnapshot(demoSlug);
+    const lightPack = core.generateContextPack(lightSnap, {
+      includeUpdateProtocol: false,
+      maxChars: 6_000,
+    });
+    // Must list the active sessions without falsely claiming they are "synced"
+    expect(lightPack).toContain('sess_arch_root');
+    expect(lightPack).toContain('sess_claude_storage');
+    expect(lightPack).not.toMatch(/sess_arch_root[^\n]*synced/);
+    expect(lightPack).not.toMatch(/sess_claude_storage[^\n]*synced/);
+  });
+
+  it('R3-3: full Context Pack omits "synced" for idle and >7d-inactive sessions while keeping "synced" and "behind by N" for evaluated active sessions', async () => {
+    const dir = await makeTempDir('cdeck-r3-3-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Idle And Inactive Labels', slug: 'main' });
+
+    // 1. Neon repro: hook session marked idle, then 3 decisions recorded
+    const { session: idleSess } = await store.upsertHookSession({
+      externalRef: 'claude-code:idle-1',
+      harness: 'claude-code',
+      defaultTitle: 'Idle Session',
+    });
+    await store.markHookSessionIdle({ externalRef: 'claude-code:idle-1' });
+
+    // 2. Active session inactive > 7 days (8 days old), also behind
+    const staleActiveSess = await store.registerSession('main', {
+      title: 'Stale Active Session',
+      harness: 'codex',
+    });
+    const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+    await store.writeSessionCursor({
+      sessionId: staleActiveSess.id,
+      syncedRevisions: { main: 1 },
+      lastActiveAt: eightDaysAgo,
+    });
+
+    // 3. Evaluated active behind session
+    const activeBehindSess = await store.registerSession('main', {
+      title: 'Active Behind Session',
+      harness: 'cursor',
+    });
+
+    // Record 3 decisions after the sessions above
+    await store.recordDecision('main', { title: 'D1' });
+    await store.recordDecision('main', { title: 'D2' });
+    await store.recordDecision('main', { title: 'D3' });
+
+    // 4. Evaluated active synced session (registered at latest revision)
+    const activeSyncedSess = await store.registerSession('main', {
+      title: 'Active Synced Session',
+      harness: 'claude-code',
+    });
+
+    const snap = await store.getSnapshot('main');
+    const pack = core.generateContextPack(snap, { includeUpdateProtocol: false });
+    const lines = pack.split('\n');
+
+    const idleLine = lines.find((l) => l.includes(idleSess.id));
+    const staleLine = lines.find((l) => l.includes(staleActiveSess.id));
+    const behindLine = lines.find((l) => l.includes(activeBehindSess.id));
+    const syncedLine = lines.find((l) => l.includes(activeSyncedSess.id));
+
+    expect(idleLine).toBeDefined();
+    expect(idleLine).toContain('_idle_');
+    expect(idleLine).not.toContain('synced');
+
+    expect(staleLine).toBeDefined();
+    expect(staleLine).toContain('_active_');
+    expect(staleLine).not.toContain('synced');
+
+    expect(behindLine).toBeDefined();
+    expect(behindLine).toContain('_active, behind by 3_');
+
+    expect(syncedLine).toBeDefined();
+    expect(syncedLine).toContain('_active, synced_');
   });
 });

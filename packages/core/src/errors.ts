@@ -53,6 +53,12 @@ export class LockCompromisedError extends ContextDeckError {
   }
 }
 
+export class LockTimeoutError extends ContextDeckError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super(message, 'LOCK_TIMEOUT', 503, details);
+  }
+}
+
 export class WorkspaceNotFoundError extends ContextDeckError {
   constructor(message: string, details?: Record<string, unknown>) {
     super(message, 'WORKSPACE_NOT_FOUND', 404, details);

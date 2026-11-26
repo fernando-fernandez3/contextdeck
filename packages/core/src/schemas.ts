@@ -63,6 +63,15 @@ export const DEFAULT_LENSES: LensConfig[] = [
   { id: 'media', title: 'Media & Mastery', kind: 'media_mastery', enabled: true, icon: 'play-circle' },
 ];
 
+export const BoardPathGlobSchema = z
+  .string()
+  .min(1)
+  .max(300)
+  .refine(
+    (value) => !value.includes('\0') && !value.split(/[\\/]/).includes('..'),
+    'Board path glob must not contain NUL bytes or ".." traversal segments',
+  );
+
 export const BoardConfigSchema = z.object({
   id: EntityIdSchema,
   slug: BoardSlugSchema,
@@ -70,6 +79,8 @@ export const BoardConfigSchema = z.object({
   description: z.string().default(''),
   revision: z.number().int().min(1).default(1),
   lenses: z.array(LensConfigSchema).default(DEFAULT_LENSES),
+  parentBoard: BoardSlugSchema.nullable().optional(),
+  paths: z.array(BoardPathGlobSchema).max(100).optional(),
   createdAt: IsoDateTimeSchema,
   updatedAt: IsoDateTimeSchema,
 });
@@ -79,17 +90,74 @@ export type BoardConfig = z.infer<typeof BoardConfigSchema>;
 export const SessionStatusSchema = z.enum(['active', 'idle', 'paused', 'completed', 'archived']);
 export type SessionStatus = z.infer<typeof SessionStatusSchema>;
 
+/**
+ * Git-tracked workspace-scoped session metadata (`<deck>/sessions/<id>.yaml`, D11).
+ * Never stores volatile sync state (`syncedRevisions`, `lastActiveAt`, or throttle timestamps).
+ */
+export const SessionMetadataSchema = z.object({
+  id: EntityIdSchema,
+  title: z.string().min(1),
+  harness: z.string().min(1).default('custom'),
+  externalRef: z.string().optional(),
+  board: BoardSlugSchema,
+  parentSessionId: EntityIdSchema.nullable().default(null),
+  relatedSessionIds: z.array(EntityIdSchema).default([]),
+  status: SessionStatusSchema.default('active'),
+  summary: z.string().default(''),
+  focusFiles: z.array(z.string()).default([]),
+  createdAt: IsoDateTimeSchema,
+  updatedAt: IsoDateTimeSchema,
+});
+
+export type SessionMetadata = z.infer<typeof SessionMetadataSchema>;
+
+/**
+ * Legacy-tolerant session file schema used when reading pre-B2 board-scoped
+ * `<deck>/boards/<slug>/sessions/<id>.yaml` files before first-write migration (D11).
+ */
+export const LegacySessionFileSchema = z.object({
+  id: EntityIdSchema,
+  title: z.string().min(1),
+  harness: z.string().min(1).default('custom'),
+  externalRef: z.string().optional(),
+  board: BoardSlugSchema.optional(),
+  parentSessionId: EntityIdSchema.nullable().default(null),
+  relatedSessionIds: z.array(EntityIdSchema).default([]),
+  status: SessionStatusSchema.default('active'),
+  summary: z.string().default(''),
+  focusFiles: z.array(z.string()).default([]),
+  lastSyncedRevision: z.number().int().min(0).optional(),
+  createdAt: IsoDateTimeSchema,
+  updatedAt: IsoDateTimeSchema,
+});
+
+export type LegacySessionFile = z.infer<typeof LegacySessionFileSchema>;
+
+/**
+ * Gitignored volatile per-session sync cursor (`<deck>/.runtime/cursors/<id>.json`, D11/D12).
+ */
+export const SessionCursorSchema = z.object({
+  sessionId: EntityIdSchema,
+  syncedRevisions: z.record(BoardSlugSchema, z.number().int().min(0)).default({}),
+  lastActiveAt: IsoDateTimeSchema,
+  lastCursorInjectAt: IsoDateTimeSchema.optional(),
+});
+
+export type SessionCursor = z.infer<typeof SessionCursorSchema>;
+
 export const SessionSchema = z.object({
   id: EntityIdSchema,
   title: z.string().min(1),
   harness: z.string().min(1).default('custom'),
   externalRef: z.string().optional(),
+  board: BoardSlugSchema.optional(),
   parentSessionId: EntityIdSchema.nullable().default(null),
   relatedSessionIds: z.array(EntityIdSchema).default([]),
   status: SessionStatusSchema.default('active'),
   summary: z.string().default(''),
   focusFiles: z.array(z.string()).default([]),
   lastSyncedRevision: z.number().int().min(0).default(1),
+  lastActiveAt: IsoDateTimeSchema.optional(),
   createdAt: IsoDateTimeSchema,
   updatedAt: IsoDateTimeSchema,
 });
@@ -272,7 +340,20 @@ export const CreateBoardInputSchema = z
     description: z.string().max(5000).optional(),
     brief: z.string().max(200 * 1024).optional(),
     lenses: z.array(LensConfigSchema).optional(),
+    parentBoard: BoardSlugSchema.nullable().optional(),
+    paths: z.array(BoardPathGlobSchema).max(100).optional(),
     setAsDefault: z.boolean().optional(),
+  })
+  .strict();
+
+export const UpdateBoardInputSchema = z
+  .object({
+    title: z.string().min(1).max(200).optional(),
+    description: z.string().max(5000).optional(),
+    lenses: z.array(LensConfigSchema).optional(),
+    parentBoard: BoardSlugSchema.nullable().optional(),
+    paths: z.array(BoardPathGlobSchema).max(100).optional(),
+    actor: ActorSchema.optional(),
   })
   .strict();
 
@@ -305,6 +386,7 @@ export const UpdateSessionPatchSchema = z
     title: z.string().min(1).max(300).optional(),
     harness: z.string().min(1).max(100).optional(),
     externalRef: z.string().max(500).optional(),
+    board: BoardSlugSchema.optional(),
     parentSessionId: EntityIdSchema.nullable().optional(),
     relatedSessionIds: z.array(EntityIdSchema).max(100).optional(),
     status: SessionStatusSchema.optional(),
@@ -479,6 +561,15 @@ export interface DriftReport {
   currentRevision: number;
   staleArtifacts: StaleArtifactNotice[];
   driftedSessions: DriftedSessionNotice[];
+  /**
+   * False when per-session drift was intentionally skipped (e.g. lightweight hook startup snapshots).
+   * Formatters must not claim sessions are "synced" when this is false.
+   */
+  sessionDriftComputed?: boolean;
+  /**
+   * ISO timestamp at which drift eligibility (e.g. 7-day inactivity cutoff) was evaluated.
+   */
+  evaluatedAt?: string;
 }
 
 export interface BoardSnapshot {

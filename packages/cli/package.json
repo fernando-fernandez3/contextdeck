@@ -16,7 +16,8 @@
   "dependencies": {
     "@contextdeck/core": "workspace:*",
     "@contextdeck/server": "workspace:*",
-    "commander": "^14.0.0"
+    "commander": "^14.0.0",
+    "smol-toml": "^1.9.1"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
