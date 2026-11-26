@@ -19,14 +19,18 @@ import {
   type TaskColumn,
   type TaskPriority,
 } from '@contextdeck/core';
-import {
-  formatHostForUrl,
-  readWorkspaceToken,
-  startServer,
-  startStdioMcpServer,
-} from '@contextdeck/server';
+import { runHookCli } from './hooks.js';
 import { setupHarness, type HarnessTarget } from './setup.js';
 
+// Fast-path hook execution: avoids Commander error output and lazy-loads server deps,
+// guaranteeing silent exit 0 on unknown harness/event or any runtime failure (C5, D12).
+if (process.argv[2] === 'hook') {
+  runHookCli(process.argv[3], process.argv[4])
+    .catch(() => {})
+    .finally(() => {
+      process.exit(0);
+    });
+} else {
 const program = new Command();
 
 program
@@ -61,6 +65,27 @@ function resolveStore(dir?: string): { store: ContextDeckStore; defaultBoard?: s
     defaultBoard: resolved.defaultBoard,
   };
 }
+
+async function resolveTargetBoard(
+  store: ContextDeckStore,
+  explicitBoard: string | undefined,
+  sessionId: string | undefined,
+  defaultBoard: string | undefined,
+): Promise<string | undefined> {
+  if (explicitBoard) return explicitBoard;
+  if (sessionId) {
+    const sess = await store.getSession(sessionId);
+    if (sess?.board) return sess.board;
+  }
+  return defaultBoard;
+}
+
+program
+  .command('hook <harness> <event>')
+  .description('Handle harness lifecycle hooks (claude-code | codex | cursor)')
+  .action(async (harness: string, event: string) => {
+    await runHookCli(harness, event);
+  });
 
 program
   .command('init')
@@ -164,6 +189,7 @@ program
           .filter(Boolean)
       : [];
 
+    const { startServer } = await import('@contextdeck/server');
     const srv = await startServer({
       deckDir: store.deckDir,
       projectRoot: store.projectRoot,
@@ -196,6 +222,7 @@ program
   .option('-H, --host <host>', 'Host where ContextDeck server is running', '127.0.0.1')
   .action(async (opts) => {
     const { store } = resolveStore(opts.dir);
+    const { formatHostForUrl, readWorkspaceToken } = await import('@contextdeck/server');
     const token = await readWorkspaceToken(store.runtimeDir);
     const port = Number.parseInt(opts.port, 10);
     const hostUrl = formatHostForUrl(String(opts.host));
@@ -222,6 +249,7 @@ program
   .action(async (opts) => {
     // D4 / D9: Resolve workspace via E4; never auto-initialize
     const { store, defaultBoard } = resolveStore(opts.dir);
+    const { startStdioMcpServer } = await import('@contextdeck/server');
     await startStdioMcpServer(store, opts.board ?? defaultBoard);
   });
 
@@ -287,7 +315,7 @@ program
   .option('--session <sessionId>', 'Originating session ID')
   .action(async (opts) => {
     const { store, defaultBoard } = resolveStore(opts.dir);
-    const board = opts.board ?? defaultBoard;
+    const board = await resolveTargetBoard(store, opts.board, opts.session, defaultBoard);
     if (opts.set !== undefined || opts.file !== undefined) {
       const nextBrief =
         opts.file !== undefined ? await fs.readFile(path.resolve(opts.file), 'utf8') : String(opts.set);
@@ -329,10 +357,45 @@ boardCmd
   .option('-d, --dir <path>', 'Workspace directory')
   .option('-s, --slug <slug>', 'Custom slug')
   .option('--description <text>', 'Description')
+  .option('--parent <slug>', 'Parent board slug')
+  .option('--paths <csv>', 'Comma-separated relative path globs for automatic hook routing')
   .action(async (title, opts) => {
     const { store } = resolveStore(opts.dir);
-    const b = await store.createBoard({ title, slug: opts.slug, description: opts.description });
+    const paths = opts.paths
+      ? String(opts.paths)
+          .split(',')
+          .map((p) => p.trim())
+          .filter(Boolean)
+      : undefined;
+    const b = await store.createBoard({
+      title,
+      slug: opts.slug,
+      description: opts.description,
+      ...(opts.parent ? { parentBoard: String(opts.parent) } : {}),
+      ...(paths && paths.length > 0 ? { paths } : {}),
+    });
     console.log(`Created board "${b.title}" (${b.slug})`);
+  });
+
+boardCmd
+  .command('use <slug>')
+  .description('Switch the workspace default board, or rebind a specific session to a board (AC6.4)')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('--session <sessionId>', 'Rebind this session ID instead of changing the workspace default')
+  .action(async (slug: string, opts) => {
+    const { store } = resolveStore(opts.dir);
+    const validSlug = validateBoardSlug(slug);
+    await store.readBoardConfig(validSlug);
+    if (opts.session) {
+      const rebound = await store.rebindSession(String(opts.session), validSlug, {
+        type: 'human',
+        label: 'cli',
+      });
+      console.log(JSON.stringify(rebound, null, 2));
+      return;
+    }
+    await store.setDefaultBoard(validSlug);
+    console.log(`Switched default board to "${validSlug}".`);
   });
 
 // Session subcommands
@@ -366,7 +429,8 @@ sessionCmd
       opts.ackRevision !== undefined
         ? parseStrictIntFlag(opts.ackRevision, '--ack-revision', 0)
         : undefined;
-    const res = await store.syncSession(opts.board ?? defaultBoard, sessionId, { ackRevision });
+    const board = await resolveTargetBoard(store, opts.board, sessionId, defaultBoard);
+    const res = await store.syncSession(board, sessionId, { ackRevision });
     console.log(JSON.stringify(res, null, 2));
   });
 
@@ -384,11 +448,12 @@ decisionCmd
   .option('--tags <csv>', 'Comma-separated tags')
   .action(async (title, opts) => {
     const { store, defaultBoard } = resolveStore(opts.dir);
+    const board = await resolveTargetBoard(store, opts.board, opts.session, defaultBoard);
     const actor: Actor = opts.session
       ? { type: 'agent', sessionId: String(opts.session), label: 'cli' }
       : { type: 'human', label: 'cli' };
     const dec = await store.recordDecision(
-      opts.board ?? defaultBoard,
+      board,
       {
         title,
         summary: opts.summary,
@@ -417,11 +482,12 @@ taskCmd
   .option('--description <text>', 'Description', '')
   .action(async (title, opts) => {
     const { store, defaultBoard } = resolveStore(opts.dir);
+    const board = await resolveTargetBoard(store, opts.board, opts.session, defaultBoard);
     const actor: Actor = opts.session
       ? { type: 'agent', sessionId: String(opts.session), label: 'cli' }
       : { type: 'human', label: 'cli' };
     const task = await store.upsertTask(
-      opts.board ?? defaultBoard,
+      board,
       {
         title,
         column: opts.column as TaskColumn,
@@ -449,12 +515,13 @@ diagramCmd
   .option('--session <sessionId>', 'Originating session ID')
   .action(async (title, opts) => {
     const { store, defaultBoard } = resolveStore(opts.dir);
+    const board = await resolveTargetBoard(store, opts.board, opts.session, defaultBoard);
     const content = await fs.readFile(path.resolve(opts.file), 'utf8');
     const actor: Actor = opts.session
       ? { type: 'agent', sessionId: String(opts.session), label: 'cli' }
       : { type: 'human', label: 'cli' };
     const diag = await store.upsertDiagram(
-      opts.board ?? defaultBoard,
+      board,
       {
         title,
         kind: opts.kind as DiagramKind,
@@ -484,6 +551,7 @@ mediaCmd
   .option('--session <sessionId>', 'Originating session ID')
   .action(async (title, opts) => {
     const { store, defaultBoard } = resolveStore(opts.dir);
+    const board = await resolveTargetBoard(store, opts.board, opts.session, defaultBoard);
     let transcript = opts.transcript as string | undefined;
     if (transcript && (transcript.endsWith('.txt') || transcript.endsWith('.md'))) {
       try {
@@ -496,7 +564,7 @@ mediaCmd
       ? { type: 'agent', sessionId: String(opts.session), label: 'cli' }
       : { type: 'human', label: 'cli' };
     const artifact = await store.addMedia(
-      opts.board ?? defaultBoard,
+      board,
       {
         title,
         kind: opts.type as MediaKind,
@@ -524,11 +592,12 @@ quizCmd
   .option('--session <sessionId>', 'Originating session ID')
   .action(async (opts) => {
     const { store, defaultBoard } = resolveStore(opts.dir);
+    const board = await resolveTargetBoard(store, opts.board, opts.session, defaultBoard);
     const raw = JSON.parse(await fs.readFile(path.resolve(opts.file), 'utf8'));
     const actor: Actor = opts.session
       ? { type: 'agent', sessionId: String(opts.session), label: 'cli' }
       : { type: 'human', label: 'cli' };
-    const quiz = await store.createQuiz(opts.board ?? defaultBoard, raw, actor);
+    const quiz = await store.createQuiz(board, raw, actor);
     console.log(JSON.stringify(quiz, null, 2));
   });
 
@@ -555,3 +624,4 @@ program.parseAsync(process.argv).catch((err) => {
   console.error(err instanceof Error ? err.message : String(err));
   process.exit(1);
 });
+}
