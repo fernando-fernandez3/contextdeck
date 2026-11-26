@@ -811,4 +811,43 @@ describe('D12 bounded lock acquisition timeout', () => {
     expect(attached.focusFiles).toEqual(['packages/web/src/App.tsx']);
     expect(attached.createdAt).toBe(noRef.createdAt);
   });
+
+  it('R4-1: updateSession rejects an externalRef owned by another session or reassigning an existing ref, leaving both records unchanged', async () => {
+    const dir = await makeTempDir('cdeck-r4-1-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main', setAsDefault: true });
+    await store.createBoard({ title: 'Web', slug: 'web' });
+
+    await store.registerSession('main', { id: 'sess_a', externalRef: 'codex:a', title: 'A', harness: 'codex' });
+    await store.registerSession('web', { id: 'sess_b', externalRef: 'codex:b', title: 'B', harness: 'codex' });
+    const aPath = path.join(store.sessionsDir, 'sess_a.yaml');
+    const bPath = path.join(store.sessionsDir, 'sess_b.yaml');
+    const aBefore = await fs.readFile(aPath, 'utf8');
+    const bBefore = await fs.readFile(bPath, 'utf8');
+
+    // Codex council-r4 exact repro: A takes B's externalRef
+    await expect(store.updateSession('main', 'sess_a', { externalRef: 'codex:b' })).rejects.toThrow(
+      core.ValidationError,
+    );
+    // Reassigning A's own ref to a fresh value follows registration's no-reassign policy
+    await expect(store.updateSession('main', 'sess_a', { externalRef: 'codex:fresh' })).rejects.toThrow(
+      core.ValidationError,
+    );
+
+    expect(await fs.readFile(aPath, 'utf8')).toBe(aBefore);
+    expect(await fs.readFile(bPath, 'utf8')).toBe(bBefore);
+    expect((await store.findSessionByExternalRef('codex:b'))?.id).toBe('sess_b');
+    expect((await store.findSessionByExternalRef('codex:a'))?.id).toBe('sess_a');
+
+    // Same ref is a no-op patch, and a ref-less session may attach an unused ref only
+    const same = await store.updateSession('main', 'sess_a', { externalRef: 'codex:a', summary: 'still A' });
+    expect(same.externalRef).toBe('codex:a');
+    await store.registerSession('main', { id: 'sess_c', title: 'C', harness: 'codex' });
+    await expect(store.updateSession('main', 'sess_c', { externalRef: 'codex:b' })).rejects.toThrow(
+      core.ValidationError,
+    );
+    const attached = await store.updateSession('main', 'sess_c', { externalRef: 'codex:c' });
+    expect(attached.externalRef).toBe('codex:c');
+    expect((await store.findSessionByExternalRef('codex:c'))?.id).toBe('sess_c');
+  });
 });

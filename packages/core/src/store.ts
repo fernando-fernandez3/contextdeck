@@ -2484,6 +2484,24 @@ export class ContextDeckStore {
 
     const nextBoard = patch.board ?? existing.board;
 
+    // R4-1: externalRef is a unique hook identity. Apply registration's policy (R3-2) on the
+    // update path too, under the same lock: never reassign an existing ref, never take one
+    // that already belongs to another session.
+    if (patch.externalRef !== undefined && patch.externalRef !== existing.externalRef) {
+      if (existing.externalRef !== undefined) {
+        throw new ValidationError(
+          `Session "${existing.id}" already has externalRef "${existing.externalRef}"; cannot reassign to "${patch.externalRef}".`,
+        );
+      }
+      const all = await this.listAllRawSessions();
+      const owner = all.find((s) => s.externalRef === patch.externalRef && s.id !== existing.id);
+      if (owner) {
+        throw new ValidationError(
+          `Session identity conflict: externalRef "${patch.externalRef}" already belongs to session "${owner.id}".`,
+        );
+      }
+    }
+
     // D7 / D11: Metadata updates NEVER move syncedRevisions cursor
     const updatedMeta = SessionMetadataSchema.parse({
       id: existing.id,
