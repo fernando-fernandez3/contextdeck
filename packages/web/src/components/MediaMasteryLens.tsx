@@ -1,23 +1,21 @@
 import { useRef, useState } from 'react';
 import {
-  AlertTriangle,
-  Award,
-  BookOpen,
   CheckCircle2,
   FileText,
   Film,
   HelpCircle,
   Plus,
-  RefreshCw,
   Trash2,
   Upload,
   X,
   XCircle,
 } from 'lucide-react';
-import type { BoardSnapshot, MediaArtifact, Quiz } from '../types';
+import type { BoardSnapshot, MediaArtifact, Quiz, RefreshJob } from '../types';
 import { api } from '../api';
 import { isSafeHttpUrl, wrapHtmlArtifactSrcDoc } from '../security';
-import { MarkdownView } from './Badge';
+import { computeMasteryTrend, getQuizQuestionStaleness } from '../quiz-helpers';
+import { MarkdownView, StatusBadge } from './Badge';
+import { ConfirmationBadges, StaleArtifactActions } from './ArtifactActions';
 
 interface MediaMasteryLensProps {
   snapshot: BoardSnapshot;
@@ -35,13 +33,89 @@ function formatTime(sec: number): string {
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 
+function MasteryTrendBadge({ quiz }: { quiz: Quiz }) {
+  const trend = computeMasteryTrend(quiz.attempts);
+  if (!trend) return null;
+
+  const recentScores = trend.scores.slice(-8);
+  const deltaLabel =
+    trend.delta !== null
+      ? trend.delta > 0
+        ? `+${trend.delta}%`
+        : `${trend.delta}%`
+      : null;
+
+  return (
+    <div className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 flex items-center gap-3">
+      <div className="text-right">
+        <div className="text-[10px] uppercase tracking-wider text-zinc-400">Mastery</div>
+        <div className="flex items-baseline justify-end gap-1.5">
+          <span className="text-base font-semibold font-mono text-zinc-100">
+            {trend.latestPct}%
+          </span>
+          {deltaLabel && (
+            <span
+              className={`text-[11px] font-mono ${
+                trend.delta! > 0
+                  ? 'text-emerald-300'
+                  : trend.delta! < 0
+                    ? 'text-amber-300'
+                    : 'text-zinc-400'
+              }`}
+            >
+              {deltaLabel}
+            </span>
+          )}
+        </div>
+        <div className="text-[10px] text-zinc-500">
+          {quiz.attempts.length} attempt{quiz.attempts.length === 1 ? '' : 's'}
+        </div>
+      </div>
+
+      {recentScores.length > 1 && (
+        <svg
+          width="64"
+          height="28"
+          viewBox="0 0 64 28"
+          className="shrink-0"
+          aria-label="Mastery score trend"
+        >
+          {recentScores.map((score, i) => {
+            const barW = Math.max(4, Math.floor(56 / recentScores.length) - 2);
+            const x = i * (barW + 2) + 2;
+            const h = Math.max(3, Math.round((score / 100) * 24));
+            const y = 26 - h;
+            return (
+              <rect
+                key={i}
+                x={x}
+                y={y}
+                width={barW}
+                height={h}
+                rx={1.5}
+                fill={i === recentScores.length - 1 ? '#6366f1' : '#3f3f46'}
+              />
+            );
+          })}
+        </svg>
+      )}
+    </div>
+  );
+}
+
 function QuizRunner({
   slug,
   quiz,
+  snapshot,
+  staleReasons,
+  activeJob,
   onSubmitted,
 }: {
   slug: string;
   quiz: Quiz;
+  snapshot: BoardSnapshot;
+  staleReasons?: string[];
+  activeJob?: RefreshJob | null;
   onSubmitted: () => void;
 }) {
   const [answers, setAnswers] = useState<Record<string, number | string | boolean>>({});
@@ -53,7 +127,7 @@ function QuizRunner({
   } | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  const latestAttempt = quiz.attempts[quiz.attempts.length - 1];
+  const questionStaleness = getQuizQuestionStaleness(quiz, snapshot.decisions);
 
   const handleSubmit = async () => {
     setSubmitting(true);
@@ -71,33 +145,47 @@ function QuizRunner({
   };
 
   return (
-    <div className="space-y-5">
-      <div className="flex flex-wrap items-start justify-between gap-4 border-b border-zinc-800 pb-4">
-        <div>
-          <div className="inline-flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-pink-300 font-semibold">
-            <HelpCircle className="w-3.5 h-3.5" /> Knowledge Check Quiz
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-zinc-800 pb-4">
+        <div className="space-y-1 min-w-0">
+          <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono text-zinc-400">
+            <span className="uppercase">quiz</span>
+            <span>v{quiz.version ?? 1}</span>
+            <span>{quiz.id}</span>
           </div>
-          <h3 className="text-base font-semibold text-zinc-100 mt-1">{quiz.title}</h3>
-          {quiz.description && <p className="text-xs text-zinc-400 mt-0.5">{quiz.description}</p>}
+          <h3 className="text-base font-semibold text-zinc-100 break-words">{quiz.title}</h3>
+          {quiz.description && <p className="text-xs text-zinc-400">{quiz.description}</p>}
         </div>
 
-        {latestAttempt && (
-          <div className="rounded-lg border border-emerald-500/30 bg-emerald-950/25 px-3.5 py-2 text-right">
-            <div className="text-[10px] uppercase tracking-wider text-emerald-300 flex items-center gap-1 justify-end">
-              <Award className="w-3.5 h-3.5" /> Latest Mastery
-            </div>
-            <div className="text-lg font-bold text-emerald-200">{latestAttempt.percentage}%</div>
-            <div className="text-[10px] text-zinc-400">
-              {quiz.attempts.length} attempt(s) logged
-            </div>
-          </div>
-        )}
+        <MasteryTrendBadge quiz={quiz} />
       </div>
 
-      <div className="space-y-4">
+      <ConfirmationBadges confirmations={quiz.confirmations} />
+
+      {staleReasons && staleReasons.length > 0 && (
+        <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-3.5 space-y-2.5">
+          <div className="flex flex-wrap items-center gap-2">
+            <StatusBadge
+              status={activeJob ? 'refreshing' : 'stale'}
+              label={activeJob ? 'Refreshing' : 'Stale'}
+            />
+            <span className="text-xs text-zinc-300">{staleReasons.join(' · ')}</span>
+          </div>
+          <StaleArtifactActions
+            boardSlug={slug}
+            artifactType="quiz"
+            artifactId={quiz.id}
+            activeJob={activeJob}
+            onUpdated={onSubmitted}
+          />
+        </div>
+      )}
+
+      <div className="space-y-3">
         {quiz.questions.map((q, idx) => {
           const chosen = answers[q.id];
           const showReveal = submittedResult !== null;
+          const qStale = questionStaleness[q.id];
           const isCorrect =
             q.type === 'multiple_choice'
               ? Number(chosen) === q.correctIndex
@@ -110,12 +198,21 @@ function QuizRunner({
           return (
             <div
               key={q.id}
-              className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-4 space-y-3"
+              data-question-id={q.id}
+              className="rounded-lg border border-zinc-800 bg-zinc-950 p-4 space-y-3"
             >
               <div className="flex items-start justify-between gap-3">
-                <div className="text-sm font-medium text-zinc-100">
-                  <span className="text-indigo-400 font-mono mr-2">Q{idx + 1}.</span>
-                  {q.prompt}
+                <div className="space-y-1.5 min-w-0">
+                  <div className="text-sm font-medium text-zinc-100">
+                    <span className="text-indigo-400 font-mono mr-2">Q{idx + 1}.</span>
+                    {q.prompt}
+                  </div>
+                  {qStale && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <StatusBadge status="stale" label="Stale" />
+                      <span className="text-xs text-zinc-400">{qStale.reasons.join(' · ')}</span>
+                    </div>
+                  )}
                 </div>
                 {showReveal &&
                   (isCorrect ? (
@@ -129,14 +226,13 @@ function QuizRunner({
                 <div className="space-y-2">
                   {q.options.map((opt, optIdx) => {
                     const selected = chosen === optIdx;
-                    let cls =
-                      'border-zinc-800 bg-zinc-900/60 hover:border-zinc-700 text-zinc-200';
+                    let cls = 'border-zinc-800 bg-zinc-900 hover:border-zinc-700 text-zinc-200';
                     if (showReveal && optIdx === q.correctIndex) {
-                      cls = 'border-emerald-500/60 bg-emerald-500/15 text-emerald-100';
+                      cls = 'border-emerald-500/60 bg-zinc-900 text-emerald-200';
                     } else if (showReveal && selected && optIdx !== q.correctIndex) {
-                      cls = 'border-rose-500/60 bg-rose-500/15 text-rose-100';
+                      cls = 'border-rose-500/60 bg-zinc-900 text-rose-200';
                     } else if (selected) {
-                      cls = 'border-indigo-500 bg-indigo-500/15 text-indigo-100';
+                      cls = 'border-indigo-500 bg-zinc-900 text-indigo-200';
                     }
                     return (
                       <button
@@ -158,6 +254,31 @@ function QuizRunner({
                 </div>
               )}
 
+              {q.type === 'true_false' && (
+                <div className="flex gap-2">
+                  {[true, false].map((val) => {
+                    const selected = chosen === val;
+                    return (
+                      <button
+                        key={String(val)}
+                        type="button"
+                        onClick={() => {
+                          setSubmittedResult(null);
+                          setAnswers((prev) => ({ ...prev, [q.id]: val }));
+                        }}
+                        className={`px-3 py-1.5 rounded-lg border text-xs transition ${
+                          selected
+                            ? 'border-indigo-500 bg-zinc-900 text-indigo-200'
+                            : 'border-zinc-800 bg-zinc-900 hover:border-zinc-700 text-zinc-300'
+                        }`}
+                      >
+                        {val ? 'True' : 'False'}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
               {q.type === 'short_answer' && (
                 <input
                   value={String(chosen ?? '')}
@@ -172,7 +293,7 @@ function QuizRunner({
 
               {showReveal && q.explanation && (
                 <div className="rounded-lg bg-zinc-900 border border-zinc-800 px-3 py-2 text-xs text-zinc-300">
-                  <strong className="text-indigo-300">Explanation: </strong>
+                  <strong className="text-zinc-100">Explanation: </strong>
                   {q.explanation}
                 </div>
               )}
@@ -181,9 +302,9 @@ function QuizRunner({
         })}
       </div>
 
-      <div className="flex flex-wrap items-center justify-between gap-4 pt-2 border-t border-zinc-800">
-        <div className="flex items-center gap-3 text-xs text-zinc-300">
-          <span>Mental-model confidence:</span>
+      <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-zinc-800">
+        <div className="flex items-center gap-2.5 text-xs text-zinc-300">
+          <span>Confidence</span>
           <div className="flex gap-1">
             {[1, 2, 3, 4, 5].map((n) => (
               <button
@@ -192,7 +313,7 @@ function QuizRunner({
                 onClick={() => setConfidence(n)}
                 className={`w-7 h-7 rounded-md font-mono text-xs border transition ${
                   confidence === n
-                    ? 'bg-indigo-600 border-indigo-400 text-white'
+                    ? 'bg-indigo-600 border-indigo-500 text-white'
                     : 'bg-zinc-900 border-zinc-700 text-zinc-400 hover:text-zinc-200'
                 }`}
               >
@@ -203,20 +324,21 @@ function QuizRunner({
         </div>
 
         <button
+          type="button"
           disabled={submitting}
           onClick={handleSubmit}
-          className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white"
+          className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-xs font-medium text-white transition"
         >
-          {submitting ? 'Checking...' : 'Check Answers & Log Mastery'}
+          {submitting ? 'Checking...' : 'Submit answers'}
         </button>
       </div>
 
       {submittedResult && (
-        <div className="rounded-xl border border-indigo-500/40 bg-indigo-950/30 p-4 flex items-center justify-between">
-          <div className="text-sm font-semibold text-indigo-100">
+        <div className="rounded-lg border border-zinc-700 bg-zinc-950 px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-xs">
+          <div className="font-semibold text-zinc-100">
             Score: {submittedResult.score} / {submittedResult.total} ({submittedResult.percentage}%)
           </div>
-          <span className="text-xs text-indigo-300">Saved to .contextdeck/quizzes/{quiz.id}.quiz.json</span>
+          <span className="font-mono text-zinc-400">{quiz.id}</span>
         </div>
       )}
     </div>
@@ -232,7 +354,6 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
   const [showUpload, setShowUpload] = useState(false);
   const [showAddDoc, setShowAddDoc] = useState(false);
 
-  // Upload form
   const [upTitle, setUpTitle] = useState('');
   const [upKind, setUpKind] = useState<'video' | 'audio'>('video');
   const [upTranscript, setUpTranscript] = useState('');
@@ -240,7 +361,6 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
   const [upFile, setUpFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
 
-  // Add Doc form
   const [docTitle, setDocTitle] = useState('');
   const [docContent, setDocContent] = useState('');
   const [docDecisions, setDocDecisions] = useState('');
@@ -257,6 +377,12 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
       .filter((s) => s.artifactType === 'quiz')
       .map((s) => [s.artifactId, s]),
   );
+  const activeJobMap = new Map<string, RefreshJob>();
+  for (const job of snapshot.jobs ?? []) {
+    if (job.status === 'queued' || job.status === 'claimed') {
+      activeJobMap.set(`${job.artifactType}:${job.artifactId}`, job);
+    }
+  }
 
   const activeMedia: MediaArtifact | null =
     selected?.kind === 'media'
@@ -314,65 +440,69 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h2 className="text-base font-semibold text-zinc-100">
-            Learning Media, Videos, Quizzes & Reference Docs
-          </h2>
-          <p className="text-xs text-zinc-400">
-            Watch Kokoro TTS explainer videos, take knowledge-check quizzes, and catch stale learning material when decisions evolve.
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
+        <h2 className="text-base font-semibold text-zinc-100">Media &amp; Mastery</h2>
+        <div className="flex flex-wrap items-center gap-2">
           <button
+            type="button"
             onClick={() => setShowAddDoc(true)}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-xs font-medium text-zinc-200"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-xs font-medium text-zinc-200 transition"
           >
-            <Plus className="w-3.5 h-3.5" /> Add Note / Doc
+            <Plus className="w-3.5 h-3.5" /> Add doc
           </button>
           <button
+            type="button"
             onClick={() => setShowUpload(true)}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-medium text-white transition"
           >
-            <Upload className="w-3.5 h-3.5" /> Upload Video / Audio
+            <Upload className="w-3.5 h-3.5" /> Upload media
           </button>
         </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-        {/* Left Library List */}
-        <div className="lg:col-span-4 space-y-4">
+        <div className="lg:col-span-4 space-y-4 min-w-0">
           <div className="space-y-2">
             <div className="text-[11px] uppercase tracking-wider text-zinc-400 font-semibold px-1 flex items-center gap-1.5">
-              <HelpCircle className="w-3.5 h-3.5 text-pink-400" /> Interactive Quizzes ({snapshot.quizzes.length})
+              <HelpCircle className="w-3.5 h-3.5 text-zinc-400" /> Quizzes ({snapshot.quizzes.length})
             </div>
             {snapshot.quizzes.map((q) => {
-              const latest = q.attempts[q.attempts.length - 1];
+              const trend = computeMasteryTrend(q.attempts);
               const isStale = staleQuizMap.has(q.id);
+              const activeJob = activeJobMap.get(`quiz:${q.id}`);
               const isSelected = selected?.kind === 'quiz' && selected.id === q.id;
               return (
                 <button
                   key={q.id}
+                  type="button"
                   onClick={() => setSelected({ kind: 'quiz', id: q.id })}
-                  className={`w-full text-left rounded-xl border p-3 transition ${
+                  className={`w-full text-left rounded-lg border p-3 transition ${
                     isSelected
-                      ? 'border-indigo-500/60 bg-indigo-500/10'
-                      : 'border-zinc-800 bg-zinc-900/50 hover:border-zinc-700'
+                      ? 'border-indigo-500 bg-zinc-900'
+                      : 'border-zinc-800 bg-zinc-900 hover:border-zinc-700'
                   }`}
                 >
                   <div className="flex items-center justify-between gap-2 mb-1">
-                    <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-pink-500/15 text-pink-300 font-semibold">
-                      quiz • {q.questions.length} Qs
+                    <span className="text-[10px] font-mono uppercase text-zinc-400">
+                      quiz · {q.questions.length} Qs · v{q.version ?? 1}
                     </span>
-                    {latest && (
-                      <span className="text-[11px] font-mono text-emerald-300">
-                        {latest.percentage}%
+                    {trend && (
+                      <span className="text-[11px] font-mono text-zinc-200">
+                        {trend.latestPct}%
+                        {trend.delta !== null && (
+                          <span className="text-zinc-400 ml-1">
+                            ({trend.delta > 0 ? `+${trend.delta}` : trend.delta}%)
+                          </span>
+                        )}
                       </span>
                     )}
                   </div>
-                  <div className="text-xs font-semibold text-zinc-100">{q.title}</div>
+                  <div className="text-xs font-semibold text-zinc-100 break-words">{q.title}</div>
                   {isStale && (
-                    <div className="mt-1 inline-flex items-center gap-1 text-[10px] text-amber-300">
-                      <AlertTriangle className="w-3 h-3" /> Decision changed
+                    <div className="mt-1.5">
+                      <StatusBadge
+                        status={activeJob ? 'refreshing' : 'stale'}
+                        label={activeJob ? 'Refreshing' : 'Stale'}
+                      />
                     </div>
                   )}
                 </button>
@@ -381,61 +511,68 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
           </div>
 
           <div className="space-y-2">
-            <div className="text-[11px] uppercase tracking-wider text-zinc-400 font-semibold px-1 flex items-center gap-1.5">
-              <BookOpen className="w-3.5 h-3.5 text-sky-400" /> Videos, Audio & Docs ({snapshot.media.length})
+            <div className="text-[11px] uppercase tracking-wider text-zinc-400 font-semibold px-1">
+              Artifacts ({snapshot.media.length})
             </div>
             {snapshot.media.map((m) => {
               const isStale = staleMediaMap.has(m.id);
+              const activeJob = activeJobMap.get(`media:${m.id}`);
               const isSelected = selected?.kind === 'media' && selected.id === m.id;
               return (
                 <button
                   key={m.id}
+                  type="button"
                   onClick={() => setSelected({ kind: 'media', id: m.id })}
-                  className={`w-full text-left rounded-xl border p-3 transition ${
+                  className={`w-full text-left rounded-lg border p-3 transition ${
                     isSelected
-                      ? 'border-indigo-500/60 bg-indigo-500/10'
-                      : 'border-zinc-800 bg-zinc-900/50 hover:border-zinc-700'
+                      ? 'border-indigo-500 bg-zinc-900'
+                      : 'border-zinc-800 bg-zinc-900 hover:border-zinc-700'
                   }`}
                 >
                   <div className="flex items-center justify-between gap-2 mb-1">
-                    <span className="inline-flex items-center gap-1 text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-300 font-semibold">
+                    <span className="inline-flex items-center gap-1 text-[10px] font-mono uppercase text-zinc-400">
                       {m.kind === 'video' ? (
-                        <Film className="w-3 h-3 text-sky-400" />
+                        <Film className="w-3 h-3 text-zinc-400" />
                       ) : (
-                        <FileText className="w-3 h-3 text-indigo-400" />
+                        <FileText className="w-3 h-3 text-zinc-400" />
                       )}
-                      {m.kind}
+                      {m.kind} · v{m.version ?? 1}
                     </span>
                     {isStale && (
-                      <span className="inline-flex items-center gap-1 text-[10px] text-amber-300">
-                        <AlertTriangle className="w-3 h-3" /> Stale
-                      </span>
+                      <StatusBadge
+                        status={activeJob ? 'refreshing' : 'stale'}
+                        label={activeJob ? 'Refreshing' : 'Stale'}
+                      />
                     )}
                   </div>
-                  <div className="text-xs font-semibold text-zinc-100">{m.title}</div>
+                  <div className="text-xs font-semibold text-zinc-100 break-words">{m.title}</div>
                 </button>
               );
             })}
           </div>
         </div>
 
-        {/* Right Detail / Player / Runner */}
-        <div className="lg:col-span-8 rounded-xl border border-zinc-800 bg-zinc-900/50 p-5 min-h-[520px]">
+        <div className="lg:col-span-8 rounded-lg border border-zinc-800 bg-zinc-900 p-4 sm:p-5 min-h-[420px] min-w-0">
           {activeQuiz ? (
             <QuizRunner
               key={activeQuiz.id}
               slug={snapshot.config.slug}
               quiz={activeQuiz}
+              snapshot={snapshot}
+              staleReasons={staleQuizMap.get(activeQuiz.id)?.reasons}
+              activeJob={activeJobMap.get(`quiz:${activeQuiz.id}`)}
               onSubmitted={onRefresh}
             />
           ) : activeMedia ? (
             <div className="space-y-4">
               <div className="flex items-start justify-between gap-3">
-                <div>
-                  <div className="text-[11px] uppercase tracking-wider text-sky-400 font-semibold">
-                    {activeMedia.kind} artifact
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono text-zinc-400">
+                    <span className="uppercase">{activeMedia.kind}</span>
+                    <span>v{activeMedia.version ?? 1}</span>
+                    <span>{activeMedia.id}</span>
                   </div>
-                  <h3 className="text-base font-semibold text-zinc-100 mt-0.5">
+                  <h3 className="text-base font-semibold text-zinc-100 mt-0.5 break-words">
                     {activeMedia.title}
                   </h3>
                   {activeMedia.tags.length > 0 && (
@@ -443,7 +580,7 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
                       {activeMedia.tags.map((t) => (
                         <span
                           key={t}
-                          className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400"
+                          className="text-[10px] px-1.5 py-0.5 rounded border border-zinc-800 bg-zinc-950 text-zinc-400"
                         >
                           #{t}
                         </span>
@@ -452,49 +589,49 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
                   )}
                 </div>
                 <button
+                  type="button"
                   onClick={async () => {
                     await api.deleteMedia(snapshot.config.slug, activeMedia.id);
                     setSelected(null);
                     onRefresh();
                   }}
-                  className="p-1.5 rounded-lg text-zinc-500 hover:text-rose-400 hover:bg-zinc-800"
+                  className="p-1.5 rounded-lg text-zinc-500 hover:text-rose-400 hover:bg-zinc-800 shrink-0"
                   title="Delete artifact"
                 >
                   <Trash2 className="w-4 h-4" />
                 </button>
               </div>
 
+              <ConfirmationBadges confirmations={activeMedia.confirmations} />
+
               {staleMediaMap.has(activeMedia.id) && (
-                <div className="rounded-lg border border-amber-500/35 bg-amber-950/25 px-4 py-3 flex flex-wrap items-center justify-between gap-3">
-                  <div className="space-y-0.5">
-                    <div className="text-xs font-semibold text-amber-200 flex items-center gap-1.5">
-                      <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
-                      Reference artifact predates a newer decision
-                    </div>
-                    <div className="text-[11px] text-amber-200/80">
-                      {staleMediaMap.get(activeMedia.id)!.reasons.join(' • ')}
-                    </div>
+                <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-3.5 space-y-2.5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <StatusBadge
+                      status={activeJobMap.has(`media:${activeMedia.id}`) ? 'refreshing' : 'stale'}
+                      label={activeJobMap.has(`media:${activeMedia.id}`) ? 'Refreshing' : 'Stale'}
+                    />
+                    <span className="text-xs text-zinc-300">
+                      {staleMediaMap.get(activeMedia.id)!.reasons.join(' · ')}
+                    </span>
                   </div>
-                  <button
-                    onClick={async () => {
-                      await api.refreshArtifact(snapshot.config.slug, 'media', activeMedia.id);
-                      onRefresh();
-                    }}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600/20 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-600/30 text-xs font-medium"
-                  >
-                    <RefreshCw className="w-3.5 h-3.5" /> Mark Aligned
-                  </button>
+                  <StaleArtifactActions
+                    boardSlug={snapshot.config.slug}
+                    artifactType="media"
+                    artifactId={activeMedia.id}
+                    activeJob={activeJobMap.get(`media:${activeMedia.id}`)}
+                    onUpdated={onRefresh}
+                  />
                 </div>
               )}
 
-              {/* Video / Audio Player */}
               {activeMedia.kind === 'video' && (
                 <div className="space-y-3">
                   {activeMedia.filePath || isSafeHttpUrl(activeMedia.externalUrl) ? (
                     <video
                       ref={videoRef}
                       controls
-                      className="w-full rounded-xl border border-zinc-800 bg-black max-h-[400px]"
+                      className="w-full rounded-lg border border-zinc-800 bg-black max-h-[400px]"
                       src={
                         activeMedia.filePath
                           ? `/api/boards/${encodeURIComponent(snapshot.config.slug)}/media/${encodeURIComponent(activeMedia.id)}/file`
@@ -502,21 +639,8 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
                       }
                     />
                   ) : (
-                    <div className="rounded-xl border border-dashed border-zinc-700 bg-zinc-950 p-6 text-center space-y-2">
-                      <Film className="w-8 h-8 text-zinc-600 mx-auto" />
-                      <div className="text-xs text-zinc-300 font-medium">
-                        No video binary attached yet
-                      </div>
-                      <p className="text-[11px] text-zinc-500 max-w-md mx-auto">
-                        Attach a rendered <code className="text-indigo-300">.mp4</code> /{' '}
-                        <code className="text-indigo-300">.webm</code> from your{' '}
-                        <code className="text-indigo-300">idea-to-video</code> skill via the Upload
-                        button or{' '}
-                        <code className="text-indigo-300">
-                          cdeck media add &quot;Title&quot; --type video --file video.mp4
-                        </code>
-                        .
-                      </p>
+                    <div className="rounded-lg border border-dashed border-zinc-700 bg-zinc-950 p-5 text-center text-xs text-zinc-400">
+                      No video file attached.
                     </div>
                   )}
 
@@ -529,13 +653,14 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
                         {activeMedia.chapters.map((ch, idx) => (
                           <button
                             key={idx}
+                            type="button"
                             onClick={() => {
                               if (videoRef.current) {
                                 videoRef.current.currentTime = ch.timeSec;
                                 void videoRef.current.play();
                               }
                             }}
-                            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-zinc-800 bg-zinc-950 hover:border-indigo-500/50 text-xs text-zinc-200"
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-zinc-800 bg-zinc-950 hover:border-indigo-500 text-xs text-zinc-200"
                           >
                             <span className="font-mono text-indigo-400">
                               {formatTime(ch.timeSec)}
@@ -550,7 +675,7 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
                   {activeMedia.transcript && (
                     <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-4 space-y-1.5">
                       <div className="text-[11px] uppercase tracking-wider text-zinc-400">
-                        Narration / Kokoro TTS Transcript
+                        Transcript
                       </div>
                       <p className="text-xs text-zinc-300 leading-relaxed whitespace-pre-wrap">
                         {activeMedia.transcript}
@@ -569,7 +694,7 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
               )}
 
               {activeMedia.kind === 'doc' && (
-                <div className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-5">
+                <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-4 overflow-x-auto">
                   <MarkdownView content={activeMedia.content || ''} />
                 </div>
               )}
@@ -594,7 +719,7 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
                   href={activeMedia.externalUrl}
                   target="_blank"
                   rel="noreferrer"
-                  className="inline-flex text-sm text-indigo-400 underline"
+                  className="inline-flex text-sm text-indigo-400 underline break-all"
                 >
                   {activeMedia.externalUrl}
                 </a>
@@ -602,28 +727,31 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
             </div>
           ) : (
             <div className="py-16 text-center text-xs text-zinc-500">
-              Select a quiz, video explainer, or reference doc from the left list.
+              Select an item to view.
             </div>
           )}
         </div>
       </div>
 
-      {/* Upload Video / Audio Modal */}
       {showUpload && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4">
           <form
             onSubmit={handleUpload}
-            className="w-full max-w-md rounded-xl border border-zinc-800 bg-zinc-900 p-5 space-y-4 shadow-2xl"
+            className="w-full max-w-md rounded-lg border border-zinc-800 bg-zinc-900 p-5 space-y-4"
           >
             <div className="flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-zinc-100">Upload Video / Audio Artifact</h3>
-              <button type="button" onClick={() => setShowUpload(false)} className="text-zinc-400 hover:text-white">
+              <h3 className="text-sm font-semibold text-zinc-100">Upload media</h3>
+              <button
+                type="button"
+                onClick={() => setShowUpload(false)}
+                className="text-zinc-400 hover:text-zinc-100"
+              >
                 <X className="w-4 h-4" />
               </button>
             </div>
             <div className="space-y-3">
               <div>
-                <label className="block text-xs text-zinc-400 mb-1">Media File (.mp4, .webm, .mp3, .wav)</label>
+                <label className="block text-xs text-zinc-400 mb-1">Media file</label>
                 <input
                   required
                   type="file"
@@ -632,8 +760,8 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
                   className="w-full text-xs text-zinc-300 file:mr-3 file:rounded-md file:border-0 file:bg-zinc-800 file:px-3 file:py-1.5 file:text-xs file:text-zinc-200"
                 />
               </div>
-              <div className="grid grid-cols-3 gap-2">
-                <div className="col-span-2">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                <div className="sm:col-span-2">
                   <label className="block text-xs text-zinc-400 mb-1">Title</label>
                   <input
                     value={upTitle}
@@ -664,7 +792,9 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
                 />
               </div>
               <div>
-                <label className="block text-xs text-zinc-400 mb-1">Based on Decision IDs (optional)</label>
+                <label className="block text-xs text-zinc-400 mb-1">
+                  Based on Decision IDs (optional)
+                </label>
                 <input
                   value={upDecisions}
                   onChange={(e) => setUpDecisions(e.target.value)}
@@ -674,13 +804,17 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
               </div>
             </div>
             <div className="flex justify-end gap-2">
-              <button type="button" onClick={() => setShowUpload(false)} className="px-3 py-1.5 text-xs text-zinc-400">
+              <button
+                type="button"
+                onClick={() => setShowUpload(false)}
+                className="px-3 py-1.5 text-xs text-zinc-400"
+              >
                 Cancel
               </button>
               <button
                 disabled={uploading || !upFile}
                 type="submit"
-                className="px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-xs font-semibold text-white"
+                className="px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-xs font-medium text-white"
               >
                 {uploading ? 'Uploading...' : 'Upload'}
               </button>
@@ -689,16 +823,19 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
         </div>
       )}
 
-      {/* Add Doc Modal */}
       {showAddDoc && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4">
           <form
             onSubmit={handleAddDoc}
-            className="w-full max-w-lg rounded-xl border border-zinc-800 bg-zinc-900 p-5 space-y-4 shadow-2xl"
+            className="w-full max-w-lg rounded-lg border border-zinc-800 bg-zinc-900 p-5 space-y-4"
           >
             <div className="flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-zinc-100">Add Markdown Reference Doc</h3>
-              <button type="button" onClick={() => setShowAddDoc(false)} className="text-zinc-400 hover:text-white">
+              <h3 className="text-sm font-semibold text-zinc-100">Add doc</h3>
+              <button
+                type="button"
+                onClick={() => setShowAddDoc(false)}
+                className="text-zinc-400 hover:text-zinc-100"
+              >
                 <X className="w-4 h-4" />
               </button>
             </div>
@@ -722,7 +859,9 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
                 />
               </div>
               <div>
-                <label className="block text-xs text-zinc-400 mb-1">Based on Decision IDs (optional)</label>
+                <label className="block text-xs text-zinc-400 mb-1">
+                  Based on Decision IDs (optional)
+                </label>
                 <input
                   value={docDecisions}
                   onChange={(e) => setDocDecisions(e.target.value)}
@@ -732,14 +871,18 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
               </div>
             </div>
             <div className="flex justify-end gap-2">
-              <button type="button" onClick={() => setShowAddDoc(false)} className="px-3 py-1.5 text-xs text-zinc-400">
+              <button
+                type="button"
+                onClick={() => setShowAddDoc(false)}
+                className="px-3 py-1.5 text-xs text-zinc-400"
+              >
                 Cancel
               </button>
               <button
                 type="submit"
-                className="px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white"
+                className="px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-medium text-white"
               >
-                Save Doc
+                Save doc
               </button>
             </div>
           </form>

@@ -1,7 +1,7 @@
 export interface LensConfig {
   id: string;
   title: string;
-  kind: 'brief' | 'sessions' | 'decisions_canvas' | 'tasks' | 'media_mastery' | 'custom';
+  kind: 'catchup' | 'brief' | 'sessions' | 'decisions_canvas' | 'tasks' | 'media_mastery' | 'custom';
   enabled: boolean;
   icon?: string;
   artifactKinds?: string[];
@@ -72,6 +72,24 @@ export interface Task {
   updatedAt: string;
 }
 
+export interface ArtifactConfirmation {
+  againstDecisionId: string;
+  confirmedBy: string;
+  actorType: 'human' | 'agent';
+  confirmedAt: string;
+  note: string;
+}
+
+export interface ArtifactVersionEntry {
+  version: number;
+  updatedAt: string;
+  boardRevision: number;
+  basedOnDecisions: string[];
+  filePath?: string;
+  createdByJob?: string;
+  note?: string;
+}
+
 export interface Diagram {
   id: string;
   title: string;
@@ -79,6 +97,9 @@ export interface Diagram {
   content: string;
   description: string;
   basedOnDecisions: string[];
+  version?: number;
+  history?: ArtifactVersionEntry[];
+  confirmations?: Record<string, ArtifactConfirmation>;
   sessionId?: string | null;
   boardRevisionAtUpdate: number;
   createdAt: string;
@@ -114,6 +135,9 @@ export interface Quiz {
   questions: QuizQuestion[];
   attempts: QuizAttempt[];
   basedOnDecisions: string[];
+  version?: number;
+  history?: ArtifactVersionEntry[];
+  confirmations?: Record<string, ArtifactConfirmation>;
   sessionId?: string | null;
   boardRevisionAtUpdate: number;
   createdAt: string;
@@ -140,10 +164,42 @@ export interface MediaArtifact {
   durationSec?: number;
   tags: string[];
   basedOnDecisions: string[];
+  version?: number;
+  history?: ArtifactVersionEntry[];
+  confirmations?: Record<string, ArtifactConfirmation>;
   sessionId?: string | null;
   boardRevisionAtUpdate: number;
   customLensId?: string;
   metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type RefreshJobArtifactType = 'diagram' | 'media' | 'quiz';
+export type RefreshJobStatus = 'queued' | 'claimed' | 'done' | 'failed';
+
+export interface RefreshJob {
+  id: string;
+  kind: 'refresh';
+  artifactType: RefreshJobArtifactType;
+  artifactId: string;
+  artifactTitle: string;
+  mediaKind?: MediaKind;
+  diagramKind?: 'mermaid' | 'excalidraw';
+  reason: string;
+  decisionsBefore: string[];
+  decisionsNow: string[];
+  baseVersion: number;
+  status: RefreshJobStatus;
+  claimedBy: string | null;
+  leaseToken: string | null;
+  claimedAt: string | null;
+  leaseExpiresAt: string | null;
+  result: {
+    artifactVersion?: number;
+    summary?: string;
+    error?: string;
+  } | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -193,6 +249,58 @@ export interface DriftedSessionNotice {
   truncatedCount: number;
 }
 
+export interface CatchUpDecisionChange {
+  decisionId: string;
+  title: string;
+  status: DecisionStatus;
+  summary: string;
+  rationaleLine: string;
+  previousDecisionId?: string;
+  previousTitle?: string;
+  revision: number;
+  timestamp: string;
+}
+
+export interface CatchUpStaleArtifact {
+  artifactType: RefreshJobArtifactType;
+  artifactId: string;
+  title: string;
+  staleDecisionIds: string[];
+  reasons: string[];
+  activeJob: {
+    id: string;
+    status: RefreshJobStatus;
+    claimedBy: string | null;
+  } | null;
+}
+
+export interface CatchUpTaskMove {
+  taskId: string;
+  title: string;
+  fromColumn: TaskColumn | null;
+  toColumn: TaskColumn;
+  revision: number;
+}
+
+export interface CatchUpNewSession {
+  sessionId: string;
+  title: string;
+  harness: string;
+  createdAt: string;
+}
+
+export interface CatchUpReport {
+  fromRevision: number;
+  toRevision: number;
+  lastReviewedAt: string | null;
+  unseenCount: number;
+  hasUnseen: boolean;
+  decisionsChanged: CatchUpDecisionChange[];
+  staleArtifacts: CatchUpStaleArtifact[];
+  tasksMoved: CatchUpTaskMove[];
+  newSessions: CatchUpNewSession[];
+}
+
 export interface BoardSnapshot {
   config: BoardConfig;
   brief: string;
@@ -202,6 +310,7 @@ export interface BoardSnapshot {
   diagrams: Diagram[];
   media: MediaArtifact[];
   quizzes: Quiz[];
+  jobs?: RefreshJob[];
   events: BoardEvent[];
   drift: {
     currentRevision: number;

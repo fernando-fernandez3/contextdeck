@@ -9,11 +9,11 @@ interface TasksLensProps {
   onRefresh: () => void;
 }
 
-const COLUMNS: Array<{ id: TaskColumn; label: string; accent: string }> = [
-  { id: 'backlog', label: 'Backlog', accent: 'border-t-zinc-500' },
-  { id: 'in_progress', label: 'In Progress', accent: 'border-t-sky-500' },
-  { id: 'in_review', label: 'In Review', accent: 'border-t-amber-500' },
-  { id: 'done', label: 'Done', accent: 'border-t-emerald-500' },
+const COLUMNS: Array<{ id: TaskColumn; label: string }> = [
+  { id: 'backlog', label: 'Backlog' },
+  { id: 'in_progress', label: 'In Progress' },
+  { id: 'in_review', label: 'In Review' },
+  { id: 'done', label: 'Done' },
 ];
 
 export function TasksLens({ snapshot, onRefresh }: TasksLensProps) {
@@ -61,18 +61,14 @@ export function TasksLens({ snapshot, onRefresh }: TasksLensProps) {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-base font-semibold text-zinc-100">Shared Kanban Work Board</h2>
-          <p className="text-xs text-zinc-400">
-            Drag cards across columns or let connected agents update task status via MCP / CLI.
-          </p>
-        </div>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-base font-semibold text-zinc-100">Tasks</h2>
         <button
+          type="button"
           onClick={() => setShowNew(true)}
-          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white"
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-medium text-white transition"
         >
-          <Plus className="w-3.5 h-3.5" /> New Task
+          <Plus className="w-3.5 h-3.5" /> Add task
         </button>
       </div>
 
@@ -89,13 +85,13 @@ export function TasksLens({ snapshot, onRefresh }: TasksLensProps) {
                 setDraggingId(null);
                 if (task) await handleMove(task, col.id);
               }}
-              className={`rounded-xl border border-zinc-800 border-t-2 ${col.accent} bg-zinc-900/50 p-3 min-h-[420px] flex flex-col gap-3`}
+              className="rounded-lg border border-zinc-800 bg-zinc-900 p-3 min-h-[340px] flex flex-col gap-3 min-w-0"
             >
               <div className="flex items-center justify-between px-1">
                 <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-300">
                   {col.label}
                 </h3>
-                <span className="text-[11px] font-mono text-zinc-500 bg-zinc-800 px-1.5 py-0.5 rounded">
+                <span className="text-[11px] font-mono text-zinc-400 bg-zinc-950 border border-zinc-800 px-1.5 py-0.5 rounded">
                   {cards.length}
                 </span>
               </div>
@@ -109,41 +105,46 @@ export function TasksLens({ snapshot, onRefresh }: TasksLensProps) {
                       draggable
                       onDragStart={() => setDraggingId(task.id)}
                       onDragEnd={() => setDraggingId(null)}
-                      className="rounded-lg border border-zinc-800 bg-zinc-950/90 hover:border-zinc-700 p-3 space-y-2 cursor-grab active:cursor-grabbing transition"
+                      className="rounded-lg border border-zinc-800 bg-zinc-950 hover:border-zinc-700 p-3 space-y-2 cursor-grab active:cursor-grabbing transition"
                     >
                       <div className="flex items-center justify-between gap-2">
-                        <div className="flex items-center gap-1.5">
-                          <span className="font-mono text-[10px] text-zinc-500">{task.id}</span>
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className="font-mono text-[10px] text-zinc-500 truncate">
+                            {task.id}
+                          </span>
                           <PriorityBadge priority={task.priority} />
                         </div>
                         <button
+                          type="button"
                           onClick={async () => {
                             await api.deleteTask(snapshot.config.slug, task.id);
                             onRefresh();
                           }}
-                          className="text-zinc-600 hover:text-rose-400"
+                          className="text-zinc-500 hover:text-rose-400 shrink-0"
                           title="Delete task"
                         >
                           <Trash2 className="w-3 h-3" />
                         </button>
                       </div>
 
-                      <div className="text-xs font-semibold text-zinc-100 leading-snug">
+                      <div className="text-xs font-semibold text-zinc-100 leading-snug break-words">
                         {task.title}
                       </div>
 
                       {task.description && (
-                        <p className="text-[11px] text-zinc-400 line-clamp-3">{task.description}</p>
+                        <p className="text-[11px] text-zinc-400 line-clamp-3 break-words">
+                          {task.description}
+                        </p>
                       )}
 
                       {isStale && (
-                        <div className="flex items-center gap-1 text-[10px] text-amber-300 bg-amber-500/10 border border-amber-500/25 rounded px-2 py-1">
+                        <div className="flex items-center gap-1 text-[10px] text-amber-300 bg-zinc-900 border border-zinc-700 rounded px-2 py-1">
                           <AlertTriangle className="w-3 h-3 shrink-0" />
                           Linked decision superseded
                         </div>
                       )}
 
-                      <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-zinc-800/80">
+                      <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-zinc-800">
                         <HarnessBadge harness={task.assignee} />
                         <select
                           aria-label="Move column"
@@ -164,7 +165,7 @@ export function TasksLens({ snapshot, onRefresh }: TasksLensProps) {
                           {task.linkedDecisionIds.map((d) => (
                             <span
                               key={d}
-                              className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-300"
+                              className="font-mono text-[10px] px-1.5 py-0.5 rounded border border-zinc-800 bg-zinc-900 text-indigo-300"
                             >
                               {d}
                             </span>
@@ -172,7 +173,7 @@ export function TasksLens({ snapshot, onRefresh }: TasksLensProps) {
                           {task.linkedSessionIds.map((s) => (
                             <span
                               key={s}
-                              className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400"
+                              className="font-mono text-[10px] px-1.5 py-0.5 rounded border border-zinc-800 bg-zinc-900 text-zinc-400"
                             >
                               {s}
                             </span>
@@ -189,14 +190,18 @@ export function TasksLens({ snapshot, onRefresh }: TasksLensProps) {
       </div>
 
       {showNew && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4">
           <form
             onSubmit={handleCreate}
-            className="w-full max-w-md rounded-xl border border-zinc-800 bg-zinc-900 p-5 space-y-4 shadow-2xl"
+            className="w-full max-w-md rounded-lg border border-zinc-800 bg-zinc-900 p-5 space-y-4"
           >
             <div className="flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-zinc-100">Create Task</h3>
-              <button type="button" onClick={() => setShowNew(false)} className="text-zinc-400 hover:text-white">
+              <h3 className="text-sm font-semibold text-zinc-100">Add task</h3>
+              <button
+                type="button"
+                onClick={() => setShowNew(false)}
+                className="text-zinc-400 hover:text-zinc-100"
+              >
                 <X className="w-4 h-4" />
               </button>
             </div>
@@ -210,7 +215,7 @@ export function TasksLens({ snapshot, onRefresh }: TasksLensProps) {
                   className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-100"
                 />
               </div>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                 <div>
                   <label className="block text-xs text-zinc-400 mb-1">Column</label>
                   <select
@@ -258,7 +263,9 @@ export function TasksLens({ snapshot, onRefresh }: TasksLensProps) {
                 />
               </div>
               <div>
-                <label className="block text-xs text-zinc-400 mb-1">Linked Decisions (optional)</label>
+                <label className="block text-xs text-zinc-400 mb-1">
+                  Linked Decisions (optional)
+                </label>
                 <input
                   value={decisionsRaw}
                   onChange={(e) => setDecisionsRaw(e.target.value)}
@@ -268,14 +275,18 @@ export function TasksLens({ snapshot, onRefresh }: TasksLensProps) {
               </div>
             </div>
             <div className="flex justify-end gap-2">
-              <button type="button" onClick={() => setShowNew(false)} className="px-3 py-1.5 text-xs text-zinc-400">
+              <button
+                type="button"
+                onClick={() => setShowNew(false)}
+                className="px-3 py-1.5 text-xs text-zinc-400 hover:text-zinc-200"
+              >
                 Cancel
               </button>
               <button
                 type="submit"
-                className="px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white"
+                className="px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-medium text-white"
               >
-                Create Task
+                Add task
               </button>
             </div>
           </form>

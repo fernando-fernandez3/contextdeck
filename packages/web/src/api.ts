@@ -1,12 +1,15 @@
 import type {
   BoardConfig,
   BoardSnapshot,
+  CatchUpReport,
   Decision,
   Diagram,
   MediaArtifact,
   MediaKind,
   Quiz,
   QuizAttempt,
+  RefreshJob,
+  RefreshJobArtifactType,
   Session,
   Task,
 } from './types';
@@ -125,6 +128,19 @@ export const api = {
     }),
 
   getBoard: (slug: string) => req<BoardSnapshot>(`/api/boards/${encodeURIComponent(slug)}`),
+
+  getCatchUp: (slug: string) =>
+    req<CatchUpReport>(`/api/boards/${encodeURIComponent(slug)}/catchup`),
+
+  ackCatchUp: (slug: string, revision: number) =>
+    req<{ cursor: { lastReviewedRevision: number; lastReviewedAt: string }; catchUp: CatchUpReport }>(
+      `/api/boards/${encodeURIComponent(slug)}/reader/ack`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ revision }),
+      },
+    ),
 
   getContextPack: (slug: string, includeProtocol = true) =>
     req<{ slug: string; revision: number; markdown: string }>(
@@ -280,13 +296,37 @@ export const api = {
       },
     ),
 
-  refreshArtifact: (
+  confirmArtifact: (
     slug: string,
-    type: 'diagram' | 'media' | 'quiz' | 'task',
+    type: RefreshJobArtifactType,
     id: string,
+    note?: string,
   ) =>
-    req<{ refreshed: boolean }>(
-      `/api/boards/${encodeURIComponent(slug)}/artifacts/${type}/${encodeURIComponent(id)}/refresh`,
-      { method: 'POST' },
+    req<Diagram | MediaArtifact | Quiz>(
+      `/api/boards/${encodeURIComponent(slug)}/artifacts/${type}/${encodeURIComponent(id)}/confirm`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(note ? { note } : {}),
+      },
+    ),
+
+  createRefreshJob: (
+    slug: string,
+    artifactType: RefreshJobArtifactType,
+    artifactId: string,
+    reason?: string,
+  ) =>
+    req<{ job: RefreshJob; deduplicated: boolean }>(
+      `/api/boards/${encodeURIComponent(slug)}/jobs`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          artifactType,
+          artifactId,
+          ...(reason ? { reason } : {}),
+        }),
+      },
     ),
 };
