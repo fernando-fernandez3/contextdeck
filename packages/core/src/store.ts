@@ -119,6 +119,14 @@ export interface WatchOptions {
   debounceMs?: number;
 }
 
+export interface HookDeliveryAck {
+  sessionId: string;
+  boardSlug: string;
+  revision: number;
+  stampCursorThrottle?: boolean;
+  now?: string;
+}
+
 interface WorkspaceMeta {
   defaultBoard: string;
   updatedAt: string;
@@ -2587,11 +2595,41 @@ export class ContextDeckStore {
   }
 
   /**
+   * Commit a hook delivery cursor acknowledgement AFTER stdout has been flushed (D12 at-least-once).
+   * Monotonically advances `.runtime/cursors/<sessionId>.json` via atomic write so concurrent or
+   * stale deliveries never rewind a newer cursor and never dirty git-tracked files.
+   */
+  public async commitHookDelivery(ack: HookDeliveryAck): Promise<SessionCursor> {
+    const validId = validateEntityId(ack.sessionId, 'sessionId');
+    const validBoard = validateBoardSlug(ack.boardSlug);
+    const nowStr = ack.now ?? nowIso();
+
+    const existingCursor = await this.readSessionCursor(validId);
+    const prevSynced = existingCursor?.syncedRevisions[validBoard] ?? 0;
+    const nextCursor: SessionCursor = {
+      sessionId: validId,
+      syncedRevisions: {
+        ...(existingCursor?.syncedRevisions ?? {}),
+        [validBoard]: Math.max(prevSynced, ack.revision),
+      },
+      lastActiveAt: nowStr,
+      ...(ack.stampCursorThrottle
+        ? { lastCursorInjectAt: nowStr }
+        : existingCursor?.lastCursorInjectAt
+          ? { lastCursorInjectAt: existingCursor.lastCursorInjectAt }
+          : {}),
+    };
+    await this.writeSessionCursor(nextCursor);
+    return nextCursor;
+  }
+
+  /**
    * Hook helper for SessionStart / sessionStart (AC5.1-AC5.4, D11, D12, D15):
    * - Runs under workspace lock bounded by `maxWaitMs` (default 800ms).
    * - Deduplicates by `externalRef`; never stores raw prompt text; routes new sessions via board `paths` globs.
    * - Does NOT bump `board.yaml` revision or churn `events.jsonl`.
-   * - Advances `.runtime/cursors/<id>.json` to the snapshot revision returned.
+   * - When `deferCursorCommit` is true, returns `pendingAck` without advancing the cursor yet so the
+   *   caller can flush stdout first and then call `commitHookDelivery(pendingAck)` (at-least-once).
    */
   public async upsertHookSession(params: {
     externalRef: string;
@@ -2599,11 +2637,13 @@ export class ContextDeckStore {
     defaultTitle: string;
     cwd?: string;
     maxWaitMs?: number;
+    deferCursorCommit?: boolean;
   }): Promise<{
     session: Session;
     boardSlug: string;
     snapshot: BoardSnapshot;
     created: boolean;
+    pendingAck: HookDeliveryAck;
   }> {
     const maxWaitMs = params.maxWaitMs ?? 800;
     return withWorkspaceLock(
@@ -2678,25 +2718,40 @@ export class ContextDeckStore {
 
         const snapshot = await this.readSnapshotOnce(boardSlug);
         const existingCursor = await this.readSessionCursor(meta.id);
-        const nextCursor: SessionCursor = {
+        const pendingAck: HookDeliveryAck = {
           sessionId: meta.id,
-          syncedRevisions: {
-            ...(existingCursor?.syncedRevisions ?? {}),
-            [boardSlug]: snapshot.config.revision,
-          },
-          lastActiveAt: now,
-          ...(existingCursor?.lastCursorInjectAt
-            ? { lastCursorInjectAt: existingCursor.lastCursorInjectAt }
-            : {}),
+          boardSlug,
+          revision: snapshot.config.revision,
+          now,
         };
-        assertActive();
-        await this.writeSessionCursor(nextCursor);
+
+        let hydratedCursor = existingCursor;
+        if (!params.deferCursorCommit) {
+          const nextCursor: SessionCursor = {
+            sessionId: meta.id,
+            syncedRevisions: {
+              ...(existingCursor?.syncedRevisions ?? {}),
+              [boardSlug]: Math.max(
+                existingCursor?.syncedRevisions[boardSlug] ?? 0,
+                snapshot.config.revision,
+              ),
+            },
+            lastActiveAt: now,
+            ...(existingCursor?.lastCursorInjectAt
+              ? { lastCursorInjectAt: existingCursor.lastCursorInjectAt }
+              : {}),
+          };
+          assertActive();
+          await this.writeSessionCursor(nextCursor);
+          hydratedCursor = nextCursor;
+        }
 
         return {
-          session: this.hydrateSession(meta, boardSlug, nextCursor),
+          session: this.hydrateSession(meta, boardSlug, hydratedCursor),
           boardSlug,
           snapshot,
           created,
+          pendingAck,
         };
       },
       this.deckDir,
@@ -2710,6 +2765,8 @@ export class ContextDeckStore {
    * 2. Enforces optional throttleMs (Cursor 60s) without advancing cursor when throttled.
    * 3. Acquires bounded workspace lock (`maxWaitMs`, default 800ms) only when registering or emitting a digest.
    *    If the lock times out, throws LockTimeoutError and leaves the cursor unchanged.
+   * 4. When `deferCursorCommit` is true, returns `pendingAck` WITHOUT writing the advanced cursor yet so the
+   *    caller can write & drain stdout first and then call `commitHookDelivery(pendingAck)` (at-least-once).
    */
   public async checkAndSyncHookDrift(params: {
     externalRef: string;
@@ -2720,11 +2777,13 @@ export class ContextDeckStore {
     maxWaitMs?: number;
     maxDigestLines?: number;
     now?: Date;
+    deferCursorCommit?: boolean;
   }): Promise<{
     action: 'noop' | 'throttled' | 'registered_silent' | 'digest';
     session?: Session;
     boardConfig?: BoardConfig;
     digestResult?: SessionDigestResult;
+    pendingAck?: HookDeliveryAck;
   }> {
     const maxWaitMs = params.maxWaitMs ?? 800;
     const nowDate = params.now ?? new Date();
@@ -2862,28 +2921,44 @@ export class ContextDeckStore {
           }
         }
 
-        const nextCursor: SessionCursor = {
+        const pendingAck: HookDeliveryAck = {
           sessionId: existing.id,
-          syncedRevisions: {
-            ...(existingCursor?.syncedRevisions ?? {}),
-            [boardSlug]: boardConfig.revision,
-          },
-          lastActiveAt: nowStr,
-          // D12: Cursor throttle stamps ONLY when a digest is actually emitted
-          ...(params.throttleMs !== undefined
-            ? { lastCursorInjectAt: nowStr }
-            : existingCursor?.lastCursorInjectAt
-              ? { lastCursorInjectAt: existingCursor.lastCursorInjectAt }
-              : {}),
+          boardSlug,
+          revision: boardConfig.revision,
+          stampCursorThrottle: params.throttleMs !== undefined,
+          now: nowStr,
         };
-        assertActive();
-        await this.writeSessionCursor(nextCursor);
+
+        let hydratedCursor = existingCursor;
+        if (!params.deferCursorCommit) {
+          const nextCursor: SessionCursor = {
+            sessionId: existing.id,
+            syncedRevisions: {
+              ...(existingCursor?.syncedRevisions ?? {}),
+              [boardSlug]: Math.max(
+                existingCursor?.syncedRevisions[boardSlug] ?? 0,
+                boardConfig.revision,
+              ),
+            },
+            lastActiveAt: nowStr,
+            // D12: Cursor throttle stamps ONLY when a digest is actually emitted
+            ...(params.throttleMs !== undefined
+              ? { lastCursorInjectAt: nowStr }
+              : existingCursor?.lastCursorInjectAt
+                ? { lastCursorInjectAt: existingCursor.lastCursorInjectAt }
+                : {}),
+          };
+          assertActive();
+          await this.writeSessionCursor(nextCursor);
+          hydratedCursor = nextCursor;
+        }
 
         return {
           action: 'digest' as const,
-          session: this.hydrateSession(existing, boardSlug, nextCursor),
+          session: this.hydrateSession(existing, boardSlug, hydratedCursor),
           boardConfig,
           digestResult,
+          pendingAck,
         };
       },
       this.deckDir,

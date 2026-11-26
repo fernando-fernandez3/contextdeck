@@ -4,8 +4,11 @@ import path from 'node:path';
 import {
   ContextDeckStore,
   UNTRUSTED_BOARD_CONTENT_FOOTER,
+  UNTRUSTED_BOARD_CONTENT_HEADER,
   WorkspaceNotFoundError,
+  capSingleLine,
   generateContextPack,
+  neutralizeUntrustedDelimiters,
   resolveWorkspace,
   type ResolvedWorkspace,
 } from '@contextdeck/core';
@@ -104,6 +107,7 @@ function readBoundedStdin(maxBytes: number, timeoutMs: number): Promise<string> 
       process.stdin.removeListener('end', onEnd);
       process.stdin.removeListener('error', onError);
       process.stdin.pause();
+      (process.stdin as { unref?: () => void }).unref?.();
     };
 
     const fail = (err: Error) => {
@@ -247,16 +251,50 @@ function capBoundedDigest(text: string, maxChars: number): string {
   return `${text.slice(0, sliceLen).trimEnd()}${suffix}`;
 }
 
+function writeStdoutBounded(text: string, remainingMs: number): Promise<boolean> {
+  if (remainingMs <= 0) {
+    return Promise.resolve(false);
+  }
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      process.stdout.removeListener('error', onError);
+      resolve(ok);
+    };
+    const onError = () => finish(false);
+    const timer = setTimeout(() => finish(false), Math.max(10, remainingMs));
+    timer.unref();
+    process.stdout.once('error', onError);
+    try {
+      process.stdout.write(text, 'utf8', (err?: Error | null) => {
+        finish(!err);
+      });
+    } catch {
+      finish(false);
+    }
+  });
+}
+
+export interface RunHookCliOptions {
+  /** Only enabled by the CLI entrypoint (`cdeck hook`) as a last-resort safeguard after deadline. */
+  exitOnHardDeadline?: boolean;
+}
+
 /**
  * Execute `cdeck hook <harness> <event>` adhering strictly to C5, C6, AC5.1-AC5.4, D11, D12, D14:
  * - Unknown harness or unknown event -> silent exit 0.
  * - Any error, corrupt workspace, stalled stdin, or lock timeout -> print NOTHING to stdout,
  *   log to `.contextdeck/.runtime/hooks.log`, and exit 0 well within 2 seconds.
+ * - At-least-once delivery: write & flush stdout BEFORE acknowledging the cursor.
  */
 export async function runHookCli(
   rawHarness: string | undefined,
   rawEvent: string | undefined,
   env: NodeJS.ProcessEnv = process.env,
+  options: RunHookCliOptions = {},
 ): Promise<void> {
   // Unknown harness/event -> immediate silent exit 0 (Deliverable 1)
   if (!isKnownHarness(rawHarness) || !rawEvent) {
@@ -271,7 +309,7 @@ export async function runHookCli(
   let resolvedDeckDir: string | undefined;
   let deadlineTriggered = false;
 
-  const hardTimer = setTimeout(() => {
+  const softTimer = setTimeout(() => {
     deadlineTriggered = true;
     appendHookLogSync(
       resolvedDeckDir,
@@ -279,9 +317,17 @@ export async function runHookCli(
       rawEvent,
       `Hook aborted at internal deadline (${HOOK_DEADLINE_MS}ms)`,
     );
-    process.exit(0);
   }, HOOK_DEADLINE_MS);
-  hardTimer.unref();
+  softTimer.unref();
+
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  if (options.exitOnHardDeadline) {
+    // Last-resort safety kill slightly after the soft deadline (still < 2s) if a handle hangs.
+    killTimer = setTimeout(() => {
+      process.exit(0);
+    }, HOOK_DEADLINE_MS + 150);
+    killTimer.unref();
+  }
 
   try {
     // Best-effort deckDir lookup for logging early stdin errors
@@ -353,12 +399,13 @@ export async function runHookCli(
     );
 
     if (eventAction === 'start') {
-      const { session, boardSlug, snapshot } = await store.upsertHookSession({
+      const { session, boardSlug, snapshot, pendingAck } = await store.upsertHookSession({
         externalRef,
         harness: rawHarness,
         defaultTitle,
         cwd: payloadCwd,
         maxWaitMs: remainingForLock,
+        deferCursorCommit: true,
       });
 
       if (deadlineTriggered) return;
@@ -372,7 +419,10 @@ export async function runHookCli(
       const additionalContext = `${pack}\n\n${sessionLine}`;
       const output = formatHookOutput(rawHarness, rawEvent, additionalContext);
       if (output && !deadlineTriggered) {
-        process.stdout.write(`${output}\n`);
+        const flushed = await writeStdoutBounded(`${output}\n`, deadlineAt - Date.now());
+        if (flushed && !deadlineTriggered) {
+          await store.commitHookDelivery(pendingAck);
+        }
       }
       return;
     }
@@ -386,6 +436,7 @@ export async function runHookCli(
         throttleMs: rawHarness === 'cursor' ? CURSOR_THROTTLE_MS : undefined,
         maxWaitMs: remainingForLock,
         now,
+        deferCursorCommit: true,
       });
 
       if (
@@ -400,14 +451,24 @@ export async function runHookCli(
       }
 
       const count = result.digestResult.behindBy;
-      const header = `[ContextDeck] Board "${result.boardConfig.title}" (${result.boardConfig.slug}) updated to rev ${result.boardConfig.revision} (${count} change${count === 1 ? '' : 's'} since your last sync; session ${result.session.id}):`;
+      const safeSlug = neutralizeUntrustedDelimiters(capSingleLine(result.boardConfig.slug, 100));
+      const safeTitle = neutralizeUntrustedDelimiters(capSingleLine(result.boardConfig.title, 160));
+      const header = `[ContextDeck] Board (${safeSlug}) updated to rev ${result.boardConfig.revision} (${count} change${count === 1 ? '' : 's'} since your last sync; session ${result.session.id}):`;
+      const digestLines = result.digestResult.digestText.split('\n');
+      const wrappedDigest =
+        digestLines[0] === UNTRUSTED_BOARD_CONTENT_HEADER
+          ? [digestLines[0], `Board title: ${safeTitle}`, ...digestLines.slice(1)].join('\n')
+          : `${UNTRUSTED_BOARD_CONTENT_HEADER}\nBoard title: ${safeTitle}\n${neutralizeUntrustedDelimiters(result.digestResult.digestText)}\n${UNTRUSTED_BOARD_CONTENT_FOOTER}`;
       const additionalContext = capBoundedDigest(
-        `${header}\n${result.digestResult.digestText}`,
+        `${header}\n${wrappedDigest}`,
         HOOK_DIGEST_MAX_CHARS,
       );
       const output = formatHookOutput(rawHarness, rawEvent, additionalContext);
       if (output && !deadlineTriggered) {
-        process.stdout.write(`${output}\n`);
+        const flushed = await writeStdoutBounded(`${output}\n`, deadlineAt - Date.now());
+        if (flushed && !deadlineTriggered && result.pendingAck) {
+          await store.commitHookDelivery(result.pendingAck);
+        }
       }
       return;
     }
@@ -427,6 +488,7 @@ export async function runHookCli(
       err instanceof Error ? `${err.name}: ${err.message}` : String(err),
     );
   } finally {
-    clearTimeout(hardTimer);
+    clearTimeout(softTimer);
+    if (killTimer) clearTimeout(killTimer);
   }
 }

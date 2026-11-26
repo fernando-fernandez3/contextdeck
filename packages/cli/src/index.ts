@@ -6,9 +6,11 @@ import {
   ContextDeckStore,
   ValidationError,
   WorkspaceNotFoundError,
+  capSingleLine,
   ensureContextDeckGitignore,
   generateContextPack,
   initGlobalWorkspacePointer,
+  neutralizeUntrustedDelimiters,
   resolveWorkspace,
   seedDemoBoard,
   validateBoardSlug,
@@ -23,13 +25,13 @@ import { runHookCli } from './hooks.js';
 import { HARNESS_TARGETS, setupHarness, type HarnessTarget } from './setup.js';
 
 // Fast-path hook execution: avoids Commander error output and lazy-loads server deps,
-// guaranteeing silent exit 0 on unknown harness/event or any runtime failure (C5, D12).
+// guaranteeing silent exit 0 on unknown harness/event or any runtime failure (C5, D12)
+// without force-exiting before stdout drains.
 if (process.argv[2] === 'hook') {
-  runHookCli(process.argv[3], process.argv[4])
-    .catch(() => {})
-    .finally(() => {
-      process.exit(0);
-    });
+  process.exitCode = 0;
+  void runHookCli(process.argv[3], process.argv[4], process.env, {
+    exitOnHardDeadline: true,
+  }).catch(() => {});
 } else {
 const program = new Command();
 
@@ -278,8 +280,9 @@ program
     }
     const snapshot = await store.getSnapshot(opts.board ?? defaultBoard);
     if (opts.briefHook) {
+      const safeTitle = neutralizeUntrustedDelimiters(capSingleLine(snapshot.config.title, 160));
       console.log(
-        `[ContextDeck] Board "${snapshot.config.title}" (${snapshot.config.slug}) is at rev ${snapshot.config.revision} | ${snapshot.decisions.filter((d) => d.status === 'accepted').length} active decisions | ${snapshot.drift.staleArtifacts.length} stale artifacts | ${snapshot.drift.driftedSessions.length} drifted sessions. Call board_get_brief to sync.`,
+        `[ContextDeck] Board "${safeTitle}" (${snapshot.config.slug}) is at rev ${snapshot.config.revision} | ${snapshot.decisions.filter((d) => d.status === 'accepted').length} active decisions | ${snapshot.drift.staleArtifacts.length} stale artifacts | ${snapshot.drift.driftedSessions.length} drifted sessions. Call board_get_brief to sync.`,
       );
       return;
     }

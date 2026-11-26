@@ -109,10 +109,11 @@ export function generateContextPack(
     capSingleLine(String(snapshot.config.updatedAt), 64),
   );
   const headerLines = [
-    `# ContextDeck Shared Context: ${safeTitle}`,
+    '# ContextDeck Shared Context',
     `> Board: \`${safeSlug}\` | Revision: \`rev ${snapshot.config.revision}\` | Updated: ${safeUpdatedAt}`,
   ];
   const header = neutralizeUntrustedDelimiters(headerLines.join('\n'));
+  const titleLine = neutralizeUntrustedDelimiters(`Board Title: ${safeTitle}`);
   const protocolBlock = includeUpdateProtocol
     ? `\n\n${buildUpdateProtocolBlock(snapshot.config.revision)}`
     : '';
@@ -122,6 +123,8 @@ export function generateContextPack(
     2 + // \n\n before untrusted header
     UNTRUSTED_BOARD_CONTENT_HEADER.length +
     2 + // \n\n
+    titleLine.length +
+    2 + // \n\n before body sections
     2 + // \n\n before footer
     UNTRUSTED_BOARD_CONTENT_FOOTER.length +
     protocolBlock.length;
@@ -246,7 +249,7 @@ export function generateContextPack(
     remaining = appendSectionWithinBudget(bodySections, lines.join('\n'), remaining, true);
   }
 
-  const innerBody = neutralizeUntrustedDelimiters(bodySections.join('\n\n'));
+  const innerBody = neutralizeUntrustedDelimiters([titleLine, ...bodySections].join('\n\n'));
   const full = `${header}\n\n${UNTRUSTED_BOARD_CONTENT_HEADER}\n\n${innerBody}\n\n${UNTRUSTED_BOARD_CONTENT_FOOTER}${protocolBlock}`;
   if (full.length <= maxChars) {
     return full;
