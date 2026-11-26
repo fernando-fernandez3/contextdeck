@@ -454,19 +454,5 @@ When jumping between **Cursor**, **Claude Code**, **Codex**, and **Grok**:
     { type: 'human', label: 'maintainer' },
   );
 
-  // Backdate Cursor & Grok sessions' lastSyncedRevision slightly so Session Drift UI is immediately demonstrable
-  await store.updateSession(
-    slug,
-    rootSession.id,
-    { lastSyncedRevision: 3 },
-    { type: 'system', label: 'demo-seed' },
-  );
-  await store.updateSession(
-    slug,
-    grokResearch.id,
-    { lastSyncedRevision: 5 },
-    { type: 'system', label: 'demo-seed' },
-  );
-
   return slug;
 }

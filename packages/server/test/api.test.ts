@@ -24,34 +24,46 @@ describe('@contextdeck/server', () => {
     const dir = await makeTempDir();
     const store = new ContextDeckStore(dir);
     const slug = await seedDemoBoard(store, 'demo');
-    const { app, close } = createApp({ store });
+    const { app, token, close } = createApp({ store, port: 4310 });
+    const auth = { Authorization: `Bearer ${token}` };
 
     try {
-      const health = await app.request('/api/health');
+      const health = await app.request('http://127.0.0.1:4310/api/health');
       expect(health.status).toBe(200);
 
-      const boardRes = await app.request(`/api/boards/${slug}`);
+      const boardRes = await app.request(`http://127.0.0.1:4310/api/boards/${slug}`, {
+        headers: auth,
+      });
       expect(boardRes.status).toBe(200);
       const snapshot = await boardRes.json();
       expect(snapshot.config.slug).toBe(slug);
       expect(snapshot.drift.staleArtifacts.length).toBeGreaterThan(0);
 
-      // Upload a mock video binary via multipart/form-data
+      // Upload a mock video binary via streaming multipart/form-data
       const form = new FormData();
       form.append('title', 'Kokoro Demo Video');
       form.append('kind', 'video');
-      form.append('file', new File([new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])], 'demo.mp4', { type: 'video/mp4' }));
-      const uploadRes = await app.request(`/api/boards/${slug}/media`, {
+      form.append(
+        'file',
+        new File([new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])], 'demo.mp4', {
+          type: 'video/mp4',
+        }),
+      );
+      const uploadRes = await app.request(`http://127.0.0.1:4310/api/boards/${slug}/media`, {
         method: 'POST',
+        headers: auth,
         body: form,
       });
       expect(uploadRes.status).toBe(201);
       const uploaded = await uploadRes.json();
 
       // Verify HTTP Range 206 streaming for smooth video scrubbing
-      const rangeRes = await app.request(`/api/boards/${slug}/media/${uploaded.id}/file`, {
-        headers: { Range: 'bytes=0-3' },
-      });
+      const rangeRes = await app.request(
+        `http://127.0.0.1:4310/api/boards/${slug}/media/${uploaded.id}/file`,
+        {
+          headers: { ...auth, Range: 'bytes=0-3' },
+        },
+      );
       expect(rangeRes.status).toBe(206);
       expect(rangeRes.headers.get('content-range')).toBe('bytes 0-3/10');
       const buf = new Uint8Array(await rangeRes.arrayBuffer());
@@ -65,15 +77,16 @@ describe('@contextdeck/server', () => {
     const dir = await makeTempDir();
     const store = new ContextDeckStore(dir);
     await seedDemoBoard(store, 'demo');
-    const { app, close } = createApp({ store });
+    const { app, token, close } = createApp({ store, port: 4310 });
 
     try {
       const mcpHeaders = {
         'Content-Type': 'application/json',
         Accept: 'application/json, text/event-stream',
+        Authorization: `Bearer ${token}`,
       };
 
-      const initRes = await app.request('/mcp', {
+      const initRes = await app.request('http://127.0.0.1:4310/mcp', {
         method: 'POST',
         headers: mcpHeaders,
         body: JSON.stringify({
@@ -91,7 +104,7 @@ describe('@contextdeck/server', () => {
       const initJson = await initRes.json();
       expect(initJson.result.serverInfo.name).toBe('contextdeck');
 
-      const toolsRes = await app.request('/mcp', {
+      const toolsRes = await app.request('http://127.0.0.1:4310/mcp', {
         method: 'POST',
         headers: mcpHeaders,
         body: JSON.stringify({

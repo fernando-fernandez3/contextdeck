@@ -11,17 +11,100 @@ import type {
   Task,
 } from './types';
 
-async function req<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init);
+export class AuthExpiredError extends Error {
+  public readonly status = 401;
+
+  constructor(message = 'Session expired. Run `cdeck open` to obtain a fresh launch URL.') {
+    super(message);
+    this.name = 'AuthExpiredError';
+  }
+}
+
+export class ApiError extends Error {
+  public readonly status: number;
+  public readonly code?: string;
+  public readonly data?: Record<string, unknown>;
+
+  constructor(message: string, status: number, code?: string, data?: Record<string, unknown>) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = code;
+    this.data = data;
+  }
+}
+
+// Keep CSRF token strictly in memory (never localStorage — AC8.4)
+let csrfToken: string | null = null;
+let authExpiredListener: (() => void) | null = null;
+
+export function setAuthExpiredHandler(handler: (() => void) | null): void {
+  authExpiredListener = handler;
+}
+
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+async function fetchSessionCsrf(): Promise<string> {
+  const res = await fetch('/api/session', {
+    method: 'GET',
+    credentials: 'same-origin',
+  });
+  if (res.status === 401) {
+    csrfToken = null;
+    authExpiredListener?.();
+    throw new AuthExpiredError();
+  }
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || `Request failed (${res.status})`);
+    const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    throw new ApiError(
+      String(body.error || `Session check failed (${res.status})`),
+      res.status,
+      typeof body.code === 'string' ? body.code : undefined,
+      body,
+    );
+  }
+  const data = (await res.json()) as { authenticated: boolean; csrfToken: string };
+  csrfToken = data.csrfToken;
+  return data.csrfToken;
+}
+
+async function req<T>(url: string, init?: RequestInit): Promise<T> {
+  const method = (init?.method ?? 'GET').toUpperCase();
+  const headers = new Headers(init?.headers ?? {});
+
+  if (MUTATING_METHODS.has(method)) {
+    const token = csrfToken ?? (await fetchSessionCsrf());
+    headers.set('X-CSRF-Token', token);
+  }
+
+  const res = await fetch(url, {
+    ...init,
+    credentials: 'same-origin',
+    headers,
+  });
+
+  if (res.status === 401) {
+    csrfToken = null;
+    authExpiredListener?.();
+    throw new AuthExpiredError();
+  }
+
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    throw new ApiError(
+      String(body.error || `Request failed (${res.status})`),
+      res.status,
+      typeof body.code === 'string' ? body.code : undefined,
+      body,
+    );
   }
   return res.json() as Promise<T>;
 }
 
 export const api = {
-  listBoards: () => req<{ defaultBoard: string; boards: BoardConfig[] }>('/api/boards'),
+  initSession: fetchSessionCsrf,
+
+  listBoards: () => req<{ defaultBoard: string | null; boards: BoardConfig[] }>('/api/boards'),
 
   createBoard: (input: { title: string; slug?: string; description?: string }) =>
     req<BoardConfig>('/api/boards', {
@@ -52,11 +135,14 @@ export const api = {
       },
     ),
 
-  updateBrief: (slug: string, brief: string) =>
+  updateBrief: (slug: string, brief: string, baseRevision?: number) =>
     req<{ revision: number; brief: string }>(`/api/boards/${encodeURIComponent(slug)}/brief`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ brief }),
+      body: JSON.stringify({
+        brief,
+        ...(baseRevision !== undefined ? { baseRevision } : {}),
+      }),
     }),
 
   registerSession: (slug: string, input: Partial<Session> & { title: string }) =>
@@ -73,10 +159,18 @@ export const api = {
       body: JSON.stringify(patch),
     }),
 
-  syncSession: (slug: string, id: string) =>
+  syncSession: (slug: string, id: string, ackRevision?: number) =>
     req<{ session: Session; currentRevision: number }>(
       `/api/boards/${encodeURIComponent(slug)}/sessions/${encodeURIComponent(id)}/sync`,
-      { method: 'POST' },
+      {
+        method: 'POST',
+        ...(ackRevision !== undefined
+          ? {
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ ackRevision }),
+            }
+          : {}),
+      },
     ),
 
   deleteSession: (slug: string, id: string) =>
@@ -119,17 +213,19 @@ export const api = {
       { method: 'DELETE' },
     ),
 
-  upsertDiagram: (slug: string, input: Partial<Diagram> & { title: string; content: string }) =>
-    req<Diagram>(
-      input.id
-        ? `/api/boards/${encodeURIComponent(slug)}/diagrams/${encodeURIComponent(input.id)}`
+  upsertDiagram: (slug: string, input: Partial<Diagram> & { title: string; content: string }) => {
+    const { id, ...rest } = input;
+    return req<Diagram>(
+      id
+        ? `/api/boards/${encodeURIComponent(slug)}/diagrams/${encodeURIComponent(id)}`
         : `/api/boards/${encodeURIComponent(slug)}/diagrams`,
       {
-        method: input.id ? 'PUT' : 'POST',
+        method: id ? 'PUT' : 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(input),
+        body: JSON.stringify(id ? rest : input),
       },
-    ),
+    );
+  },
 
   deleteDiagram: (slug: string, id: string) =>
     req<{ deleted: boolean }>(

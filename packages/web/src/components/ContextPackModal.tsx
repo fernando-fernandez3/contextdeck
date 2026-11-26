@@ -129,7 +129,7 @@ export function ContextPackModal({
               <textarea
                 value={importText}
                 onChange={(e) => setImportText(e.target.value)}
-                placeholder={'{\n  "sessionTitle": "Grok Architecture Chat",\n  "harness": "grok",\n  "sessionSummary": "Agreed to cache parsed diagrams in memory",\n  "decisions": [{ "title": "...", "summary": "..." }]\n}'}
+                placeholder={'{\n  "baseRevision": 1,\n  "sessionTitle": "Grok Architecture Chat",\n  "harness": "grok",\n  "sessionSummary": "Agreed to cache parsed diagrams in memory",\n  "decisions": [{ "title": "...", "summary": "..." }]\n}'}
                 className="w-full h-80 rounded-lg border border-zinc-800 bg-zinc-950 p-3 font-mono text-xs text-zinc-200 focus:outline-none focus:border-indigo-500"
               />
               {errorMsg && (

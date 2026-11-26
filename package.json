@@ -8,10 +8,15 @@
     "build:backend": "pnpm --filter @contextdeck/core build && pnpm --filter @contextdeck/server build && pnpm --filter @contextdeck/cli build",
     "build:web": "pnpm --filter @contextdeck/web build",
     "dev:web": "pnpm --filter @contextdeck/web dev",
-    "test": "pnpm -r test",
-    "typecheck": "pnpm -r typecheck"
+    "test": "pnpm build:backend && pnpm -r test",
+    "typecheck": "pnpm --filter @contextdeck/core build && pnpm --filter @contextdeck/server build && pnpm -r typecheck"
   },
   "engines": {
     "node": ">=20.0.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "jsdom": "^29.1.1"
+    }
   }
 }

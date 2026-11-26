@@ -1,5 +1,5 @@
 import { useMemo } from 'react';
-import { marked } from 'marked';
+import { sanitizeMarkdownHtml } from '../security';
 
 const HARNESS_STYLES: Record<string, string> = {
   cursor: 'bg-sky-500/15 text-sky-300 border-sky-500/30',
@@ -61,7 +61,7 @@ export function PriorityBadge({ priority }: { priority: string }) {
 
 export function MarkdownView({ content, className = '' }: { content: string; className?: string }) {
   const html = useMemo(() => {
-    return marked.parse(content || '', { async: false, breaks: true }) as string;
+    return sanitizeMarkdownHtml(content || '');
   }, [content]);
 
   return (

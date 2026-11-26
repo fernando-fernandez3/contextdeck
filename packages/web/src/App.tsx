@@ -14,7 +14,7 @@ import {
   X,
 } from 'lucide-react';
 import type { BoardConfig, BoardSnapshot } from './types';
-import { api } from './api';
+import { AuthExpiredError, api, setAuthExpiredHandler } from './api';
 import { BriefLens } from './components/BriefLens';
 import { SessionsLens } from './components/SessionsLens';
 import { DecisionsCanvasLens } from './components/DecisionsCanvasLens';
@@ -38,6 +38,8 @@ export function App() {
   const [sseConnected, setSseConnected] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [authExpired, setAuthExpired] = useState(false);
+  const [authenticated, setAuthenticated] = useState(false);
   const [packModal, setPackModal] = useState<'export' | 'import' | null>(null);
 
   // Create Board modal
@@ -45,8 +47,20 @@ export function App() {
   const [newBoardTitle, setNewBoardTitle] = useState('');
   const [newBoardDesc, setNewBoardDesc] = useState('');
 
+  useEffect(() => {
+    setAuthExpiredHandler(() => {
+      setAuthenticated(false);
+      setAuthExpired(true);
+      setSseConnected(false);
+    });
+    return () => setAuthExpiredHandler(null);
+  }, []);
+
   const loadBoardsAndSnapshot = useCallback(async (preferredSlug?: string) => {
     try {
+      await api.initSession();
+      setAuthenticated(true);
+      setAuthExpired(false);
       const list = await api.listBoards();
       setBoards(list.boards);
       const slug = preferredSlug || activeSlug || list.defaultBoard || list.boards[0]?.slug;
@@ -54,10 +68,18 @@ export function App() {
         setActiveSlug(slug);
         const snap = await api.getBoard(slug);
         setSnapshot(snap);
+      } else {
+        setSnapshot(null);
       }
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (err instanceof AuthExpiredError) {
+        setAuthExpired(true);
+        setAuthenticated(false);
+        setError(null);
+      } else {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
       setLoading(false);
     }
@@ -67,8 +89,9 @@ export function App() {
     void loadBoardsAndSnapshot();
   }, []);
 
-  // Subscribe to SSE live push for external agent / file changes
+  // Subscribe to SSE live push for external agent / file changes (only when authenticated)
   useEffect(() => {
+    if (!authenticated || authExpired) return;
     const es = new EventSource('/api/events');
     es.addEventListener('connected', () => setSseConnected(true));
     es.addEventListener('board.changed', () => {
@@ -81,7 +104,7 @@ export function App() {
     return () => {
       es.close();
     };
-  }, [activeSlug, loadBoardsAndSnapshot]);
+  }, [activeSlug, authenticated, authExpired, loadBoardsAndSnapshot]);
 
   const handleSelectBoard = async (slug: string) => {
     setActiveSlug(slug);
@@ -229,6 +252,30 @@ export function App() {
       <main className="flex-1 max-w-[1440px] w-full mx-auto px-4 sm:px-6 py-6">
         {loading ? (
           <div className="py-24 text-center text-xs text-zinc-500">Loading ContextDeck...</div>
+        ) : authExpired ? (
+          <div className="max-w-lg mx-auto my-12 rounded-xl border border-zinc-800 bg-zinc-900 p-6 space-y-4">
+            <div className="flex items-center gap-2 text-amber-300 text-sm font-semibold">
+              <AlertTriangle className="w-4 h-4 shrink-0" />
+              Session expired
+            </div>
+            <p className="text-xs text-zinc-300 leading-relaxed">
+              Your browser session is missing or expired. Open the launch URL printed by{' '}
+              <code className="px-1.5 py-0.5 rounded bg-zinc-950 border border-zinc-800 text-zinc-100">
+                cdeck serve
+              </code>{' '}
+              or run{' '}
+              <code className="px-1.5 py-0.5 rounded bg-zinc-950 border border-zinc-800 text-zinc-100">
+                cdeck open
+              </code>{' '}
+              in your workspace to get a fresh one.
+            </p>
+            <button
+              onClick={() => void loadBoardsAndSnapshot(activeSlug)}
+              className="px-3 py-1.5 rounded-lg border border-zinc-700 bg-zinc-800 hover:bg-zinc-700 text-xs font-medium text-zinc-100"
+            >
+              Retry connection
+            </button>
+          </div>
         ) : error ? (
           <div className="rounded-xl border border-rose-500/30 bg-rose-950/20 p-5 text-xs text-rose-200">
             Error loading workspace: {error}

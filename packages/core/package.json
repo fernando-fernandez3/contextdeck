@@ -13,16 +13,20 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:unit": "vitest run --project unit",
+    "test:stress": "vitest run --project stress"
   },
   "dependencies": {
     "chokidar": "^4.0.3",
     "js-yaml": "^4.1.0",
+    "proper-lockfile": "^4.1.2",
     "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.15.0",
+    "@types/proper-lockfile": "^4.1.4",
     "typescript": "^5.8.3",
     "vitest": "^3.2.4"
   }

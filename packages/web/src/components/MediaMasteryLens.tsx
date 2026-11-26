@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import type { BoardSnapshot, MediaArtifact, Quiz } from '../types';
 import { api } from '../api';
+import { isSafeHttpUrl, wrapHtmlArtifactSrcDoc } from '../security';
 import { MarkdownView } from './Badge';
 
 interface MediaMasteryLensProps {
@@ -489,7 +490,7 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
               {/* Video / Audio Player */}
               {activeMedia.kind === 'video' && (
                 <div className="space-y-3">
-                  {activeMedia.filePath || activeMedia.externalUrl ? (
+                  {activeMedia.filePath || isSafeHttpUrl(activeMedia.externalUrl) ? (
                     <video
                       ref={videoRef}
                       controls
@@ -583,12 +584,12 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
                 <iframe
                   sandbox="allow-scripts"
                   title={activeMedia.title}
-                  srcDoc={activeMedia.content}
+                  srcDoc={wrapHtmlArtifactSrcDoc(activeMedia.content)}
                   className="w-full h-[420px] rounded-lg border border-zinc-800 bg-white"
                 />
               )}
 
-              {activeMedia.kind === 'link' && activeMedia.externalUrl && (
+              {activeMedia.kind === 'link' && isSafeHttpUrl(activeMedia.externalUrl) && (
                 <a
                   href={activeMedia.externalUrl}
                   target="_blank"
