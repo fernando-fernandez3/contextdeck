@@ -117,6 +117,16 @@ interface WorkspaceMeta {
 
 const DEFAULT_ACTOR: Actor = { type: 'human', label: 'user' };
 
+/** True only if the workspace lock is still held; used to gate cleanup in error paths (R6-1). */
+function lockStillOwned(assertActive: () => void): boolean {
+  try {
+    assertActive();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function formatZodError(err: { issues: Array<{ path: (string | number)[]; message: string }> }): string {
   return err.issues.map((i) => `${i.path.join('.') || 'root'}: ${i.message}`).join('; ');
 }
@@ -533,8 +543,10 @@ export class ContextDeckStore {
           checkEventDedupe: false,
         });
       } catch (err) {
+        // R6-1: revalidate ownership itself, not the error type: a lost lock can surface as an unrelated I/O error.
         if (
           !(err instanceof LockCompromisedError) &&
+          lockStillOwned(assertActive) &&
           !existsSync(path.join(this.runtimeDir, TXN_FILENAME))
         ) {
           await Promise.all(stagedTmpPaths.map((p) => fs.rm(p, { force: true }).catch(() => {})));
@@ -748,8 +760,10 @@ export class ContextDeckStore {
       } catch (err) {
         // Skip all filesystem cleanup if the lock was compromised (R5-5), and never
         // remove temp files once txn.json exists (roll-forward recovery needs them!).
+        // R6-1: revalidate current lock ownership too, since a lost lock can surface as an unrelated I/O error.
         if (
           !(err instanceof LockCompromisedError) &&
+          lockStillOwned(assertActive) &&
           !existsSync(path.join(this.runtimeDir, TXN_FILENAME))
         ) {
           await Promise.all(createdTmpFiles.map((p) => fs.rm(p, { force: true }).catch(() => {})));

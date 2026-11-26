@@ -1309,4 +1309,79 @@ describe('E1 safe concurrent storage engine', () => {
     expect(snap.config.revision).toBe(1);
     expect(snap.brief).toBe('# V1\n');
   }, FSYNC_TEST_TIMEOUT_MS);
+
+  it('R6-1: skips cleanup when the lock is lost and staging then fails with an unrelated I/O error', async () => {
+    const stealLockDir = async (runtimeDir: string): Promise<void> => {
+      const lockDir = path.join(runtimeDir, 'lock.lock');
+      const replacementDir = path.join(runtimeDir, `lock.lock.stolen-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+      await fs.mkdir(replacementDir);
+      await fs.rm(lockDir, { recursive: true, force: true });
+      await fs.rename(replacementDir, lockDir);
+    };
+    const eio = (): Error => Object.assign(new Error('simulated staging EIO'), { code: 'EIO' });
+    const origOpen = fs.open.bind(fs);
+    const origRm = fs.rm.bind(fs);
+
+    // 1. createBoard: lock stolen, then the staged write fails with EIO. The new holder's sentinel must survive.
+    const dir1 = await makeTempDir('cdeck-r6-1-create-');
+    const store1 = new core.ContextDeckStore(dir1);
+    const boardDir1 = path.join(store1.boardsDir, 'eio-board');
+    const sentinelPath = path.join(boardDir1, 'sentinel.txt');
+    let createFired = false;
+    const rmCalls1: string[] = [];
+    const openSpy1 = vi.spyOn(fs, 'open').mockImplementation(async (p, ...rest) => {
+      if (!createFired && String(p).includes(`${path.sep}boards${path.sep}eio-board${path.sep}.tmp-`)) {
+        createFired = true;
+        await stealLockDir(store1.runtimeDir);
+        await fs.writeFile(sentinelPath, 'NEW_LOCK_HOLDER_STATE', 'utf8');
+        throw eio();
+      }
+      return origOpen(p, ...rest);
+    });
+    const rmSpy1 = vi.spyOn(fs, 'rm').mockImplementation(async (p, ...rest) => {
+      if (String(p).startsWith(boardDir1)) rmCalls1.push(String(p));
+      return origRm(p, ...rest);
+    });
+    try {
+      await expect(store1.createBoard({ title: 'EIO Board', slug: 'eio-board' })).rejects.toThrow(
+        'simulated staging EIO',
+      );
+    } finally {
+      openSpy1.mockRestore();
+      rmSpy1.mockRestore();
+    }
+    expect(createFired).toBe(true);
+    expect(rmCalls1).toEqual([]);
+    expect(await fs.readFile(sentinelPath, 'utf8')).toBe('NEW_LOCK_HOLDER_STATE');
+
+    // 2. mutate: lock stolen, then the staged write fails with EIO. No cleanup may touch the board dir.
+    const dir2 = await makeTempDir('cdeck-r6-1-mutate-');
+    const store2 = new core.ContextDeckStore(dir2);
+    await store2.createBoard({ title: 'Main', slug: 'main', brief: '# V1\n' });
+    const boardDir2 = path.join(store2.boardsDir, 'main');
+    let mutateFired = false;
+    const rmCalls2: string[] = [];
+    const openSpy2 = vi.spyOn(fs, 'open').mockImplementation(async (p, ...rest) => {
+      if (!mutateFired && String(p).includes(`${path.sep}boards${path.sep}main${path.sep}.tmp-`)) {
+        mutateFired = true;
+        await stealLockDir(store2.runtimeDir);
+        throw eio();
+      }
+      return origOpen(p, ...rest);
+    });
+    const rmSpy2 = vi.spyOn(fs, 'rm').mockImplementation(async (p, ...rest) => {
+      if (String(p).startsWith(boardDir2)) rmCalls2.push(String(p));
+      return origRm(p, ...rest);
+    });
+    try {
+      await expect(
+        store2.updateBrief('main', '# Should Abort\n', undefined, { baseRevision: 1 }),
+      ).rejects.toThrow('simulated staging EIO');
+    } finally {
+      openSpy2.mockRestore();
+      rmSpy2.mockRestore();
+    }
+    expect(mutateFired).toBe(true);
+    expect(rmCalls2).toEqual([]);
+  }, FSYNC_TEST_TIMEOUT_MS);
 });
