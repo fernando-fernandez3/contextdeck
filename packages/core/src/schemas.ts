@@ -452,10 +452,9 @@ export interface DriftedSessionNotice {
   lastSyncedRevision: number;
   currentRevision: number;
   behindBy: number;
-  digest?: DriftDigestEntry[];
-  digestText?: string;
-  truncatedCount?: number;
-  missedEvents?: BoardEvent[];
+  digest: DriftDigestEntry[];
+  digestText: string;
+  truncatedCount: number;
 }
 
 export interface DriftReport {

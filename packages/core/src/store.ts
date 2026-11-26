@@ -68,7 +68,11 @@ import {
 import { assertContainedPath, assertContainedPathSync } from './paths.js';
 import { CONTEXTDECK_DIR_NAME } from './workspace.js';
 import { parseFrontmatter, stringifyFrontmatter } from './markdown.js';
-import { computeDriftReport } from './drift.js';
+import {
+  buildSessionDriftDigest,
+  computeDriftReport,
+  type SessionDigestResult,
+} from './drift.js';
 import {
   TXN_FILENAME,
   atomicWriteFile,
@@ -629,6 +633,162 @@ export class ContextDeckStore {
       }
     }
     return events;
+  }
+
+  /**
+   * Lightweight reverse-chunk tail reader for events.jsonl (E3 amended).
+   * Reads backwards from EOF in 32 KB chunks and stops as soon as it sees
+   * an event with revision <= afterRevision, keeping hook/digest latency
+   * well under 300ms even with 5,000+ events.
+   */
+  public async readEventsSince(
+    slug: string,
+    afterRevision: number,
+    maxRevision?: number,
+  ): Promise<BoardEvent[]> {
+    const validSlug = validateBoardSlug(slug);
+    const eventsPath = await this.safeBoardFilePath(validSlug, 'events.jsonl');
+    let fh: fs.FileHandle;
+    try {
+      fh = await fs.open(eventsPath, 'r');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return [];
+      }
+      throw err;
+    }
+
+    const CHUNK_SIZE = 32 * 1024;
+    const collected: BoardEvent[] = [];
+
+    try {
+      const stat = await fh.stat();
+      let position = stat.size;
+      let carry = '';
+      let done = false;
+
+      while (position > 0 && !done) {
+        const readSize = Math.min(CHUNK_SIZE, position);
+        position -= readSize;
+        const buf = Buffer.allocUnsafe(readSize);
+        await fh.read(buf, 0, readSize, position);
+
+        const chunkStr = buf.toString('utf8') + carry;
+        const lines = chunkStr.split('\n');
+        // First element may be an incomplete line if position > 0
+        carry = position > 0 ? (lines.shift() ?? '') : '';
+
+        for (let i = lines.length - 1; i >= 0; i -= 1) {
+          const trimmed = lines[i].trim();
+          if (!trimmed) continue;
+          let parsedJson: unknown;
+          try {
+            parsedJson = JSON.parse(trimmed);
+          } catch (err) {
+            throw new CorruptDataError(
+              `Corrupt JSONL line in ${eventsPath}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+          const parsed = BoardEventSchema.safeParse(parsedJson);
+          if (!parsed.success) {
+            throw new CorruptDataError(
+              `Invalid event schema in ${eventsPath}: ${formatZodError(parsed.error)}`,
+            );
+          }
+          const ev = parsed.data;
+          if (ev.revision <= afterRevision) {
+            done = true;
+            break;
+          }
+          if (maxRevision === undefined || ev.revision <= maxRevision) {
+            collected.push(ev);
+          }
+        }
+      }
+
+      if (!done && carry.trim()) {
+        const trimmed = carry.trim();
+        let parsedJson: unknown;
+        try {
+          parsedJson = JSON.parse(trimmed);
+        } catch (err) {
+          throw new CorruptDataError(
+            `Corrupt JSONL line in ${eventsPath}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        const parsed = BoardEventSchema.safeParse(parsedJson);
+        if (!parsed.success) {
+          throw new CorruptDataError(
+            `Invalid event schema in ${eventsPath}: ${formatZodError(parsed.error)}`,
+          );
+        }
+        const ev = parsed.data;
+        if (ev.revision > afterRevision && (maxRevision === undefined || ev.revision <= maxRevision)) {
+          collected.push(ev);
+        }
+      }
+    } finally {
+      await fh.close();
+    }
+
+    collected.reverse();
+    return collected;
+  }
+
+  /**
+   * Lightweight session drift check (E3 amended):
+   * Reads ONLY board.yaml, the single session yaml, and the tail of events.jsonl.
+   * Never loads media, diagrams, quizzes, decisions, or tasks.
+   */
+  public async getSessionDrift(
+    boardSlug: string | undefined,
+    sessionId: string,
+    options: { maxDigestLines?: number } = {},
+  ): Promise<
+    SessionDigestResult & {
+      session: Session;
+      currentRevision: number;
+    }
+  > {
+    const slug = await this.resolveBoardSlug(boardSlug);
+    validateEntityId(sessionId, 'sessionId');
+    const config = await this.readBoardConfig(slug);
+    const sessionPath = await this.safeBoardFilePath(slug, 'sessions', `${sessionId}.yaml`);
+    const session = await readYamlStrict(sessionPath, SessionSchema);
+    if (!session) {
+      throw new NotFoundError(`Session "${sessionId}" not found on board "${slug}".`);
+    }
+
+    if (session.lastSyncedRevision >= config.revision) {
+      return {
+        session,
+        currentRevision: config.revision,
+        behindBy: 0,
+        digest: [],
+        digestText: '',
+        truncatedCount: 0,
+      };
+    }
+
+    const tailEvents = await this.readEventsSince(
+      slug,
+      session.lastSyncedRevision,
+      config.revision,
+    );
+
+    const digestResult = buildSessionDriftDigest({
+      sessionId: session.id,
+      lastSyncedRevision: session.lastSyncedRevision,
+      currentRevision: config.revision,
+      events: tailEvents,
+      maxLines: options.maxDigestLines,
+    });
+
+    return {
+      session,
+      currentRevision: config.revision,
+      ...digestResult,
+    };
   }
 
   public async listSessions(slug: string): Promise<Session[]> {
@@ -1402,13 +1562,14 @@ export class ContextDeckStore {
   public async syncSession(
     boardSlug: string | undefined,
     sessionId: string,
-    options?: { ackRevision?: number },
-  ): Promise<{
-    session: Session;
-    missedEvents: BoardEvent[];
-    currentRevision: number;
-    ackRevision: number;
-  }> {
+    options?: { ackRevision?: number; maxDigestLines?: number },
+  ): Promise<
+    SessionDigestResult & {
+      session: Session;
+      currentRevision: number;
+      ackRevision: number;
+    }
+  > {
     validateEntityId(sessionId, 'sessionId');
     return this.mutate(boardSlug, { type: 'system', sessionId, label: 'sync' }, async (tx) => {
       const filePath = await this.safeBoardFilePath(tx.slug, 'sessions', `${sessionId}.yaml`);
@@ -1424,10 +1585,17 @@ export class ContextDeckStore {
           : currentRevision;
       const ackRevision = Math.max(existing.lastSyncedRevision, requestedAck);
 
-      const events = await this.readEvents(tx.slug, ackRevision);
-      const missedEvents = events.filter(
-        (e) => e.revision > existing.lastSyncedRevision && e.revision <= ackRevision,
-      );
+      const tailEvents =
+        ackRevision > existing.lastSyncedRevision
+          ? await this.readEventsSince(tx.slug, existing.lastSyncedRevision, ackRevision)
+          : [];
+      const digestResult = buildSessionDriftDigest({
+        sessionId: existing.id,
+        lastSyncedRevision: existing.lastSyncedRevision,
+        currentRevision: ackRevision,
+        events: tailEvents,
+        maxLines: options?.maxDigestLines,
+      });
 
       const updated: Session = {
         ...existing,
@@ -1435,7 +1603,12 @@ export class ContextDeckStore {
         updatedAt: nowIso(),
       };
       tx.stageFile(filePath, dumpYaml(updated));
-      return { session: updated, missedEvents, currentRevision, ackRevision };
+      return {
+        session: updated,
+        currentRevision,
+        ackRevision,
+        ...digestResult,
+      };
     });
   }
 

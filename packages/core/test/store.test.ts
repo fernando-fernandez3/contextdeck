@@ -83,7 +83,8 @@ describe('@contextdeck/core', () => {
 
     // Syncing session clears drift for s1
     const syncResult = await store.syncSession('auth-redesign', s1.id);
-    expect(syncResult.missedEvents.length).toBeGreaterThan(0);
+    expect(syncResult.digest.length).toBeGreaterThan(0);
+    expect(syncResult.behindBy).toBeGreaterThan(0);
     const afterSync = await store.getSnapshot('auth-redesign');
     expect(afterSync.drift.driftedSessions.find((s) => s.sessionId === s1.id)).toBeUndefined();
   });
