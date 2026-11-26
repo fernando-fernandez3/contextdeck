@@ -34,19 +34,23 @@ interface StaleArtifactActionsProps {
   boardSlug: string;
   artifactType: RefreshJobArtifactType;
   artifactId: string;
+  artifactVersion: number;
+  expectedAgainst: Record<string, string>;
   activeJob?: Pick<RefreshJob, 'id' | 'status' | 'claimedBy'> | null;
   onUpdated: () => void;
 }
 
 /**
- * AC7.3 + D17: Stale artifact actions are strictly two:
+ * AC7.3 + D17 + H9: Stale artifact actions are strictly two:
  *   1. "Queue refresh" (1-tap creates refresh job)
- *   2. "Still accurate" (human confirmation with optional note)
+ *   2. "Still accurate" (human confirmation bound to displayed version + expectedAgainst)
  */
 export function StaleArtifactActions({
   boardSlug,
   artifactType,
   artifactId,
+  artifactVersion,
+  expectedAgainst,
   activeJob,
   onUpdated,
 }: StaleArtifactActionsProps) {
@@ -73,12 +77,19 @@ export function StaleArtifactActions({
     setBusy('confirm');
     setError(null);
     try {
-      await api.confirmArtifact(boardSlug, artifactType, artifactId, note.trim() || undefined);
+      const trimmedNote = note.trim();
+      await api.confirmArtifact(boardSlug, artifactType, artifactId, {
+        artifactVersion,
+        expectedAgainst,
+        ...(trimmedNote ? { note: trimmedNote } : {}),
+      });
       setNote('');
       setConfirmOpen(false);
       onUpdated();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      // H9: On conflict (409), refresh board state so the human sees the newer decision/version
+      onUpdated();
     } finally {
       setBusy(null);
     }

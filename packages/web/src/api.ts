@@ -132,13 +132,16 @@ export const api = {
   getCatchUp: (slug: string) =>
     req<CatchUpReport>(`/api/boards/${encodeURIComponent(slug)}/catchup`),
 
-  ackCatchUp: (slug: string, revision: number) =>
+  ackCatchUp: (slug: string, revision: number, reviewedAt?: string) =>
     req<{ cursor: { lastReviewedRevision: number; lastReviewedAt: string }; catchUp: CatchUpReport }>(
       `/api/boards/${encodeURIComponent(slug)}/reader/ack`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ revision }),
+        body: JSON.stringify({
+          revision,
+          ...(reviewedAt ? { reviewedAt } : {}),
+        }),
       },
     ),
 
@@ -300,14 +303,22 @@ export const api = {
     slug: string,
     type: RefreshJobArtifactType,
     id: string,
-    note?: string,
+    payload: {
+      artifactVersion: number;
+      expectedAgainst: Record<string, string>;
+      note?: string;
+    },
   ) =>
     req<Diagram | MediaArtifact | Quiz>(
       `/api/boards/${encodeURIComponent(slug)}/artifacts/${type}/${encodeURIComponent(id)}/confirm`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(note ? { note } : {}),
+        body: JSON.stringify({
+          artifactVersion: payload.artifactVersion,
+          expectedAgainst: payload.expectedAgainst,
+          ...(payload.note ? { note: payload.note } : {}),
+        }),
       },
     ),
 

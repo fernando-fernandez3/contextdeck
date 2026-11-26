@@ -266,6 +266,8 @@ export function BriefLens({ snapshot, onRefresh, onNavigateLens }: BriefLensProp
                         boardSlug={snapshot.config.slug}
                         artifactType={stale.artifactType}
                         artifactId={stale.artifactId}
+                        artifactVersion={stale.artifactVersion ?? 1}
+                        expectedAgainst={stale.expectedAgainst ?? {}}
                         activeJob={job}
                         onUpdated={onRefresh}
                       />

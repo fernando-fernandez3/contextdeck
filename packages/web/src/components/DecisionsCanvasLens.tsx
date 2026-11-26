@@ -323,6 +323,12 @@ export function DecisionsCanvasLens({ snapshot, onRefresh }: DecisionsCanvasLens
                       boardSlug={snapshot.config.slug}
                       artifactType="diagram"
                       artifactId={selectedDiagram.id}
+                      artifactVersion={
+                        staleMap.get(selectedDiagram.id)!.artifactVersion ??
+                        selectedDiagram.version ??
+                        1
+                      }
+                      expectedAgainst={staleMap.get(selectedDiagram.id)!.expectedAgainst ?? {}}
                       activeJob={openJobByDiag.get(selectedDiagram.id) ?? null}
                       onUpdated={onRefresh}
                     />

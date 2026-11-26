@@ -227,6 +227,8 @@ export interface StaleArtifactNotice {
   title: string;
   staleDecisionIds: string[];
   reasons: string[];
+  artifactVersion?: number;
+  expectedAgainst?: Record<string, string>;
 }
 
 export interface DriftDigestEntry {
@@ -267,7 +269,9 @@ export interface CatchUpStaleArtifact {
   artifactType: RefreshJobArtifactType;
   artifactId: string;
   title: string;
+  artifactVersion: number;
   staleDecisionIds: string[];
+  expectedAgainst: Record<string, string>;
   reasons: string[];
   activeJob: {
     id: string;
@@ -291,16 +295,26 @@ export interface CatchUpNewSession {
   createdAt: string;
 }
 
+export interface CatchUpOtherChange {
+  kind: string;
+  title: string;
+  actor: string;
+  at: string;
+}
+
 export interface CatchUpReport {
   fromRevision: number;
   toRevision: number;
   lastReviewedAt: string | null;
+  evaluatedAt: string;
   unseenCount: number;
   hasUnseen: boolean;
   decisionsChanged: CatchUpDecisionChange[];
   staleArtifacts: CatchUpStaleArtifact[];
   tasksMoved: CatchUpTaskMove[];
   newSessions: CatchUpNewSession[];
+  otherChanges: CatchUpOtherChange[];
+  otherChangesTruncated: number;
 }
 
 export interface BoardSnapshot {

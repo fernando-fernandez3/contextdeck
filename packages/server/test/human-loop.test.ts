@@ -91,13 +91,58 @@ describe('B3 Server: REST catchup, confirmations, jobs, and versioned updates', 
       expect(dup.deduplicated).toBe(true);
       expect(dup.job.id).toBe(created.job.id);
 
+      // H9: REST confirm requires artifactVersion + expectedAgainst (400 if omitted)
+      const missingMetaConfirm = await app.request(
+        `http://127.0.0.1:4310/api/boards/main/artifacts/diagram/${diag.id}/confirm`,
+        {
+          method: 'POST',
+          headers: auth,
+          body: JSON.stringify({ note: 'Missing expectedAgainst' }),
+        },
+      );
+      expect(missingMetaConfirm.status).toBe(400);
+
+      // H9: Stale expectedAgainst returns 409 Conflict
+      const conflictConfirm = await app.request(
+        `http://127.0.0.1:4310/api/boards/main/artifacts/diagram/${diag.id}/confirm`,
+        {
+          method: 'POST',
+          headers: auth,
+          body: JSON.stringify({
+            note: 'Wrong replacement',
+            artifactVersion: 1,
+            expectedAgainst: { [d1.id]: d1.id },
+          }),
+        },
+      );
+      expect(conflictConfirm.status).toBe(409);
+
+      // H10: Whitespace-only note rejected over REST (400)
+      const blankRestConfirm = await app.request(
+        `http://127.0.0.1:4310/api/boards/main/artifacts/diagram/${diag.id}/confirm`,
+        {
+          method: 'POST',
+          headers: auth,
+          body: JSON.stringify({
+            note: '   ',
+            artifactVersion: 1,
+            expectedAgainst: { [d1.id]: d2.id },
+          }),
+        },
+      );
+      expect(blankRestConfirm.status).toBe(400);
+
       // Human confirm via REST clears staleness without rewriting basedOnDecisions
       const confirmRes = await app.request(
         `http://127.0.0.1:4310/api/boards/main/artifacts/diagram/${diag.id}/confirm`,
         {
           method: 'POST',
           headers: auth,
-          body: JSON.stringify({ note: 'Still accurate for overview' }),
+          body: JSON.stringify({
+            note: 'Still accurate for overview',
+            artifactVersion: 1,
+            expectedAgainst: { [d1.id]: d2.id },
+          }),
         },
       );
       expect(confirmRes.status).toBe(200);
@@ -108,6 +153,21 @@ describe('B3 Server: REST catchup, confirmations, jobs, and versioned updates', 
       expect(confirmed.basedOnDecisions).toEqual([d1.id]);
       expect(confirmed.confirmations[d1.id].againstDecisionId).toBe(d2.id);
       expect(confirmed.confirmations[d1.id].actorType).toBe('human');
+
+      // H10: Confirming again when nothing is stale returns 400 ValidationError
+      const noOpConfirm = await app.request(
+        `http://127.0.0.1:4310/api/boards/main/artifacts/diagram/${diag.id}/confirm`,
+        {
+          method: 'POST',
+          headers: auth,
+          body: JSON.stringify({
+            note: 'Nothing stale',
+            artifactVersion: 1,
+            expectedAgainst: { [d1.id]: d2.id },
+          }),
+        },
+      );
+      expect(noOpConfirm.status).toBe(400);
 
       // Task confirm rejected (D17)
       const taskConfirm = await app.request(
@@ -238,6 +298,26 @@ describe('B3 Server: MCP artifact_confirm, job_*, media_update, quiz_update', ()
         arguments: { artifactType: 'media', artifactId: media.id },
       });
       expect(missingNote.isError).toBe(true);
+
+      // H10: whitespace-only note rejected over MCP
+      const blankNote = await client.callTool({
+        name: 'artifact_confirm',
+        arguments: { artifactType: 'media', artifactId: media.id, note: '   ' },
+      });
+      expect(blankNote.isError).toBe(true);
+
+      // H9: conflicting expectedAgainst rejected over MCP
+      const staleExpected = await client.callTool({
+        name: 'artifact_confirm',
+        arguments: {
+          artifactType: 'media',
+          artifactId: media.id,
+          note: 'Checked against stale id',
+          artifactVersion: 1,
+          expectedAgainst: { [d1.id]: d1.id },
+        },
+      });
+      expect(staleExpected.isError).toBe(true);
 
       const confirmOk = await client.callTool({
         name: 'artifact_confirm',
@@ -435,6 +515,47 @@ describe('B3 Server: MCP artifact_confirm, job_*, media_update, quiz_update', ()
           headers: { Authorization: `Bearer ${token}` },
         });
         expect(await packRes.text()).not.toContain(claimedSecret.leaseToken);
+
+        // H13: GET /api/boards/:slug bounds events to latest 200 by default, ?events=all returns full log
+        const boardDir = store.boardPath('main');
+        const extraLines: string[] = [];
+        const nowStr = new Date().toISOString();
+        const currentSnap = await store.getSnapshot('main');
+        const startRev = currentSnap.config.revision + 1;
+        for (let i = 0; i < 230; i += 1) {
+          extraLines.push(
+            JSON.stringify({
+              id: `evt_cap_${i}`,
+              revision: startRev + i,
+              timestamp: nowStr,
+              actor: { type: 'agent', label: 'bench' },
+              kind: 'task.updated',
+              entityId: 'task_cap',
+              summary: `Cap event ${i}`,
+            }),
+          );
+        }
+        await fs.appendFile(path.join(boardDir, 'events.jsonl'), `${extraLines.join('\n')}\n`, 'utf8');
+        const byPath = path.join(boardDir, 'board.yaml');
+        const byRaw = await fs.readFile(byPath, 'utf8');
+        await fs.writeFile(
+          byPath,
+          byRaw.replace(/revision:\s*\d+/, `revision: ${startRev + 229}`),
+          'utf8',
+        );
+
+        const defaultSnapRes = await app.request('http://127.0.0.1:4311/api/boards/main', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const defaultSnap = (await defaultSnapRes.json()) as { events: Array<{ revision: number }> };
+        expect(defaultSnap.events).toHaveLength(200);
+        expect(defaultSnap.events[defaultSnap.events.length - 1].revision).toBe(startRev + 229);
+
+        const allSnapRes = await app.request('http://127.0.0.1:4311/api/boards/main?events=all', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const allSnap = (await allSnapRes.json()) as { events: Array<{ revision: number }> };
+        expect(allSnap.events.length).toBeGreaterThanOrEqual(230);
       } finally {
         await close();
       }

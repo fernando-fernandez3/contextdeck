@@ -841,3 +841,256 @@ describe('B3 Hardening G1: Claim-bound refresh jobs, substantive changes, and pr
     expect(dryPrune.keptFiles).toContain('art_test.v13.mp4');
   });
 });
+
+describe('B3 Hardening G3: Confirm conflict/validation, Catch up otherChanges/chain/ack, and 40-session/5000-event perf (H9-H13)', () => {
+  it('H9: confirmArtifact rejects stale expectedAgainst (dec_001->002->003) and artifactVersion mismatch with ConflictError', async () => {
+    const dir = await makeTempDir('cdeck-h9-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'H9', slug: 'main' });
+
+    const d1 = await store.recordDecision('main', { title: 'Use Cookies' });
+    const diag = await store.upsertDiagram('main', {
+      title: 'Auth Flow',
+      kind: 'mermaid',
+      content: 'flowchart LR\nA-->B',
+      basedOnDecisions: [d1.id],
+    });
+    const d2 = await store.recordDecision('main', { title: 'Use JWT', supersedes: d1.id });
+
+    // Human views stale artifact showing d1 -> d2 at version 1, then d3 supersedes d2 before submit
+    const d3 = await store.recordDecision('main', { title: 'Use Passkeys', supersedes: d2.id });
+
+    await expect(
+      store.confirmArtifact(
+        'main',
+        'diagram',
+        diag.id,
+        {
+          note: 'I checked dec_002',
+          artifactVersion: 1,
+          expectedAgainst: { [d1.id]: d2.id },
+        },
+        { type: 'human', label: 'reviewer' },
+      ),
+    ).rejects.toThrow(core.ConflictError);
+
+    // Confirming with wrong artifactVersion also throws ConflictError
+    await expect(
+      store.confirmArtifact(
+        'main',
+        'diagram',
+        diag.id,
+        {
+          note: 'Checked against d3',
+          artifactVersion: 99,
+          expectedAgainst: { [d1.id]: d3.id },
+        },
+        { type: 'human', label: 'reviewer' },
+      ),
+    ).rejects.toThrow(core.ConflictError);
+
+    // Confirming with matching version + expectedAgainst succeeds against d3
+    const ok = await store.confirmArtifact(
+      'main',
+      'diagram',
+      diag.id,
+      {
+        note: 'Checked against d3',
+        artifactVersion: 1,
+        expectedAgainst: { [d1.id]: d3.id },
+      },
+      { type: 'human', label: 'reviewer' },
+    );
+    expect(ok.confirmations[d1.id].againstDecisionId).toBe(d3.id);
+  });
+
+  it('H10: rejects whitespace-only note and rejects no-op confirmArtifact without bumping revision or appending events', async () => {
+    const dir = await makeTempDir('cdeck-h10-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'H10', slug: 'main' });
+
+    const d1 = await store.recordDecision('main', { title: 'Active Decision' });
+    const diag = await store.upsertDiagram('main', {
+      title: 'Fresh Diagram',
+      kind: 'mermaid',
+      content: 'flowchart LR\nA-->B',
+      basedOnDecisions: [d1.id],
+    });
+
+    const beforeSnap = await store.getSnapshot('main');
+    const beforeRev = beforeSnap.config.revision;
+    const beforeEvents = beforeSnap.events.length;
+
+    // Nothing is stale -> MUST throw ValidationError and NOT mutate revision or events
+    await expect(
+      store.confirmArtifact('main', 'diagram', diag.id, { note: 'nothing stale' }),
+    ).rejects.toThrow(core.ValidationError);
+
+    const afterNoOp = await store.getSnapshot('main');
+    expect(afterNoOp.config.revision).toBe(beforeRev);
+    expect(afterNoOp.events).toHaveLength(beforeEvents);
+
+    // Supersede d1 -> blank whitespace-only note MUST throw ValidationError
+    await store.recordDecision('main', { title: 'New Decision', supersedes: d1.id });
+    await expect(
+      store.confirmArtifact('main', 'diagram', diag.id, { note: '   ' }),
+    ).rejects.toThrow(core.ValidationError);
+  });
+
+  it('H11: Catch up surfaces otherChanges (brief/diagram/task edits/deletes) capped at 20 and preserves non-empty invariant when hasUnseen is true', async () => {
+    const dir = await makeTempDir('cdeck-h11-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'H11', slug: 'main' });
+
+    const initSnap = await store.getSnapshot('main');
+    await store.ackReaderCursor('main', initSnap.config.revision, { readerId: 'reader_h11' });
+
+    await store.updateBrief('main', '# Updated Brief', { type: 'agent', label: 'codex' });
+    const cu = (await store.getCatchUp('main', { readerId: 'reader_h11' })) as core.CatchUpReport & {
+      otherChanges?: Array<{ kind: string; title: string; actor: string; at: string }>;
+      otherChangesTruncated?: number;
+    };
+    expect(cu.hasUnseen).toBe(true);
+    expect(cu.unseenCount).toBe(1);
+    expect(cu.otherChanges).toBeDefined();
+    expect(cu.otherChanges!.length).toBe(1);
+    expect(cu.otherChanges![0].kind).toBe('brief.updated');
+    expect(cu.otherChanges![0].actor).toBe('codex');
+
+    // Invariant: hasUnseen === true implies at least one surfaced item across all sections
+    const totalRendered =
+      cu.decisionsChanged.length +
+      cu.staleArtifacts.length +
+      cu.tasksMoved.length +
+      cu.newSessions.length +
+      (cu.otherChanges?.length ?? 0);
+    expect(totalRendered).toBeGreaterThan(0);
+
+    // Cap at 20 + truncated count
+    for (let i = 0; i < 24; i += 1) {
+      await store.updateBrief('main', `# Brief rev ${i}`, { type: 'agent', label: 'codex' });
+    }
+    const cuMany = (await store.getCatchUp('main', { readerId: 'reader_h11' })) as core.CatchUpReport & {
+      otherChanges?: Array<{ kind: string; title: string; actor: string; at: string }>;
+      otherChangesTruncated?: number;
+    };
+    expect(cuMany.otherChanges).toHaveLength(20);
+    expect(cuMany.otherChangesTruncated).toBe(5);
+  });
+
+  it('H12: walks chain supersession back to pre-window decision and preserves concurrent hook sessions on ack via evaluatedAt/reviewedAt', async () => {
+    const dir = await makeTempDir('cdeck-h12-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'H12', slug: 'main' });
+
+    const d1 = await store.recordDecision('main', { title: 'Use Redis' });
+    const snap1 = await store.getSnapshot('main');
+    await store.ackReaderCursor('main', snap1.config.revision, { readerId: 'reader_h12' });
+
+    // Chain supersession in one window: d1 -> d2 -> d3
+    const d2 = await store.recordDecision('main', { title: 'Use SQLite', supersedes: d1.id });
+    const d3 = await store.recordDecision('main', { title: 'Use Plain Files', supersedes: d2.id });
+
+    const cuChain = (await store.getCatchUp('main', { readerId: 'reader_h12' })) as core.CatchUpReport & {
+      evaluatedAt?: string;
+    };
+    expect(cuChain.decisionsChanged).toHaveLength(1);
+    expect(cuChain.decisionsChanged[0].decisionId).toBe(d3.id);
+    expect(cuChain.decisionsChanged[0].previousDecisionId).toBe(d1.id);
+    expect(cuChain.decisionsChanged[0].previousTitle).toBe('Use Redis');
+    expect(cuChain.evaluatedAt).toBeTruthy();
+
+    // Ack race: hook creates a session AFTER cuChain was evaluated, BEFORE user clicks Mark caught up
+    await new Promise((r) => setTimeout(r, 15));
+    const hookRes = await store.upsertHookSession({
+      externalRef: 'codex:race-session-1',
+      harness: 'codex',
+      defaultTitle: 'Concurrent Hook Session',
+      cwd: dir,
+    });
+    await new Promise((r) => setTimeout(r, 15));
+
+    await store.ackReaderCursor('main', cuChain.toRevision, {
+      readerId: 'reader_h12',
+      reviewedAt: cuChain.evaluatedAt,
+    });
+
+    const cuAfterAck = await store.getCatchUp('main', { readerId: 'reader_h12' });
+    expect(cuAfterAck.hasUnseen).toBe(true);
+    expect(cuAfterAck.newSessions.some((s) => s.sessionId === hookRes.session.id)).toBe(true);
+  });
+
+  it('H13: keeps caught-up getCatchUp < 50ms and behind-by-5000 hook digest < 300ms at 40 sessions / 5,000 events', async () => {
+    const dir = await makeTempDir('cdeck-h13-');
+    const store = new core.ContextDeckStore({ deckDir: path.join(dir, '.contextdeck'), projectRoot: dir });
+    await store.createBoard({ title: 'Perf', slug: 'main' });
+
+    const boardDir = store.boardPath('main');
+    const nowIso = new Date().toISOString();
+
+    // Seed 40 active sessions in workspace sessions dir + cursors
+    const sessionsDir = path.join(store.deckDir, 'sessions');
+    const cursorsDir = path.join(store.runtimeDir, 'cursors');
+    await fs.mkdir(sessionsDir, { recursive: true });
+    await fs.mkdir(cursorsDir, { recursive: true });
+    for (let i = 0; i < 40; i += 1) {
+      const sid = `sess_perf_${String(i).padStart(2, '0')}`;
+      const extRef = `claude-code:perf-${i}`;
+      await fs.writeFile(
+        path.join(sessionsDir, `${sid}.yaml`),
+        `id: ${sid}\ntitle: Perf Session ${i}\nharness: claude-code\nexternalRef: "${extRef}"\nboard: main\nparentSessionId: null\nrelatedSessionIds: []\nstatus: active\nsummary: ""\nfocusFiles: []\ncreatedAt: "${nowIso}"\nupdatedAt: "${nowIso}"\n`,
+        'utf8',
+      );
+      await fs.writeFile(
+        path.join(cursorsDir, `${sid}.json`),
+        JSON.stringify({ sessionId: sid, syncedRevisions: { main: 10 }, lastActiveAt: nowIso }),
+        'utf8',
+      );
+    }
+
+    // Seed 5,000 valid events in events.jsonl and update board.yaml revision to 5001
+    const lines: string[] = [];
+    for (let r = 2; r <= 5001; r += 1) {
+      lines.push(
+        JSON.stringify({
+          id: `evt_${String(r).padStart(5, '0')}`,
+          revision: r,
+          timestamp: nowIso,
+          actor: { type: 'agent', harness: 'codex', sessionId: 'sess_other' },
+          kind: 'task.updated',
+          entityId: `task_${(r % 20) + 1}`,
+          summary: `Updated task ${(r % 20) + 1} at rev ${r}`,
+        }),
+      );
+    }
+    await fs.appendFile(path.join(boardDir, 'events.jsonl'), `${lines.join('\n')}\n`, 'utf8');
+    const boardYamlPath = path.join(boardDir, 'board.yaml');
+    const boardYaml = await fs.readFile(boardYamlPath, 'utf8');
+    await fs.writeFile(boardYamlPath, boardYaml.replace(/revision:\s*\d+/, 'revision: 5001'), 'utf8');
+
+    // Ack reader cursor at 5001 so caught-up path executes
+    await store.ackReaderCursor('main', 5001, { readerId: 'reader_perf' });
+
+    const ciFactor = Number(process.env.CONTEXTDECK_BENCH_FACTOR ?? '1') || 1;
+    // Warm one call for module/git cache
+    await store.getCatchUp('main', { readerId: 'reader_perf' });
+
+    const tCatchUp0 = performance.now();
+    const caughtUp = await store.getCatchUp('main', { readerId: 'reader_perf' });
+    const catchUpMs = performance.now() - tCatchUp0;
+    expect(caughtUp.hasUnseen).toBe(false);
+    expect(catchUpMs).toBeLessThan(50 * ciFactor);
+
+    // Measure behind-by-4991 hook sync digest
+    const tHook0 = performance.now();
+    const hookSync = await store.checkAndSyncHookDrift({
+      externalRef: 'claude-code:perf-0',
+      harness: 'claude-code',
+      defaultTitle: 'Perf Session 0',
+      cwd: dir,
+    });
+    const hookMs = performance.now() - tHook0;
+    expect(hookSync.action).toBe('digest');
+    expect(hookMs).toBeLessThan(300 * ciFactor);
+  });
+});

@@ -93,6 +93,7 @@ import {
 } from './errors.js';
 import {
   BOARD_SLUG_REGEX,
+  ENTITY_ID_REGEX,
   nextSequentialId,
   nowIso,
   shortId,
@@ -113,6 +114,7 @@ import { parseFrontmatter, stringifyFrontmatter } from './markdown.js';
 import {
   buildSessionDriftDigest,
   computeDriftReport,
+  computeStaleArtifacts,
   evaluateDecisionStaleness,
   isMeaningfulEvent,
   resolveLatestDecision,
@@ -644,7 +646,7 @@ export class ContextDeckStore {
   public async ackReaderCursor(
     boardSlug: string | undefined,
     ackRevision: number,
-    options: { readerId?: string; now?: string } = {},
+    options: { readerId?: string; reviewedAt?: string; now?: string } = {},
   ): Promise<ReaderBoardCursor> {
     if (!Number.isInteger(ackRevision) || ackRevision < 0) {
       throw new ValidationError('ackRevision must be a non-negative integer.');
@@ -663,9 +665,26 @@ export class ContextDeckStore {
         const clamped = Math.min(ackRevision, config.revision);
         const nextRev = Math.max(prev?.lastReviewedRevision ?? 0, clamped);
         const nowStr = options.now ?? nowIso();
+        // H12: Store min(reviewedAt, now) so sessions created between Catch up display and click
+        // are never swallowed, while remaining monotonic against any previous lastReviewedAt.
+        let effectiveReviewedAt = nowStr;
+        if (options.reviewedAt) {
+          const revMs = Date.parse(options.reviewedAt);
+          const nowMs = Date.parse(nowStr);
+          if (Number.isFinite(revMs) && Number.isFinite(nowMs)) {
+            effectiveReviewedAt = revMs <= nowMs ? options.reviewedAt : nowStr;
+          }
+        }
+        if (prev?.lastReviewedAt) {
+          const prevMs = Date.parse(prev.lastReviewedAt);
+          const effMs = Date.parse(effectiveReviewedAt);
+          if (Number.isFinite(prevMs) && Number.isFinite(effMs) && effMs < prevMs) {
+            effectiveReviewedAt = prev.lastReviewedAt;
+          }
+        }
         const nextEntry: ReaderBoardCursor = {
           lastReviewedRevision: nextRev,
-          lastReviewedAt: nowStr,
+          lastReviewedAt: effectiveReviewedAt,
         };
         const nextFile: ReaderCursorFile = ReaderCursorFileSchema.parse({
           readerId: id,
@@ -690,11 +709,74 @@ export class ContextDeckStore {
     options: { readerId?: string } = {},
   ): Promise<CatchUpReport> {
     const slug = await this.resolveBoardSlug(boardSlug);
-    const [snapshot, cursor] = await Promise.all([
-      this.getSnapshot(slug),
+    const evaluatedAt = nowIso();
+    const [config, cursor] = await Promise.all([
+      this.readBoardConfig(slug),
       this.getReaderCursor(slug, options.readerId),
     ]);
-    return computeCatchUp(snapshot, cursor);
+    const fromRevision = cursor?.lastReviewedRevision ?? 0;
+
+    // H13: Fast short-circuit when already caught up at the board's current revision:
+    // skip events, decisions, tasks, diagrams, media, quizzes, jobs, and per-session drift,
+    // checking ONLY sessions (for hook-created sessions newer than lastReviewedAt).
+    if (cursor !== null && fromRevision >= config.revision) {
+      const sessions = await this.listSessions(slug);
+      return computeCatchUp(
+        {
+          config,
+          sessions,
+          decisions: [],
+          tasks: [],
+          diagrams: [],
+          media: [],
+          quizzes: [],
+          jobs: [],
+          events: [],
+          drift: { staleArtifacts: [] },
+        },
+        cursor,
+        { evaluatedAt },
+      );
+    }
+
+    // H13: Lightweight delta read — readEventsSince (tail only), loadContent: false,
+    // and computeStaleArtifacts only (no 40x5000 per-session drift).
+    const [events, sessions, decisions, tasks, diagrams, media, quizzes, jobs] = await Promise.all([
+      this.readEventsSince(slug, fromRevision, config.revision),
+      this.listSessions(slug),
+      this.listDecisions(slug),
+      this.listTasks(slug),
+      this.listDiagrams(slug, { loadContent: false }),
+      this.listMedia(slug, { loadContent: false }),
+      this.listQuizzes(slug),
+      this.listJobs(slug),
+    ]);
+
+    const staleArtifacts = computeStaleArtifacts({
+      decisions,
+      tasks,
+      diagrams,
+      media,
+      quizzes,
+      includeTasks: false,
+    });
+
+    return computeCatchUp(
+      {
+        config,
+        sessions,
+        decisions,
+        tasks,
+        diagrams,
+        media,
+        quizzes,
+        jobs,
+        events,
+        drift: { staleArtifacts },
+      },
+      cursor,
+      { evaluatedAt },
+    );
   }
 
   private sessionMetadataFingerprint(meta: SessionMetadata): string {
@@ -1457,6 +1539,45 @@ export class ContextDeckStore {
     return cfg;
   }
 
+  private static fastParseBoardEvent(parsedJson: unknown, eventsPath: string): BoardEvent {
+    if (parsedJson && typeof parsedJson === 'object' && !Array.isArray(parsedJson)) {
+      const obj = parsedJson as Record<string, unknown>;
+      const actor = obj.actor as Record<string, unknown> | undefined;
+      if (
+        typeof obj.id === 'string' &&
+        ENTITY_ID_REGEX.test(obj.id) &&
+        typeof obj.revision === 'number' &&
+        Number.isInteger(obj.revision) &&
+        obj.revision >= 1 &&
+        typeof obj.timestamp === 'string' &&
+        obj.timestamp.length >= 10 &&
+        typeof obj.kind === 'string' &&
+        obj.kind.length >= 1 &&
+        typeof obj.summary === 'string' &&
+        (obj.entityId === undefined || typeof obj.entityId === 'string') &&
+        (obj.details === undefined ||
+          (typeof obj.details === 'object' && obj.details !== null && !Array.isArray(obj.details))) &&
+        actor !== undefined &&
+        typeof actor === 'object' &&
+        actor !== null &&
+        (actor.type === 'human' || actor.type === 'agent' || actor.type === 'system') &&
+        (actor.harness === undefined || typeof actor.harness === 'string') &&
+        (actor.sessionId === undefined ||
+          (typeof actor.sessionId === 'string' && ENTITY_ID_REGEX.test(actor.sessionId))) &&
+        (actor.label === undefined || typeof actor.label === 'string')
+      ) {
+        return obj as unknown as BoardEvent;
+      }
+    }
+    const parsed = BoardEventSchema.safeParse(parsedJson);
+    if (!parsed.success) {
+      throw new CorruptDataError(
+        `Invalid event schema in ${eventsPath}: ${formatZodError(parsed.error)}`,
+      );
+    }
+    return parsed.data;
+  }
+
   public async readEvents(slug: string, maxRevision?: number): Promise<BoardEvent[]> {
     const validSlug = validateBoardSlug(slug);
     const eventsPath = await this.safeBoardFilePath(validSlug, 'events.jsonl');
@@ -1475,14 +1596,9 @@ export class ContextDeckStore {
           `Corrupt JSONL line in ${eventsPath}: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
-      const parsed = BoardEventSchema.safeParse(parsedJson);
-      if (!parsed.success) {
-        throw new CorruptDataError(
-          `Invalid event schema in ${eventsPath}: ${formatZodError(parsed.error)}`,
-        );
-      }
-      if (maxRevision === undefined || parsed.data.revision <= maxRevision) {
-        events.push(parsed.data);
+      const ev = ContextDeckStore.fastParseBoardEvent(parsedJson, eventsPath);
+      if (maxRevision === undefined || ev.revision <= maxRevision) {
+        events.push(ev);
       }
     }
     return events;
@@ -1490,7 +1606,7 @@ export class ContextDeckStore {
 
   /**
    * Lightweight reverse-chunk tail reader for events.jsonl (E3 amended).
-   * Reads backwards from EOF in 32 KB chunks and stops as soon as it sees
+   * Reads backwards from EOF in 64 KB chunks and stops as soon as it sees
    * an event with revision <= afterRevision, keeping hook/digest latency
    * well under 300ms even with 5,000+ events.
    */
@@ -1511,7 +1627,7 @@ export class ContextDeckStore {
       throw err;
     }
 
-    const CHUNK_SIZE = 32 * 1024;
+    const CHUNK_SIZE = 64 * 1024;
     const collected: BoardEvent[] = [];
 
     const parseEventLine = (lineBuf: Buffer): BoardEvent | null => {
@@ -1525,13 +1641,7 @@ export class ContextDeckStore {
           `Corrupt JSONL line in ${eventsPath}: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
-      const parsed = BoardEventSchema.safeParse(parsedJson);
-      if (!parsed.success) {
-        throw new CorruptDataError(
-          `Invalid event schema in ${eventsPath}: ${formatZodError(parsed.error)}`,
-        );
-      }
-      return parsed.data;
+      return ContextDeckStore.fastParseBoardEvent(parsedJson, eventsPath);
     };
 
     try {
@@ -1748,28 +1858,38 @@ export class ContextDeckStore {
   }): Promise<Array<LegacySessionFile & { board: string }>> {
     const skipCorrupt = Boolean(options?.skipCorrupt);
     const byId = new Map<string, LegacySessionFile & { board: string }>();
+    let cachedDefaultBoard: string | undefined;
+    const resolveDefault = async (): Promise<string> => {
+      if (cachedDefaultBoard === undefined) {
+        cachedDefaultBoard = await this.getDefaultBoardSlug();
+      }
+      return cachedDefaultBoard;
+    };
 
-    // 1. Workspace-scoped sessions in `<deck>/sessions/*.yaml` (canonical D11 location)
+    // 1. Workspace-scoped sessions in `<deck>/sessions/*.yaml` (canonical D11 location), read in parallel (H13)
     const canonicalSessionsDir = await this.assertSessionsDirSafe();
     const wsFiles = await listFilesStrict(canonicalSessionsDir, '.yaml');
-    for (const file of wsFiles) {
-      const filePath = await assertContainedPath(
-        canonicalSessionsDir,
-        path.join(canonicalSessionsDir, file),
-        { label: `session ${file}` },
-      );
-      let parsed: LegacySessionFile | null;
-      try {
-        parsed = await readYamlStrict(filePath, LegacySessionFileSchema);
-      } catch (err) {
-        if (skipCorrupt && err instanceof CorruptDataError) {
-          options?.onCorrupt?.(filePath, err);
-          continue;
+    const wsResults = await Promise.all(
+      wsFiles.map(async (file) => {
+        const filePath = await assertContainedPath(
+          canonicalSessionsDir,
+          path.join(canonicalSessionsDir, file),
+          { label: `session ${file}` },
+        );
+        try {
+          return await readYamlStrict(filePath, LegacySessionFileSchema);
+        } catch (err) {
+          if (skipCorrupt && err instanceof CorruptDataError) {
+            options?.onCorrupt?.(filePath, err);
+            return null;
+          }
+          throw err;
         }
-        throw err;
-      }
+      }),
+    );
+    for (const parsed of wsResults) {
       if (parsed) {
-        const board = parsed.board ?? (await this.getDefaultBoardSlug());
+        const board = parsed.board ?? (await resolveDefault());
         byId.set(parsed.id, { ...parsed, board });
       }
     }
@@ -1791,20 +1911,23 @@ export class ContextDeckStore {
       if (!existsSync(legacyDir)) continue;
       const safeDir = await this.safeBoardFilePath(entry.name, 'sessions');
       const legacyFiles = await listFilesStrict(safeDir, '.yaml');
-      for (const file of legacyFiles) {
-        const filePath = await assertContainedPath(safeDir, path.join(safeDir, file), {
-          label: `legacy session ${file}`,
-        });
-        let parsed: LegacySessionFile | null;
-        try {
-          parsed = await readYamlStrict(filePath, LegacySessionFileSchema);
-        } catch (err) {
-          if (skipCorrupt && err instanceof CorruptDataError) {
-            options?.onCorrupt?.(filePath, err);
-            continue;
+      const legacyResults = await Promise.all(
+        legacyFiles.map(async (file) => {
+          const filePath = await assertContainedPath(safeDir, path.join(safeDir, file), {
+            label: `legacy session ${file}`,
+          });
+          try {
+            return await readYamlStrict(filePath, LegacySessionFileSchema);
+          } catch (err) {
+            if (skipCorrupt && err instanceof CorruptDataError) {
+              options?.onCorrupt?.(filePath, err);
+              return null;
+            }
+            throw err;
           }
-          throw err;
-        }
+        }),
+      );
+      for (const parsed of legacyResults) {
         if (parsed && !byId.has(parsed.id)) {
           byId.set(parsed.id, { ...parsed, board: parsed.board ?? entry.name });
         }
@@ -3902,7 +4025,14 @@ export class ContextDeckStore {
       params.onCorruptSession?.(filePath, err instanceof Error ? err.message : String(err));
     };
 
-    // --- Lock-free fast path (D12, H8, N3) ---
+    // --- Lock-free fast path (D12, H8, N3, H13) ---
+    let cachedFastDigest: {
+      sessionId: string;
+      boardSlug: string;
+      lastSynced: number;
+      revision: number;
+      result: SessionDigestResult;
+    } | null = null;
     const fastMatch = (await this.listAllRawSessions({ skipCorrupt: true, onCorrupt })).find(
       (s) => s.externalRef === params.externalRef,
     );
@@ -3933,6 +4063,13 @@ export class ContextDeckStore {
             events: tailEvents,
             maxLines: params.maxDigestLines,
           });
+          cachedFastDigest = {
+            sessionId: fastMatch.id,
+            boardSlug,
+            lastSynced,
+            revision: config.revision,
+            result: fastDigest,
+          };
 
           if (fastDigest.behindBy === 0 || fastDigest.digest.length === 0) {
             // H8 + R2-2: Fast-forward runtime cursor via bounded locked commit (swallows lock timeout)
@@ -4054,14 +4191,20 @@ export class ContextDeckStore {
           return { action: 'noop' as const };
         }
 
-        const tailEvents = await this.readEventsSince(boardSlug, lastSynced, boardConfig.revision);
-        const digestResult = buildSessionDriftDigest({
-          sessionId: activeExisting.id,
-          lastSyncedRevision: lastSynced,
-          currentRevision: boardConfig.revision,
-          events: tailEvents,
-          maxLines: params.maxDigestLines,
-        });
+        const digestResult =
+          cachedFastDigest &&
+          cachedFastDigest.sessionId === activeExisting.id &&
+          cachedFastDigest.boardSlug === boardSlug &&
+          cachedFastDigest.lastSynced === lastSynced &&
+          cachedFastDigest.revision === boardConfig.revision
+            ? cachedFastDigest.result
+            : buildSessionDriftDigest({
+                sessionId: activeExisting.id,
+                lastSyncedRevision: lastSynced,
+                currentRevision: boardConfig.revision,
+                events: await this.readEventsSince(boardSlug, lastSynced, boardConfig.revision),
+                maxLines: params.maxDigestLines,
+              });
 
         if (digestResult.behindBy === 0 || digestResult.digest.length === 0) {
           // H8 + R2-2: Fast-forward runtime cursor using unlocked helper (workspace lock already held)
@@ -5106,7 +5249,12 @@ export class ContextDeckStore {
     boardSlug: string | undefined,
     artifactType: RefreshJobArtifactType,
     artifactId: string,
-    rawInput: { note?: string; decisionIds?: string[] } = {},
+    rawInput: {
+      note?: string;
+      decisionIds?: string[];
+      artifactVersion?: number;
+      expectedAgainst?: Record<string, string>;
+    } = {},
     actor: Actor = DEFAULT_ACTOR,
   ): Promise<Diagram | MediaArtifact | Quiz> {
     const validType = parseStrict(RefreshJobArtifactTypeSchema, artifactType, 'artifactType');
@@ -5125,12 +5273,20 @@ export class ContextDeckStore {
         actorType;
 
       const buildConfirmations = (
+        currentVersion: number,
         existingConfirmations: Record<string, ArtifactConfirmation>,
         referencedDecisionIds: string[],
       ): {
         nextConfirmations: Record<string, ArtifactConfirmation>;
         confirmedAgainst: Array<{ staleId: string; againstId: string }>;
       } => {
+        // H9: Reject confirmation if the artifact changed since display
+        if (input.artifactVersion !== undefined && currentVersion !== input.artifactVersion) {
+          throw new ConflictError(
+            `Artifact "${artifactId}" is now at version ${currentVersion}, not displayed version ${input.artifactVersion}. Refetch before confirming.`,
+          );
+        }
+
         const { staleIds } = evaluateDecisionStaleness(
           referencedDecisionIds,
           decisionMap,
@@ -5140,8 +5296,16 @@ export class ContextDeckStore {
           ? staleIds.filter((id) => input.decisionIds!.includes(id))
           : staleIds;
 
+        // H10: Never bump board revision or append events when nothing is stale
+        if (targetIds.length === 0) {
+          throw new ValidationError(
+            `Artifact "${artifactId}" has no stale decisions to confirm.`,
+          );
+        }
+
         const nextConfirmations: Record<string, ArtifactConfirmation> = { ...existingConfirmations };
         const confirmedAgainst: Array<{ staleId: string; againstId: string }> = [];
+        const resolvedMap = new Map<string, string>();
 
         for (const staleId of targetIds) {
           const dec = decisionMap.get(staleId);
@@ -5149,6 +5313,7 @@ export class ContextDeckStore {
           const latest =
             dec.status === 'superseded' ? resolveLatestDecision(dec.id, decisionMap) : dec;
           const againstId = latest?.id ?? dec.id;
+          resolvedMap.set(staleId, againstId);
           nextConfirmations[staleId] = ArtifactConfirmationSchema.parse({
             againstDecisionId: againstId,
             confirmedBy,
@@ -5159,6 +5324,31 @@ export class ContextDeckStore {
           confirmedAgainst.push({ staleId, againstId });
         }
 
+        if (confirmedAgainst.length === 0) {
+          throw new ValidationError(
+            `Artifact "${artifactId}" has no stale decisions to confirm.`,
+          );
+        }
+
+        // H9: Reject if any stale decision now resolves to a newer replacement than what the caller displayed
+        if (input.expectedAgainst !== undefined) {
+          for (const [staleId, actualAgainstId] of resolvedMap.entries()) {
+            const expectedId = input.expectedAgainst[staleId];
+            if (expectedId !== actualAgainstId) {
+              throw new ConflictError(
+                `Stale decision "${staleId}" now resolves to "${actualAgainstId}", not expected "${expectedId ?? 'none'}". Refetch before confirming.`,
+              );
+            }
+          }
+          for (const expectedStaleId of Object.keys(input.expectedAgainst)) {
+            if (!resolvedMap.has(expectedStaleId)) {
+              throw new ConflictError(
+                `Expected stale decision "${expectedStaleId}" is no longer pending confirmation on "${artifactId}". Refetch before confirming.`,
+              );
+            }
+          }
+        }
+
         return { nextConfirmations, confirmedAgainst };
       };
 
@@ -5166,6 +5356,7 @@ export class ContextDeckStore {
         const item = await this.readDiagramById(tx.slug, artifactId);
         if (!item) throw new NotFoundError(`Diagram "${artifactId}" not found.`);
         const { nextConfirmations, confirmedAgainst } = buildConfirmations(
+          item.version,
           item.confirmations,
           item.basedOnDecisions,
         );
@@ -5197,6 +5388,7 @@ export class ContextDeckStore {
         const item = await this.readMediaById(tx.slug, artifactId, { loadContent: true });
         if (!item) throw new NotFoundError(`Media "${artifactId}" not found.`);
         const { nextConfirmations, confirmedAgainst } = buildConfirmations(
+          item.version,
           item.confirmations,
           item.basedOnDecisions,
         );
@@ -5236,6 +5428,7 @@ export class ContextDeckStore {
         ...quiz.questions.flatMap((q) => q.relatedDecisionIds ?? []),
       ];
       const { nextConfirmations, confirmedAgainst } = buildConfirmations(
+        quiz.version,
         quiz.confirmations,
         allQuizDecs,
       );

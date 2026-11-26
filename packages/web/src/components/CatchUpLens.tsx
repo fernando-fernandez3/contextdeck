@@ -32,7 +32,7 @@ export function CatchUpLens({ boardSlug, catchUp, onUpdated }: CatchUpLensProps)
   const handleMarkCaughtUp = async () => {
     setAcking(true);
     try {
-      await api.ackCatchUp(boardSlug, catchUp.toRevision);
+      await api.ackCatchUp(boardSlug, catchUp.toRevision, catchUp.evaluatedAt);
       onUpdated();
     } finally {
       setAcking(false);
@@ -108,6 +108,8 @@ export function CatchUpLens({ boardSlug, catchUp, onUpdated }: CatchUpLensProps)
                   boardSlug={boardSlug}
                   artifactType={art.artifactType}
                   artifactId={art.artifactId}
+                  artifactVersion={art.artifactVersion}
+                  expectedAgainst={art.expectedAgainst}
                   activeJob={art.activeJob}
                   onUpdated={onUpdated}
                 />
@@ -153,6 +155,36 @@ export function CatchUpLens({ boardSlug, catchUp, onUpdated }: CatchUpLensProps)
                 <span className="text-zinc-100 min-w-0 truncate">{s.title}</span>
               </div>
             ))}
+          </div>
+        </section>
+      )}
+
+      {(catchUp.otherChanges?.length ?? 0) > 0 && (
+        <section className="rounded-lg border border-zinc-800 bg-zinc-900 overflow-hidden">
+          <div className="px-4 py-3 border-b border-zinc-800 flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-zinc-100">Other changes</h2>
+            <span className="text-xs font-mono text-zinc-500">
+              {catchUp.otherChanges.length + (catchUp.otherChangesTruncated ?? 0)}
+            </span>
+          </div>
+          <div className="divide-y divide-zinc-800">
+            {catchUp.otherChanges.map((item, idx) => (
+              <div
+                key={`${item.kind}-${item.at}-${idx}`}
+                className="px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-sm"
+              >
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="text-[11px] font-mono text-zinc-500 shrink-0">{item.kind}</span>
+                  <span className="text-zinc-100 min-w-0 truncate">{item.title}</span>
+                </div>
+                <span className="text-xs font-mono text-zinc-500 shrink-0">{item.actor}</span>
+              </div>
+            ))}
+            {(catchUp.otherChangesTruncated ?? 0) > 0 && (
+              <div className="px-4 py-2 text-xs font-mono text-zinc-500">
+                and {catchUp.otherChangesTruncated} more
+              </div>
+            )}
           </div>
         </section>
       )}

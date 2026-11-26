@@ -665,8 +665,20 @@ export const SubmitQuizAttemptInputSchema = z
 
 export const ConfirmArtifactInputSchema = z
   .object({
-    note: z.string().max(1000).optional(),
+    note: z.string().trim().min(1).max(1000).optional(),
     decisionIds: z.array(EntityIdSchema).max(100).optional(),
+    artifactVersion: z.number().int().min(1).optional(),
+    expectedAgainst: z.record(EntityIdSchema, EntityIdSchema).optional(),
+    actor: ActorSchema.optional(),
+  })
+  .strict();
+
+export const RestConfirmArtifactInputSchema = z
+  .object({
+    note: z.string().trim().min(1).max(1000).optional(),
+    decisionIds: z.array(EntityIdSchema).max(100).optional(),
+    artifactVersion: z.number().int().min(1),
+    expectedAgainst: z.record(EntityIdSchema, EntityIdSchema),
     actor: ActorSchema.optional(),
   })
   .strict();
@@ -721,6 +733,7 @@ export const CompleteJobInputSchema = z
 export const AckReaderCursorInputSchema = z
   .object({
     revision: z.number().int().min(0),
+    reviewedAt: IsoDateTimeSchema.optional(),
     readerId: EntityIdSchema.optional(),
   })
   .strict();
@@ -731,6 +744,8 @@ export interface StaleArtifactNotice {
   title: string;
   staleDecisionIds: string[];
   reasons: string[];
+  artifactVersion?: number;
+  expectedAgainst?: Record<string, string>;
 }
 
 export interface DriftDigestEntry {
@@ -786,7 +801,9 @@ export interface CatchUpStaleArtifact {
   artifactType: RefreshJobArtifactType;
   artifactId: string;
   title: string;
+  artifactVersion: number;
   staleDecisionIds: string[];
+  expectedAgainst: Record<string, string>;
   reasons: string[];
   activeJob: {
     id: string;
@@ -810,16 +827,26 @@ export interface CatchUpNewSession {
   createdAt: string;
 }
 
+export interface CatchUpOtherChange {
+  kind: string;
+  title: string;
+  actor: string;
+  at: string;
+}
+
 export interface CatchUpReport {
   fromRevision: number;
   toRevision: number;
   lastReviewedAt: string | null;
+  evaluatedAt: string;
   unseenCount: number;
   hasUnseen: boolean;
   decisionsChanged: CatchUpDecisionChange[];
   staleArtifacts: CatchUpStaleArtifact[];
   tasksMoved: CatchUpTaskMove[];
   newSessions: CatchUpNewSession[];
+  otherChanges: CatchUpOtherChange[];
+  otherChangesTruncated: number;
 }
 
 export interface BoardSnapshot {

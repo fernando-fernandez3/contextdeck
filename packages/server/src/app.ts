@@ -13,7 +13,6 @@ import {
   AckReaderCursorInputSchema,
   ClaimJobInputSchema,
   CompleteJobInputSchema,
-  ConfirmArtifactInputSchema,
   ContextDeckError,
   ContextDeckStore,
   CreateBoardInputSchema,
@@ -29,6 +28,7 @@ import {
   ReleaseJobInputSchema,
   RenewJobInputSchema,
   RestAddMediaInputSchema,
+  RestConfirmArtifactInputSchema,
   RestUpdateDiagramInputSchema,
   SubmitQuizAttemptInputSchema,
   SyncSessionInputSchema,
@@ -499,6 +499,13 @@ export function createApp(options: AppOptions): {
   app.get('/api/boards/:slug', async (c) => {
     const slug = validateBoardSlug(c.req.param('slug'));
     const snapshot = await store.getSnapshot(slug);
+    const includeAllEvents = c.req.query('events') === 'all';
+    if (!includeAllEvents && snapshot.events.length > 200) {
+      return c.json({
+        ...snapshot,
+        events: snapshot.events.slice(-200),
+      });
+    }
     return c.json(snapshot);
   });
 
@@ -971,12 +978,15 @@ export function createApp(options: AppOptions): {
   app.post('/api/boards/:slug/reader/ack', async (c) => {
     const slug = validateBoardSlug(c.req.param('slug'));
     const body = parseBodyStrict(AckReaderCursorInputSchema, await readByteCountedJson(c));
-    const cursor = await store.ackReaderCursor(slug, body.revision, { readerId: body.readerId });
+    const cursor = await store.ackReaderCursor(slug, body.revision, {
+      readerId: body.readerId,
+      reviewedAt: body.reviewedAt,
+    });
     const catchUp = await store.getCatchUp(slug, { readerId: body.readerId });
     return c.json({ cursor, catchUp });
   });
 
-  // Human confirmation for stale artifact (AC7.3, D14, D17; old /refresh removed!)
+  // Human confirmation for stale artifact (AC7.3, D14, D17, H9, H10; old /refresh removed!)
   app.post('/api/boards/:slug/artifacts/:type/:id/confirm', async (c) => {
     const slug = validateBoardSlug(c.req.param('slug'));
     const rawType = c.req.param('type');
@@ -988,7 +998,7 @@ export function createApp(options: AppOptions): {
     }
     const id = validateEntityId(c.req.param('id'), 'artifactId');
     const rawBody = await readByteCountedJson(c);
-    const { actor: bodyActor, ...input } = parseBodyStrict(ConfirmArtifactInputSchema, rawBody);
+    const { actor: bodyActor, ...input } = parseBodyStrict(RestConfirmArtifactInputSchema, rawBody);
     const auth = c.get('auth');
     const defaultHumanLabel = resolveDefaultReaderLabel({ projectRoot: store.projectRoot });
     const actor: Actor =

@@ -108,6 +108,7 @@ function QuizRunner({
   quiz,
   snapshot,
   staleReasons,
+  staleNotice,
   activeJob,
   onSubmitted,
 }: {
@@ -115,6 +116,7 @@ function QuizRunner({
   quiz: Quiz;
   snapshot: BoardSnapshot;
   staleReasons?: string[];
+  staleNotice?: BoardSnapshot['drift']['staleArtifacts'][number];
   activeJob?: RefreshJob | null;
   onSubmitted: () => void;
 }) {
@@ -175,6 +177,8 @@ function QuizRunner({
             boardSlug={slug}
             artifactType="quiz"
             artifactId={quiz.id}
+            artifactVersion={staleNotice?.artifactVersion ?? quiz.version ?? 1}
+            expectedAgainst={staleNotice?.expectedAgainst ?? {}}
             activeJob={activeJob}
             onUpdated={onSubmitted}
           />
@@ -560,6 +564,7 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
               quiz={activeQuiz}
               snapshot={snapshot}
               staleReasons={staleQuizMap.get(activeQuiz.id)?.reasons}
+              staleNotice={staleQuizMap.get(activeQuiz.id)}
               activeJob={activeJobMap.get(`quiz:${activeQuiz.id}`)}
               onSubmitted={onRefresh}
             />
@@ -619,6 +624,12 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
                     boardSlug={snapshot.config.slug}
                     artifactType="media"
                     artifactId={activeMedia.id}
+                    artifactVersion={
+                      staleMediaMap.get(activeMedia.id)!.artifactVersion ??
+                      activeMedia.version ??
+                      1
+                    }
+                    expectedAgainst={staleMediaMap.get(activeMedia.id)!.expectedAgainst ?? {}}
                     activeJob={activeJobMap.get(`media:${activeMedia.id}`)}
                     onUpdated={onRefresh}
                   />

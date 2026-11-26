@@ -662,21 +662,46 @@ export function createContextDeckMcpServer(
           board: BoardSlugSchema.optional(),
           artifactType: RefreshJobArtifactTypeSchema,
           artifactId: EntityIdSchema,
-          note: z.string().min(1).max(1000).describe('Required rationale explaining why the artifact is still accurate'),
+          note: z
+            .string()
+            .trim()
+            .min(1)
+            .max(1000)
+            .describe('Required non-blank rationale explaining why the artifact is still accurate'),
           decisionIds: z.array(EntityIdSchema).max(100).optional(),
+          artifactVersion: z
+            .number()
+            .int()
+            .min(1)
+            .optional()
+            .describe('Optional displayed artifact version; conflicts if artifact changed'),
+          expectedAgainst: z
+            .record(EntityIdSchema, EntityIdSchema)
+            .optional()
+            .describe('Optional map of staleDecisionId -> expected replacement decisionId'),
           harness: z.string().max(100).optional(),
           sessionId: EntityIdSchema.optional(),
         })
         .strict(),
     },
-    async ({ board, artifactType, artifactId, note, decisionIds, harness, sessionId }) => {
+    async ({
+      board,
+      artifactType,
+      artifactId,
+      note,
+      decisionIds,
+      artifactVersion,
+      expectedAgainst,
+      harness,
+      sessionId,
+    }) => {
       const slug = await resolveSlug(board, sessionId);
       // D14: MCP-originated confirmations are ALWAYS labeled as agent confirmations, never human.
       const updated = await store.confirmArtifact(
         slug,
         artifactType,
         artifactId,
-        { note, decisionIds },
+        { note, decisionIds, artifactVersion, expectedAgainst },
         {
           type: 'agent',
           harness: harness ?? 'mcp',
