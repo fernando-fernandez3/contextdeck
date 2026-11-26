@@ -597,3 +597,88 @@ describe('B3 Hardening G4: Packaging web-dist resolver order (H16)', () => {
     expect(resolveDefaultWebDistDir(serverDist)).toBe(monoWebDist);
   });
 });
+
+describe('B3 Hardening Round 2 G2: REST quiz version conflict (R2-5)', () => {
+  it('R2-5: POST /quizzes/:id/attempts returns 409 on stale or missing quizVersion after update and 201 on matching version', async () => {
+    const dir = await makeTempDir('cdeck-r2-5-srv-');
+    const store = new ContextDeckStore(dir);
+    await store.createBoard({ title: 'R2-5 REST', slug: 'main' });
+
+    const quiz = await store.createQuiz('main', {
+      title: 'REST Quiz',
+      questions: [
+        {
+          id: 'q1',
+          prompt: 'Pick A',
+          type: 'multiple_choice',
+          options: ['A', 'B'],
+          correctIndex: 0,
+          explanation: 'v1',
+          relatedDecisionIds: [],
+        },
+      ],
+    });
+    await store.updateQuiz('main', quiz.id, {
+      questions: [
+        {
+          id: 'q1',
+          prompt: 'Pick A',
+          type: 'multiple_choice',
+          options: ['B', 'A'],
+          correctIndex: 1,
+          explanation: 'v2',
+          relatedDecisionIds: [],
+        },
+      ],
+    });
+
+    const { app, token, close } = createApp({ store, port: 4311 });
+    try {
+      const staleRes = await app.request(
+        `http://127.0.0.1:4311/api/boards/main/quizzes/${quiz.id}/attempts`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ answers: { q1: 0 }, quizVersion: 1 }),
+        },
+      );
+      expect(staleRes.status).toBe(409);
+      const staleBody = (await staleRes.json()) as { error: string };
+      expect(staleBody.error).toMatch(/version 2/i);
+
+      const missingVerRes = await app.request(
+        `http://127.0.0.1:4311/api/boards/main/quizzes/${quiz.id}/attempts`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ answers: { q1: 0 } }),
+        },
+      );
+      expect(missingVerRes.status).toBe(409);
+
+      const okRes = await app.request(
+        `http://127.0.0.1:4311/api/boards/main/quizzes/${quiz.id}/attempts`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ answers: { q1: 1 }, quizVersion: 2 }),
+        },
+      );
+      expect(okRes.status).toBe(201);
+      const okBody = (await okRes.json()) as { attempt: { score: number; quizVersion?: number } };
+      expect(okBody.attempt.score).toBe(1);
+      expect(okBody.attempt.quizVersion).toBe(2);
+    } finally {
+      await close();
+    }
+  });
+});

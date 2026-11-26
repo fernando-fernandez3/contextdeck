@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { existsSync, type Dirent } from 'node:fs';
+import { createReadStream, existsSync, type Dirent } from 'node:fs';
 import yaml from 'js-yaml';
 import chokidar, { type FSWatcher } from 'chokidar';
 import type { ZodType, ZodTypeDef } from 'zod';
@@ -3219,6 +3219,16 @@ export class ContextDeckStore {
     return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
   }
 
+  private static hashFileSha256(filePath: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const hash = crypto.createHash('sha256');
+      const stream = createReadStream(filePath);
+      stream.on('data', (chunk) => hash.update(chunk));
+      stream.on('end', () => resolve(hash.digest('hex')));
+      stream.on('error', reject);
+    });
+  }
+
   private static getStoredLeaseHash(job: RefreshJob): string | null {
     if (job.leaseTokenHash) return job.leaseTokenHash;
     // R2-4 read-compat: accept legacy job files that stored a raw leaseToken without a hash
@@ -3415,6 +3425,33 @@ export class ContextDeckStore {
       throw new NotFoundError(`Media artifact "${mediaId}" not found on board "${tx.slug}".`);
     }
 
+    const isTextMediaKind =
+      existing.kind === 'doc' || existing.kind === 'html' || existing.kind === 'json';
+    const MAX_INLINE_TEXT_MEDIA_BYTES = 512 * 1024;
+    let stagedTextContent: string | undefined;
+    let stagedContentHash: string | undefined;
+    if (isTextMediaKind && stagedBinary) {
+      const st = await fs.stat(stagedBinary.tmpPath);
+      if (st.size <= MAX_INLINE_TEXT_MEDIA_BYTES) {
+        stagedTextContent = await fs.readFile(stagedBinary.tmpPath, 'utf8');
+        stagedContentHash = ContextDeckStore.sha256Hex(stagedTextContent);
+      } else {
+        stagedTextContent = undefined;
+        stagedContentHash = await ContextDeckStore.hashFileSha256(stagedBinary.tmpPath);
+      }
+    }
+
+    const existingContentHash =
+      existing.content !== undefined
+        ? ContextDeckStore.sha256Hex(existing.content)
+        : existing.history.at(-1)?.contentHash;
+    const nextContentHash =
+      isTextMediaKind && stagedBinary
+        ? stagedContentHash
+        : patch.content !== undefined
+          ? ContextDeckStore.sha256Hex(patch.content)
+          : existingContentHash;
+
     const activeClaim = await this.validateActiveJobClaim(
       tx.slug,
       patch.jobId,
@@ -3443,14 +3480,15 @@ export class ContextDeckStore {
           );
         }
       }
-      if (
-        (existing.kind === 'doc' || existing.kind === 'html' || existing.kind === 'json') &&
-        !hasNewBinary &&
-        !hasNewContent
-      ) {
-        throw new ValidationError(
-          'Cannot record refresh job version for document/html/json without changed content or a new file.',
-        );
+      if (isTextMediaKind) {
+        const textContentChanged =
+          (hasNewBinary || hasNewContent) &&
+          (existingContentHash === undefined || nextContentHash !== existingContentHash);
+        if (!textContentChanged) {
+          throw new ValidationError(
+            'Cannot record refresh job version for document/html/json without changed content or a new file.',
+          );
+        }
       }
       if (!hasNewBinary && !hasNewContent && !hasNewTranscript && !hasNewUrl) {
         throw new ValidationError(
@@ -3478,7 +3516,7 @@ export class ContextDeckStore {
       tx.stagePreStagedFile(stagedBinary.tmpPath, finalFilePath);
     } else if (
       patch.content !== undefined &&
-      (existing.kind === 'doc' || existing.kind === 'html' || existing.kind === 'json')
+      isTextMediaKind
     ) {
       const ext = existing.kind === 'html' ? '.html' : existing.kind === 'json' ? '.json' : '.md';
       nextFilePath = `${existing.id}.v${nextVersion}${ext}`;
@@ -3501,7 +3539,6 @@ export class ContextDeckStore {
       actor: effActor,
     });
 
-    const nextContentForHash = patch.content !== undefined ? patch.content : existing.content;
     const versionEntry: ArtifactVersionEntry = ArtifactVersionEntrySchema.parse({
       version: nextVersion,
       updatedAt: now,
@@ -3509,9 +3546,7 @@ export class ContextDeckStore {
       actor: effActor,
       basedOnDecisions: nextBasedOn,
       ...(nextFilePath ? { filePath: nextFilePath } : {}),
-      ...(nextContentForHash !== undefined
-        ? { contentHash: ContextDeckStore.sha256Hex(nextContentForHash) }
-        : {}),
+      ...(nextContentHash !== undefined ? { contentHash: nextContentHash } : {}),
       ...(activeClaim
         ? { createdByJob: activeClaim.job.id, createdByClaim: activeClaim.claimFingerprint }
         : {}),
@@ -3525,10 +3560,17 @@ export class ContextDeckStore {
       patch.transcript !== undefined ||
       patch.externalUrl !== undefined;
 
+    const nextContent =
+      isTextMediaKind && stagedBinary
+        ? stagedTextContent
+        : patch.content !== undefined
+          ? patch.content
+          : existing.content;
+
     const updated = MediaArtifactSchema.parse({
       ...existing,
       ...(patch.title !== undefined ? { title: patch.title } : {}),
-      ...(patch.content !== undefined ? { content: patch.content } : {}),
+      content: nextContent,
       ...(patch.transcript !== undefined ? { transcript: patch.transcript } : {}),
       ...(patch.chapters !== undefined ? { chapters: patch.chapters } : {}),
       ...(patch.durationSec !== undefined ? { durationSec: patch.durationSec } : {}),
@@ -5239,6 +5281,7 @@ export class ContextDeckStore {
     rawInput: {
       answers: Record<string, number | string | boolean>;
       confidence?: number;
+      quizVersion?: number;
     },
     actor: Actor = { type: 'human', label: 'user' },
   ): Promise<{ quiz: Quiz; attempt: QuizAttempt }> {
@@ -5250,11 +5293,27 @@ export class ContextDeckStore {
       if (!quiz) {
         throw new NotFoundError(`Quiz "${quizId}" not found on board "${tx.slug}".`);
       }
+      // R2-5: Bind submission to displayed quizVersion under the mutation lock so
+      // answers from an older version can never be silently graded against newer keys.
+      const currentVersion = quiz.version ?? 1;
+      if (input.quizVersion !== undefined) {
+        if (input.quizVersion !== currentVersion) {
+          throw new ConflictError(
+            `Quiz "${quiz.id}" is now at version ${currentVersion}, not version ${input.quizVersion}. Reload the quiz before submitting.`,
+          );
+        }
+      } else if (currentVersion > 1) {
+        throw new ConflictError(
+          `Quiz "${quiz.id}" is at version ${currentVersion}; quizVersion is required when submitting answers to an updated quiz.`,
+        );
+      }
+
       const quizPath = await this.safeBoardFilePath(tx.slug, 'quizzes', `${quiz.id}.quiz.json`);
       const { score, total, percentage } = scoreQuizAttempt(quiz.questions, input.answers);
       const attempt = QuizAttemptSchema.parse({
         id: shortId('att'),
         takenAt: nowIso(),
+        quizVersion: currentVersion,
         score,
         total,
         percentage,
@@ -5554,6 +5613,8 @@ export class ContextDeckStore {
         inputFilePath = media.filePath;
         if (media.content !== undefined) {
           inputContentHash = ContextDeckStore.sha256Hex(media.content);
+        } else if (media.history.at(-1)?.contentHash) {
+          inputContentHash = media.history.at(-1)?.contentHash;
         }
         kindLabel = media.kind;
       } else {
@@ -5940,19 +6001,18 @@ export class ContextDeckStore {
             );
           }
         } else if (
-          existing.inputFilePath &&
-          (currentMedia.kind === 'doc' || currentMedia.kind === 'html' || currentMedia.kind === 'json')
+          currentMedia.kind === 'doc' ||
+          currentMedia.kind === 'html' ||
+          currentMedia.kind === 'json'
         ) {
+          // R2-6: Compare contentHash unconditionally (without filePath equality gate)
+          // so A -> Temp -> A and identical-file doc/html/json refreshes are always rejected.
           const currentHash =
             matchingEntry.contentHash ??
             (currentMedia.content !== undefined
               ? ContextDeckStore.sha256Hex(currentMedia.content)
               : undefined);
-          if (
-            matchingEntry.filePath === existing.inputFilePath &&
-            existing.inputContentHash &&
-            currentHash === existing.inputContentHash
-          ) {
+          if (existing.inputContentHash && currentHash === existing.inputContentHash) {
             throw new ValidationError(
               `Cannot complete refresh job "${existing.id}": ${currentMedia.kind} content is unchanged.`,
             );

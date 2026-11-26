@@ -289,6 +289,8 @@ export type QuizQuestion = z.infer<typeof QuizQuestionSchema>;
 export const QuizAttemptSchema = z.object({
   id: EntityIdSchema,
   takenAt: IsoDateTimeSchema,
+  // R2-5: Recorded on new attempts; omitted (undefined = unknown, never defaulted to v1) on legacy attempts.
+  quizVersion: z.number().int().min(1).optional(),
   score: z.number().int().nonnegative(),
   total: z.number().int().positive(),
   percentage: z.number().min(0).max(100),
@@ -671,6 +673,7 @@ export const SubmitQuizAttemptInputSchema = z
   .object({
     answers: z.record(z.string(), z.union([z.number(), z.string(), z.boolean()])),
     confidence: z.number().min(1).max(5).optional(),
+    quizVersion: z.number().int().min(1).optional(),
     actor: ActorSchema.optional(),
   })
   .strict();

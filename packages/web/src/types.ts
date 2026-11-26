@@ -121,6 +121,7 @@ export interface QuizQuestion {
 export interface QuizAttempt {
   id: string;
   takenAt: string;
+  quizVersion?: number;
   score: number;
   total: number;
   percentage: number;

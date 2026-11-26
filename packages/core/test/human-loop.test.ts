@@ -1276,3 +1276,186 @@ describe('B3 Hardening Round 2 G1: Refresh-job lease secrecy (R2-3, R2-4)', () =
     expect(legacyDone.status).toBe('done');
   });
 });
+
+describe('B3 Hardening Round 2 G2: Doc/HTML/JSON file updates and Quiz version binding (R2-6, R2-5)', () => {
+  it('R2-6: file-based doc/html/json update returns and hashes v2 content, and completeJob rejects A->Temp->A and identical-file refreshes', async () => {
+    const dir = await makeTempDir('cdeck-r2-6-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'R2-6', slug: 'main' });
+
+    const d1 = await store.recordDecision('main', { title: 'Spec v1' });
+    const doc = await store.addMedia('main', {
+      title: 'Architecture Spec',
+      kind: 'doc',
+      content: '# Original Spec\nDetails v1.',
+      basedOnDecisions: [d1.id],
+    });
+    await store.recordDecision('main', { title: 'Spec v2', supersedes: d1.id });
+
+    // Repro 1: A -> Temp (non-job) -> A (via job) MUST be rejected by completeJob
+    const { job: revertJob } = await store.createRefreshJob('main', {
+      artifactType: 'media',
+      artifactId: doc.id,
+    });
+    const revertClaim = await store.claimJob('main', { jobId: revertJob.id, claimedBy: 'w-r2-6' });
+    await store.updateMedia('main', doc.id, { content: '# Temp Spec' });
+    await store.updateMedia('main', doc.id, {
+      content: '# Original Spec\nDetails v1.',
+      jobId: revertJob.id,
+      leaseToken: revertClaim!.leaseToken,
+    });
+    await expect(
+      store.completeJob('main', revertJob.id, {
+        leaseToken: revertClaim!.leaseToken,
+        artifactVersion: 3,
+      }),
+    ).rejects.toThrow(/unchanged/i);
+    await store.completeJob('main', revertJob.id, {
+      leaseToken: revertClaim!.leaseToken,
+      status: 'failed',
+      error: 'aborted after unchanged test',
+    });
+
+    // Repro 2: file-based update via sourceFilePath MUST return and hash the new v2 content
+    const doc2 = await store.addMedia('main', {
+      title: 'File Spec',
+      kind: 'doc',
+      content: '# V1 content',
+      basedOnDecisions: [d1.id],
+    });
+    const v2File = path.join(dir, 'v2.md');
+    await fs.writeFile(v2File, '# V2 brand new content', 'utf8');
+    const updatedV2 = await store.updateMedia('main', doc2.id, {
+      sourceFilePath: v2File,
+    });
+    const expectedV2Hash = crypto
+      .createHash('sha256')
+      .update('# V2 brand new content', 'utf8')
+      .digest('hex');
+    expect(updatedV2.content).toBe('# V2 brand new content');
+    expect(updatedV2.history.find((h) => h.version === 2)?.contentHash).toBe(expectedV2Hash);
+
+    // Repro 3: refreshing with an identical file via sourceFilePath MUST be rejected and cannot complete done
+    const { job: sameFileJob } = await store.createRefreshJob('main', {
+      artifactType: 'media',
+      artifactId: doc2.id,
+    });
+    const sameClaim = await store.claimJob('main', { jobId: sameFileJob.id, claimedBy: 'w-same' });
+    const sameFile = path.join(dir, 'same.md');
+    await fs.writeFile(sameFile, '# V2 brand new content', 'utf8');
+
+    let sameRefreshRejected = false;
+    try {
+      const maybeV3 = await store.updateMedia('main', doc2.id, {
+        sourceFilePath: sameFile,
+        jobId: sameFileJob.id,
+        leaseToken: sameClaim!.leaseToken,
+      });
+      await store.completeJob('main', sameFileJob.id, {
+        leaseToken: sameClaim!.leaseToken,
+        artifactVersion: maybeV3.version,
+      });
+    } catch (err) {
+      expect(err).toBeInstanceOf(core.ValidationError);
+      sameRefreshRejected = true;
+    }
+    expect(sameRefreshRejected).toBe(true);
+    expect((await store.getJob('main', sameFileJob.id))?.status).toBe('claimed');
+  });
+
+  it('R2-5: rejects stale or missing quizVersion after update with ConflictError, records quizVersion, and reads legacy attempts as unknown', async () => {
+    const dir = await makeTempDir('cdeck-r2-5-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'R2-5', slug: 'main' });
+
+    const quiz = await store.createQuiz('main', {
+      title: 'Versioned Quiz',
+      questions: [
+        {
+          id: 'q1',
+          prompt: 'Pick A',
+          type: 'multiple_choice',
+          options: ['A', 'B'],
+          correctIndex: 0,
+          explanation: 'A is right in v1',
+          relatedDecisionIds: [],
+        },
+      ],
+    });
+
+    // Simulate legacy attempt stored without quizVersion on disk
+    const quizPath = path.join(dir, '.contextdeck', 'boards', 'main', 'quizzes', `${quiz.id}.quiz.json`);
+    const diskQuiz = JSON.parse(await fs.readFile(quizPath, 'utf8')) as {
+      attempts: Array<Record<string, unknown>>;
+    };
+    diskQuiz.attempts.push({
+      id: 'att_legacy01',
+      takenAt: '2026-11-25T00:00:00.000Z',
+      score: 1,
+      total: 1,
+      percentage: 100,
+      answers: { q1: 0 },
+    });
+    await fs.writeFile(quizPath, `${JSON.stringify(diskQuiz, null, 2)}\n`, 'utf8');
+
+    // Legacy attempt MUST read as unknown (undefined), NOT 1
+    const snapLegacy = await store.getSnapshot('main');
+    const legacyAttempt = snapLegacy.quizzes[0].attempts.find((a) => a.id === 'att_legacy01');
+    expect(legacyAttempt).toBeDefined();
+    expect(legacyAttempt?.quizVersion).toBeUndefined();
+
+    // Update quiz to v2 with swapped options (Codex new-3 repro)
+    const v2 = await store.updateQuiz('main', quiz.id, {
+      questions: [
+        {
+          id: 'q1',
+          prompt: 'Pick A',
+          type: 'multiple_choice',
+          options: ['B', 'A'],
+          correctIndex: 1,
+          explanation: 'A is index 1 in v2',
+          relatedDecisionIds: [],
+        },
+      ],
+    });
+    expect(v2.version).toBe(2);
+
+    // Submitting v1 answer with quizVersion: 1 MUST fail with ConflictError naming version 2 and record no attempt
+    let staleErr: unknown = null;
+    try {
+      await store.submitQuizAttempt('main', quiz.id, {
+        answers: { q1: 0 },
+        quizVersion: 1,
+      });
+    } catch (err) {
+      staleErr = err;
+    }
+    expect(staleErr).toBeInstanceOf(core.ConflictError);
+    expect((staleErr as Error).message).toMatch(/version 2/i);
+
+    // Omitting quizVersion on a multi-version quiz (> 1) MUST also fail with ConflictError naming version 2
+    let missingVerErr: unknown = null;
+    try {
+      await store.submitQuizAttempt('main', quiz.id, {
+        answers: { q1: 0 },
+      });
+    } catch (err) {
+      missingVerErr = err;
+    }
+    expect(missingVerErr).toBeInstanceOf(core.ConflictError);
+    expect((missingVerErr as Error).message).toMatch(/version 2/i);
+
+    expect((await store.getSnapshot('main')).quizzes[0].attempts).toHaveLength(1);
+
+    // Matching quizVersion: 2 succeeds and persists quizVersion on the attempt
+    const ok = await store.submitQuizAttempt('main', quiz.id, {
+      answers: { q1: 1 },
+      quizVersion: 2,
+    });
+    expect(ok.attempt.score).toBe(1);
+    expect(ok.attempt.quizVersion).toBe(2);
+    expect(ok.quiz.attempts).toHaveLength(2);
+    expect(ok.quiz.attempts[0].quizVersion).toBeUndefined();
+    expect(ok.quiz.attempts[1].quizVersion).toBe(2);
+  });
+});

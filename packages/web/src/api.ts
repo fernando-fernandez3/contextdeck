@@ -289,13 +289,18 @@ export const api = {
     quizId: string,
     answers: Record<string, number | string | boolean>,
     confidence?: number,
+    quizVersion?: number,
   ) =>
     req<{ quiz: Quiz; attempt: QuizAttempt }>(
       `/api/boards/${encodeURIComponent(slug)}/quizzes/${encodeURIComponent(quizId)}/attempts`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ answers, confidence }),
+        body: JSON.stringify({
+          answers,
+          confidence,
+          ...(quizVersion !== undefined ? { quizVersion } : {}),
+        }),
       },
     ),
 

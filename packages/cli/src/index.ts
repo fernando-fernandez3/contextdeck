@@ -525,7 +525,7 @@ diagramCmd
   .option('-d, --dir <path>', 'Workspace directory')
   .option('-b, --board <slug>', 'Board slug')
   .option('--id <diagramId>', 'Existing diagram ID to update (creates a new version)')
-  .option('--kind <kind>', 'mermaid | excalidraw', 'mermaid')
+  .option('--kind <kind>', 'mermaid | excalidraw (preserves existing kind on update, defaults to mermaid on create)')
   .option('--based-on <csv>', 'Comma-separated decision IDs')
   .option('--job <jobId>', 'Optional claimed refresh job ID fulfilled by this version')
   .option('--lease <token>', 'Active lease token from job claim (required with --job)')
@@ -543,12 +543,17 @@ diagramCmd
       {
         ...(opts.id ? { id: String(opts.id) } : {}),
         title,
-        kind: opts.kind as DiagramKind,
+        ...(opts.kind !== undefined ? { kind: opts.kind as DiagramKind } : {}),
         content,
-        sessionId: opts.session ?? null,
-        basedOnDecisions: opts.basedOn
-          ? String(opts.basedOn).split(',').map((s) => s.trim()).filter(Boolean)
-          : [],
+        ...(opts.session !== undefined ? { sessionId: String(opts.session) } : {}),
+        ...(opts.basedOn !== undefined
+          ? {
+              basedOnDecisions: String(opts.basedOn)
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean),
+            }
+          : {}),
         ...(opts.job ? { jobId: String(opts.job) } : {}),
         ...(opts.lease ? { leaseToken: String(opts.lease) } : {}),
         ...(opts.note ? { note: String(opts.note) } : {}),

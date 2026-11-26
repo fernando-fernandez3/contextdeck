@@ -880,3 +880,62 @@ setInterval(()=>{},1000);
     },
   );
 });
+
+describe('B3 Hardening Round 2 G2: CLI diagram add --id preserves kind and basedOnDecisions (R2-9)', () => {
+  it('R2-9: cdeck diagram add --id preserves excalidraw kind and basedOnDecisions when flags are omitted, while new diagrams still default to mermaid', async () => {
+    const dir = await makeTempDir('cdeck-r2-9-');
+    const store = new ContextDeckStore({ deckDir: path.join(dir, '.contextdeck'), projectRoot: dir });
+    await store.createBoard({ title: 'R2-9', slug: 'main' });
+    const d1 = await store.recordDecision('main', { title: 'Use Excalidraw' });
+
+    const created = await store.upsertDiagram('main', {
+      title: 'Canvas',
+      kind: 'excalidraw',
+      content: JSON.stringify({ type: 'excalidraw', version: 2, elements: [{ id: 'e1' }] }),
+      basedOnDecisions: [d1.id],
+    });
+    expect(created.kind).toBe('excalidraw');
+    expect(created.basedOnDecisions).toEqual([d1.id]);
+
+    const updatedFile = path.join(dir, 'updated.excalidraw');
+    await fs.writeFile(
+      updatedFile,
+      JSON.stringify({ type: 'excalidraw', version: 2, elements: [{ id: 'e1' }, { id: 'e2' }] }),
+      'utf8',
+    );
+
+    const updateRes = await runCli(
+      ['diagram', 'add', 'Canvas', '--id', created.id, '--file', updatedFile, '--dir', dir, '--board', 'main'],
+      { cwd: dir },
+    );
+    expect(updateRes.code).toBe(0);
+    const updated = JSON.parse(updateRes.stdout) as {
+      id: string;
+      kind: string;
+      version: number;
+      basedOnDecisions: string[];
+    };
+    expect(updated.id).toBe(created.id);
+    expect(updated.version).toBe(2);
+    expect(updated.kind).toBe('excalidraw');
+    expect(updated.basedOnDecisions).toEqual([d1.id]);
+
+    // No stray .mmd file created for the excalidraw diagram
+    const diagramsDir = path.join(dir, '.contextdeck', 'boards', 'main', 'diagrams');
+    const files = await fs.readdir(diagramsDir);
+    expect(files).toContain(`${created.id}.excalidraw`);
+    expect(files).not.toContain(`${created.id}.mmd`);
+
+    // New diagram without --kind still defaults to mermaid
+    const mmdFile = path.join(dir, 'new.mmd');
+    await fs.writeFile(mmdFile, 'flowchart LR\nA-->B\n', 'utf8');
+    const newRes = await runCli(
+      ['diagram', 'add', 'New Flow', '--file', mmdFile, '--dir', dir, '--board', 'main'],
+      { cwd: dir },
+    );
+    expect(newRes.code).toBe(0);
+    const newDiag = JSON.parse(newRes.stdout) as { kind: string; basedOnDecisions: string[] };
+    expect(newDiag.kind).toBe('mermaid');
+    expect(newDiag.basedOnDecisions).toEqual([]);
+  });
+});

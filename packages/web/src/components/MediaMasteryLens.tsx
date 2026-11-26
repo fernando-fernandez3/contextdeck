@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   CheckCircle2,
   FileText,
@@ -11,7 +11,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import type { BoardSnapshot, MediaArtifact, Quiz, RefreshJob } from '../types';
-import { api } from '../api';
+import { ApiError, api } from '../api';
 import { isSafeHttpUrl, wrapHtmlArtifactSrcDoc } from '../security';
 import { computeMasteryTrend, getQuizQuestionStaleness } from '../quiz-helpers';
 import { MarkdownView, StatusBadge } from './Badge';
@@ -127,20 +127,42 @@ function QuizRunner({
     total: number;
     percentage: number;
   } | null>(null);
+  const [versionNotice, setVersionNotice] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
+  const currentVersion = quiz.version ?? 1;
   const questionStaleness = getQuizQuestionStaleness(quiz, snapshot.decisions);
+
+  // R2-5: Reset answers and graded results whenever the loaded quiz or its version changes.
+  useEffect(() => {
+    setAnswers({});
+    setSubmittedResult(null);
+  }, [quiz.id, currentVersion]);
+
+  useEffect(() => {
+    setVersionNotice(null);
+  }, [quiz.id]);
 
   const handleSubmit = async () => {
     setSubmitting(true);
     try {
-      const res = await api.submitQuizAttempt(slug, quiz.id, answers, confidence);
+      const res = await api.submitQuizAttempt(slug, quiz.id, answers, confidence, currentVersion);
+      setVersionNotice(null);
       setSubmittedResult({
         score: res.attempt.score,
         total: res.attempt.total,
         percentage: res.attempt.percentage,
       });
       onSubmitted();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409) {
+        setAnswers({});
+        setSubmittedResult(null);
+        setVersionNotice('Quiz changed to a newer version. Reloaded.');
+        onSubmitted();
+        return;
+      }
+      throw err;
     } finally {
       setSubmitting(false);
     }
@@ -163,6 +185,15 @@ function QuizRunner({
       </div>
 
       <ConfirmationBadges confirmations={quiz.confirmations} />
+
+      {versionNotice && (
+        <div
+          role="status"
+          className="rounded-lg border border-amber-500/40 bg-zinc-950 px-3 py-2 text-xs text-amber-300"
+        >
+          {versionNotice}
+        </div>
+      )}
 
       {staleReasons && staleReasons.length > 0 && (
         <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-3.5 space-y-2.5">
@@ -243,6 +274,7 @@ function QuizRunner({
                         key={optIdx}
                         type="button"
                         onClick={() => {
+                          setVersionNotice(null);
                           setSubmittedResult(null);
                           setAnswers((prev) => ({ ...prev, [q.id]: optIdx }));
                         }}
@@ -267,6 +299,7 @@ function QuizRunner({
                         key={String(val)}
                         type="button"
                         onClick={() => {
+                          setVersionNotice(null);
                           setSubmittedResult(null);
                           setAnswers((prev) => ({ ...prev, [q.id]: val }));
                         }}
@@ -287,6 +320,7 @@ function QuizRunner({
                 <input
                   value={String(chosen ?? '')}
                   onChange={(e) => {
+                    setVersionNotice(null);
                     setSubmittedResult(null);
                     setAnswers((prev) => ({ ...prev, [q.id]: e.target.value }));
                   }}
