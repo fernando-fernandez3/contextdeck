@@ -194,7 +194,7 @@ export interface RefreshJob {
   inputFilePath?: string;
   status: RefreshJobStatus;
   claimedBy: string | null;
-  leaseToken: string | null;
+  leaseToken?: string | null;
   claimedAt: string | null;
   leaseExpiresAt: string | null;
   result: {

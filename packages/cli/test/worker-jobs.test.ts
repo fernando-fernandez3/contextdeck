@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ContextDeckStore } from '@contextdeck/core';
+import { resolveHandlerForJob, runWorkerLoop, runWorkerOnce } from '../src/worker.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CLI_BIN = path.resolve(here, '../dist/index.js');
@@ -241,4 +242,472 @@ execFileSync(process.execPath, [
     expect(reUntrusted.code).not.toBe(0);
     expect(reUntrusted.stderr).toContain('cdeck worker trust');
   });
+});
+
+describe('B3 Hardening G2: Worker contract, robustness, process-tree timeout, and temp dir (H4-H6, H8)', () => {
+  it('H4: matches docs/handlers.md resolution order, env vars, payload fields, --interval flag, and runs documented media:video + quiz handlers', async () => {
+    const base = await makeTempDir('cdeck-h4-');
+    const fakeHome = path.join(base, 'home');
+    const repo = path.join(base, 'repo');
+    await fs.mkdir(fakeHome, { recursive: true });
+    await fs.mkdir(repo, { recursive: true });
+    const env = { CONTEXTDECK_HOME: fakeHome };
+
+    // Resolution priority: media:<kind> -> <kind> -> media -> *; diagram:<kind> -> <kind> -> diagram -> *; quiz -> *
+    const dummyJob = (over: Partial<import('@contextdeck/core').RefreshJob>) =>
+      ({
+        id: 'job_1',
+        kind: 'refresh',
+        artifactType: 'media',
+        artifactId: 'art_1',
+        artifactTitle: 'T',
+        mediaKind: 'video',
+        reason: 'r',
+        decisionsBefore: [],
+        decisionsNow: [],
+        baseVersion: 1,
+        status: 'queued',
+        claimedBy: null,
+        leaseToken: null,
+        claimedAt: null,
+        leaseExpiresAt: null,
+        result: null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        ...over,
+      }) as import('@contextdeck/core').RefreshJob;
+
+    expect(
+      resolveHandlerForJob(
+        {
+          handlers: {
+            'media:video': { argv: ['node', 'mv.mjs'], timeoutSec: 60 },
+            video: { argv: ['node', 'v.mjs'], timeoutSec: 60 },
+            media: { argv: ['node', 'm.mjs'], timeoutSec: 60 },
+            '*': { argv: ['node', 'star.mjs'], timeoutSec: 60 },
+          },
+        },
+        dummyJob({ artifactType: 'media', mediaKind: 'video' }),
+      )?.key,
+    ).toBe('media:video');
+    expect(
+      resolveHandlerForJob(
+        { handlers: { '*': { argv: ['node', 'star.mjs'], timeoutSec: 60 } } },
+        dummyJob({ artifactType: 'media', mediaKind: 'video' }),
+      )?.key,
+    ).toBe('*');
+    expect(
+      resolveHandlerForJob(
+        {
+          handlers: {
+            'diagram:mermaid': { argv: ['node', 'dm.mjs'], timeoutSec: 60 },
+            diagram: { argv: ['node', 'd.mjs'], timeoutSec: 60 },
+          },
+        },
+        dummyJob({ artifactType: 'diagram', mediaKind: undefined, diagramKind: 'mermaid' }),
+      )?.key,
+    ).toBe('diagram:mermaid');
+    expect(
+      resolveHandlerForJob(
+        { handlers: { '*': { argv: ['node', 'star.mjs'], timeoutSec: 60 } } },
+        dummyJob({ artifactType: 'quiz', mediaKind: undefined }),
+      )?.key,
+    ).toBe('*');
+
+    expect((await runCli(['init', '--slug', 'main'], { cwd: repo, env })).code).toBe(0);
+    const store = new ContextDeckStore({ deckDir: path.join(repo, '.contextdeck'), projectRoot: repo });
+    const d1 = await store.recordDecision('main', { title: 'Old Auth', summary: 'Legacy' });
+    const v1 = path.join(repo, 'v1.mp4');
+    await fs.writeFile(v1, Buffer.from('v1-bytes'));
+    const video = await store.addMedia('main', {
+      title: 'Auth Explainer',
+      kind: 'video',
+      sourceFilePath: v1,
+      basedOnDecisions: [d1.id],
+    });
+    const quiz = await store.createQuiz('main', {
+      title: 'Auth Quiz',
+      basedOnDecisions: [d1.id],
+      questions: [
+        {
+          id: 'q1',
+          prompt: 'Old auth?',
+          type: 'true_false',
+          correctAnswer: 'true',
+          explanation: 'Old',
+          relatedDecisionIds: [d1.id],
+        },
+      ],
+    });
+    const d2 = await store.recordDecision('main', {
+      title: 'Passkeys',
+      supersedes: d1.id,
+      summary: 'WebAuthn passkeys',
+    });
+    const { job: videoJob } = await store.createRefreshJob('main', {
+      artifactType: 'media',
+      artifactId: video.id,
+    });
+    const { job: quizJob } = await store.createRefreshJob('main', {
+      artifactType: 'quiz',
+      artifactId: quiz.id,
+    });
+
+    const videoHandler = path.join(base, 'docs-video-handler.mjs');
+    const quizHandler = path.join(base, 'docs-quiz-handler.mjs');
+    const outVideo = path.join(base, 'docs-v2.mp4');
+    const outQuiz = path.join(base, 'docs-quiz.json');
+    await fs.writeFile(
+      videoHandler,
+      `import fs from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+const payload = JSON.parse(await fs.readFile(process.env.CONTEXTDECK_JOB_FILE, 'utf8'));
+if (!process.env.CONTEXTDECK_BASE_VERSION) throw new Error('missing CONTEXTDECK_BASE_VERSION');
+if (!process.env.CONTEXTDECK_PROJECT_ROOT) throw new Error('missing CONTEXTDECK_PROJECT_ROOT');
+const accepted = payload.decisions.filter((d) => d.status === 'accepted');
+const decisionIds = accepted.map((d) => d.id).join(',');
+await fs.writeFile(${JSON.stringify(outVideo)}, 'rendered-docs-v2');
+execFileSync(process.execPath, [
+  ${JSON.stringify(CLI_BIN)},
+  'media', 'update', payload.job.artifactId,
+  '--dir', payload.projectRoot,
+  '--board', payload.boardSlug,
+  '--file', ${JSON.stringify(outVideo)},
+  '--based-on', decisionIds,
+  '--job', process.env.CONTEXTDECK_JOB_ID,
+  '--lease', process.env.CONTEXTDECK_LEASE_TOKEN,
+], { stdio: 'inherit' });
+`,
+      'utf8',
+    );
+    await fs.writeFile(
+      quizHandler,
+      `import fs from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+const payload = JSON.parse(await fs.readFile(process.env.CONTEXTDECK_JOB_FILE, 'utf8'));
+if (!process.env.CONTEXTDECK_BASE_VERSION) throw new Error('missing CONTEXTDECK_BASE_VERSION');
+if (!process.env.CONTEXTDECK_PROJECT_ROOT) throw new Error('missing CONTEXTDECK_PROJECT_ROOT');
+const accepted = payload.decisions.filter((d) => d.status === 'accepted');
+const decisionIds = accepted.map((d) => d.id);
+await fs.writeFile(${JSON.stringify(outQuiz)}, JSON.stringify({
+  basedOnDecisions: decisionIds,
+  questions: [{
+    id: 'q1',
+    prompt: 'Passkeys active?',
+    type: 'true_false',
+    correctAnswer: 'true',
+    explanation: 'Per ' + decisionIds.join(','),
+    relatedDecisionIds: decisionIds,
+  }],
+}), 'utf8');
+execFileSync(process.execPath, [
+  ${JSON.stringify(CLI_BIN)},
+  'quiz', 'update', payload.job.artifactId,
+  '--dir', payload.projectRoot,
+  '--board', payload.boardSlug,
+  '--file', ${JSON.stringify(outQuiz)},
+  '--job', process.env.CONTEXTDECK_JOB_ID,
+  '--lease', process.env.CONTEXTDECK_LEASE_TOKEN,
+], { stdio: 'inherit' });
+`,
+      'utf8',
+    );
+
+    await fs.writeFile(
+      path.join(fakeHome, 'worker.yaml'),
+      `handlers:\n  "media:video":\n    argv: [${JSON.stringify(process.execPath)}, ${JSON.stringify(videoHandler)}]\n    timeoutSec: 30\n  quiz:\n    argv: [${JSON.stringify(process.execPath)}, ${JSON.stringify(quizHandler)}]\n    timeoutSec: 30\n`,
+      'utf8',
+    );
+    expect((await runCli(['worker', 'trust'], { cwd: repo, env })).code).toBe(0);
+
+    // --interval + --poll-ms together MUST error
+    const bothFlags = await runCli(['worker', '--once', '--interval', '5', '--poll-ms', '1000'], {
+      cwd: repo,
+      env,
+    });
+    expect(bothFlags.code).not.toBe(0);
+
+    // --interval 5 works with --once
+    const pass1 = await runCli(['worker', '--once', '--interval', '5'], { cwd: repo, env });
+    expect(pass1.code).toBe(0);
+    const pass2 = await runCli(['worker', '--once', '--interval', '5'], { cwd: repo, env });
+    expect(pass2.code).toBe(0);
+
+    expect((await store.getJob('main', videoJob.id))?.status).toBe('done');
+    expect((await store.getJob('main', quizJob.id))?.status).toBe('done');
+    expect((await store.getSnapshot('main')).media.find((m) => m.id === video.id)?.basedOnDecisions).toEqual([d2.id]);
+  });
+
+  it('H5: handles spawn ENOENT, concurrent claim races, and lost-lease completion cleanly without crashing or wedging jobs', async () => {
+    const base = await makeTempDir('cdeck-h5-');
+    const fakeHome = path.join(base, 'home');
+    const repo = path.join(base, 'repo');
+    await fs.mkdir(fakeHome, { recursive: true });
+    await fs.mkdir(repo, { recursive: true });
+    const env = { CONTEXTDECK_HOME: fakeHome };
+
+    const store = new ContextDeckStore({ deckDir: path.join(repo, '.contextdeck'), projectRoot: repo });
+    await store.createBoard({ title: 'H5', slug: 'main' });
+    const d1 = await store.recordDecision('main', { title: 'D1' });
+    const diag1 = await store.upsertDiagram('main', {
+      title: 'D1 Diag',
+      kind: 'mermaid',
+      content: 'flowchart LR\nA-->1',
+      basedOnDecisions: [d1.id],
+    });
+    const diag2 = await store.upsertDiagram('main', {
+      title: 'D2 Diag',
+      kind: 'mermaid',
+      content: 'flowchart LR\nA-->2',
+      basedOnDecisions: [d1.id],
+    });
+    await store.recordDecision('main', { title: 'D2', supersedes: d1.id });
+
+    // (1) Spawn ENOENT -> fails job cleanly instead of throwing and leaving it claimed
+    const { job: enoentJob } = await store.createRefreshJob('main', {
+      artifactType: 'diagram',
+      artifactId: diag1.id,
+    });
+    await fs.writeFile(
+      path.join(fakeHome, 'worker.yaml'),
+      `handlers:\n  diagram:\n    argv: ["definitely-nonexistent-binary-99999"]\n    timeoutSec: 10\n`,
+      'utf8',
+    );
+    expect((await runCli(['worker', 'trust'], { cwd: repo, env })).code).toBe(0);
+
+    const enoentRes = await runWorkerOnce(store, { workerName: 'w-enoent', env });
+    expect(enoentRes.processed).toBe(true);
+    expect(enoentRes.status).toBe('failed');
+    expect((await store.getJob('main', enoentJob.id))?.status).toBe('failed');
+
+    // (2) Two workers racing one queued job -> neither throws ConflictError
+    const okHandler = path.join(base, 'ok-diag.mjs');
+    await fs.writeFile(
+      okHandler,
+      `import fs from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+const payload = JSON.parse(await fs.readFile(process.env.CONTEXTDECK_JOB_FILE, 'utf8'));
+const mmd = payload.projectRoot + '/updated-' + payload.job.artifactId + '.mmd';
+await fs.writeFile(mmd, 'flowchart LR\\nA-->Updated_' + payload.job.id, 'utf8');
+execFileSync(process.execPath, [
+  ${JSON.stringify(CLI_BIN)},
+  'diagram', 'add', payload.artifact.title,
+  '--id', payload.job.artifactId,
+  '--file', mmd,
+  '--dir', payload.projectRoot,
+  '--board', payload.boardSlug,
+  '--job', process.env.CONTEXTDECK_JOB_ID,
+  '--lease', process.env.CONTEXTDECK_LEASE_TOKEN,
+], { stdio: 'inherit' });
+`,
+      'utf8',
+    );
+    await fs.writeFile(
+      path.join(fakeHome, 'worker.yaml'),
+      `handlers:\n  diagram:\n    argv: [${JSON.stringify(process.execPath)}, ${JSON.stringify(okHandler)}]\n    timeoutSec: 30\n`,
+      'utf8',
+    );
+    expect((await runCli(['worker', 'trust'], { cwd: repo, env })).code).toBe(0);
+
+    const { job: raceJob } = await store.createRefreshJob('main', {
+      artifactType: 'diagram',
+      artifactId: diag2.id,
+    });
+    const [r1, r2] = await Promise.all([
+      runWorkerOnce(store, { workerName: 'w1', env }),
+      runWorkerOnce(store, { workerName: 'w2', env }),
+    ]);
+    const processedCount = [r1, r2].filter((r) => r.processed).length;
+    expect(processedCount).toBe(1);
+    expect((await store.getJob('main', raceJob.id))?.status).toBe('done');
+
+    // (3) Lost lease before handler exits 0 -> does NOT throw unhandled ConflictError
+    const releaseSelfHandler = path.join(base, 'release-self.mjs');
+    await fs.writeFile(
+      releaseSelfHandler,
+      `import { execFileSync } from 'node:child_process';
+execFileSync(process.execPath, [
+  ${JSON.stringify(CLI_BIN)},
+  'job', 'release', process.env.CONTEXTDECK_JOB_ID,
+  '--lease', process.env.CONTEXTDECK_LEASE_TOKEN,
+  '--dir', process.env.CONTEXTDECK_PROJECT_ROOT,
+  '--board', process.env.CONTEXTDECK_BOARD,
+], { stdio: 'inherit' });
+`,
+      'utf8',
+    );
+    await fs.writeFile(
+      path.join(fakeHome, 'worker.yaml'),
+      `handlers:\n  diagram:\n    argv: [${JSON.stringify(process.execPath)}, ${JSON.stringify(releaseSelfHandler)}]\n    timeoutSec: 30\n`,
+      'utf8',
+    );
+    expect((await runCli(['worker', 'trust'], { cwd: repo, env })).code).toBe(0);
+
+    const { job: lostJob } = await store.createRefreshJob('main', {
+      artifactType: 'diagram',
+      artifactId: diag1.id,
+    });
+    const lostRes = await runWorkerOnce(store, { workerName: 'w-lost', env });
+    expect(lostRes.processed).toBe(true);
+    expect(lostRes.status).toBe('failed');
+    // Job was released back to queued and NOT overwritten by the dead lease token
+    expect((await store.getJob('main', lostJob.id))?.status).toBe('queued');
+
+    // (4) Polling loop catches transient errors and keeps polling, while exiting on missing/untrusted config
+    await expect(
+      runWorkerLoop(store, {
+        pollMs: 20,
+        env: { CONTEXTDECK_HOME: path.join(base, 'no-such-home') },
+      }),
+    ).rejects.toThrow(/worker\.yaml/i);
+
+    let ticks = 0;
+    const transientErrors: unknown[] = [];
+    const origListBoards = store.listBoards.bind(store);
+    store.listBoards = async () => {
+      ticks += 1;
+      if (ticks === 1) throw new Error('simulated transient EIO');
+      return origListBoards();
+    };
+    try {
+      await runWorkerLoop(store, {
+        pollMs: 20,
+        env,
+        shouldStop: () => ticks >= 2,
+        onTransientError: (e) => transientErrors.push(e),
+      });
+    } finally {
+      store.listBoards = origListBoards;
+    }
+    expect(transientErrors).toHaveLength(1);
+    expect(ticks).toBeGreaterThanOrEqual(2);
+  });
+
+  it.skipIf(process.platform === 'win32')(
+    'H6 & H8: kills process-tree descendants on timeout without hanging on open pipes, stops on lease renewal failure, and uses 0700 temp dir + 0600 job.json',
+    async () => {
+      const base = await makeTempDir('cdeck-h6-h8-');
+      const fakeHome = path.join(base, 'home');
+      const repo = path.join(base, 'repo');
+      await fs.mkdir(fakeHome, { recursive: true });
+      await fs.mkdir(repo, { recursive: true });
+      const env = { CONTEXTDECK_HOME: fakeHome };
+
+      const store = new ContextDeckStore({ deckDir: path.join(repo, '.contextdeck'), projectRoot: repo });
+      await store.createBoard({ title: 'H6H8', slug: 'main' });
+      const d1 = await store.recordDecision('main', { title: 'D1' });
+      const diag = await store.upsertDiagram('main', {
+        title: 'Timeout Diag',
+        kind: 'mermaid',
+        content: 'flowchart LR\nA-->1',
+        basedOnDecisions: [d1.id],
+      });
+      await store.recordDecision('main', { title: 'D2', supersedes: d1.id });
+      const { job } = await store.createRefreshJob('main', {
+        artifactType: 'diagram',
+        artifactId: diag.id,
+      });
+
+      const metaOut = path.join(base, 'probe.json');
+      const grandchildMarker = path.join(base, 'grandchild-ran.txt');
+      const timeoutHandler = path.join(base, 'timeout-grandchild.mjs');
+      await fs.writeFile(
+        timeoutHandler,
+        `import fs from 'node:fs';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+const jobFile = process.env.CONTEXTDECK_JOB_FILE;
+const jobDir = path.dirname(jobFile);
+const dirMode = fs.statSync(jobDir).mode & 0o777;
+const fileMode = fs.statSync(jobFile).mode & 0o777;
+const child = spawn(process.execPath, [
+  '-e',
+  'setTimeout(() => { console.log("GRANDCHILD STILL RUNNING"); require("node:fs").writeFileSync(' + ${JSON.stringify(JSON.stringify(grandchildMarker))} + ', "alive"); }, 4000);'
+], { stdio: 'inherit' });
+fs.writeFileSync(${JSON.stringify(metaOut)}, JSON.stringify({ jobDir, jobFile, dirMode, fileMode, grandchildPid: child.pid }));
+setInterval(() => {}, 1000);
+`,
+        'utf8',
+      );
+      await fs.writeFile(
+        path.join(fakeHome, 'worker.yaml'),
+        `handlers:\n  diagram:\n    argv: [${JSON.stringify(process.execPath)}, ${JSON.stringify(timeoutHandler)}]\n    timeoutSec: 1\n`,
+        'utf8',
+      );
+      expect((await runCli(['worker', 'trust'], { cwd: repo, env })).code).toBe(0);
+
+      const startedAt = Date.now();
+      const res = await runWorkerOnce(store, { workerName: 'w-timeout', env });
+      const elapsedMs = Date.now() - startedAt;
+
+      expect(res.processed).toBe(true);
+      expect(res.status).toBe('failed');
+      expect(elapsedMs).toBeLessThan(3_500);
+      expect((await store.getJob('main', job.id))?.status).toBe('failed');
+
+      const probe = JSON.parse(await fs.readFile(metaOut, 'utf8')) as {
+        jobDir: string;
+        jobFile: string;
+        dirMode: number;
+        fileMode: number;
+        grandchildPid: number;
+      };
+      // H8: 0700 private dir, 0600 job.json, removed after exit
+      expect(path.basename(probe.jobFile)).toBe('job.json');
+      expect(probe.dirMode).toBe(0o700);
+      expect(probe.fileMode).toBe(0o600);
+      await expect(fs.stat(probe.jobDir)).rejects.toThrow();
+
+      // H6: grandchild process is dead
+      let grandchildAlive = true;
+      try {
+        process.kill(probe.grandchildPid, 0);
+      } catch {
+        grandchildAlive = false;
+      }
+      expect(grandchildAlive).toBe(false);
+      await expect(fs.stat(grandchildMarker)).rejects.toThrow();
+
+      // H6b: lease renewal failure mid-run stops the handler immediately instead of waiting for timeoutSec
+      const { job: renewFailJob } = await store.createRefreshJob('main', {
+        artifactType: 'diagram',
+        artifactId: diag.id,
+      });
+      const slowHandler = path.join(base, 'slow-renew-fail.mjs');
+      await fs.writeFile(
+        slowHandler,
+        `import { execFileSync } from 'node:child_process';
+// Release our own lease right away, then sleep 10s; the worker's renewal tick should kill us promptly.
+execFileSync(process.execPath, [
+  ${JSON.stringify(CLI_BIN)},
+  'job', 'release', process.env.CONTEXTDECK_JOB_ID,
+  '--lease', process.env.CONTEXTDECK_LEASE_TOKEN,
+  '--dir', process.env.CONTEXTDECK_PROJECT_ROOT,
+  '--board', process.env.CONTEXTDECK_BOARD,
+], { stdio: 'inherit' });
+setTimeout(() => {}, 10000);
+`,
+        'utf8',
+      );
+      await fs.writeFile(
+        path.join(fakeHome, 'worker.yaml'),
+        `handlers:\n  diagram:\n    argv: [${JSON.stringify(process.execPath)}, ${JSON.stringify(slowHandler)}]\n    timeoutSec: 15\n`,
+        'utf8',
+      );
+      expect((await runCli(['worker', 'trust'], { cwd: repo, env })).code).toBe(0);
+
+      const renewStart = Date.now();
+      const renewRes = await runWorkerOnce(store, {
+        workerName: 'w-renew-fail',
+        env,
+        renewIntervalMs: 300,
+      });
+      const renewElapsed = Date.now() - renewStart;
+      expect(renewRes.processed).toBe(true);
+      expect(renewRes.status).toBe('failed');
+      expect(renewRes.message).toMatch(/renewal/i);
+      expect(renewElapsed).toBeLessThan(4_500);
+      expect((await store.getJob('main', renewFailJob.id))?.status).toBe('queued');
+    },
+  );
 });

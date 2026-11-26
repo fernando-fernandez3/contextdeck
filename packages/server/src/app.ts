@@ -43,6 +43,8 @@ import {
   ValidationError,
   generateContextPack,
   parseContextUpdatePayload,
+  redactJobLease,
+  redactJobsLeases,
   resolveDefaultReaderLabel,
   seedDemoBoard,
   validateBoardSlug,
@@ -1016,7 +1018,7 @@ export function createApp(options: AppOptions): {
       artifactType = parsed.data;
     }
     const jobs = await store.listJobs(slug, { status, artifactType });
-    return c.json({ jobs });
+    return c.json({ jobs: redactJobsLeases(jobs) });
   });
 
   app.post('/api/boards/:slug/jobs', async (c) => {
@@ -1029,7 +1031,10 @@ export function createApp(options: AppOptions): {
     if (!res.deduplicated) {
       broadcast('board.changed', slug);
     }
-    return c.json(res, res.deduplicated ? 200 : 201);
+    return c.json(
+      { job: redactJobLease(res.job), deduplicated: res.deduplicated },
+      res.deduplicated ? 200 : 201,
+    );
   });
 
   app.post('/api/boards/:slug/jobs/:id/claim', async (c) => {
@@ -1068,7 +1073,7 @@ export function createApp(options: AppOptions): {
     );
     const released = await store.releaseJob(slug, id, input, actor ?? { type: 'agent', label: 'worker' });
     broadcast('board.changed', slug);
-    return c.json(released);
+    return c.json(redactJobLease(released));
   });
 
   app.post('/api/boards/:slug/jobs/:id/complete', async (c) => {
@@ -1080,7 +1085,7 @@ export function createApp(options: AppOptions): {
     );
     const completed = await store.completeJob(slug, id, input, actor ?? { type: 'agent', label: 'worker' });
     broadcast('board.changed', slug);
-    return c.json(completed);
+    return c.json(redactJobLease(completed));
   });
 
   // Streamable HTTP MCP Endpoint (/mcp) — authenticated by authMiddleware

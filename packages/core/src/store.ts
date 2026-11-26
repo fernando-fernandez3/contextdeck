@@ -63,6 +63,7 @@ import {
   type LensConfig,
   type MediaArtifact,
   type MediaKind,
+  type PublicRefreshJob,
   type Quiz,
   type QuizAttempt,
   type QuizQuestion,
@@ -71,6 +72,8 @@ import {
   type RefreshJob,
   type RefreshJobArtifactType,
   type RefreshJobStatus,
+  redactJobLease,
+  redactJobsLeases,
   type Session,
   type SessionCursor,
   type SessionMetadata,
@@ -2212,11 +2215,10 @@ export class ContextDeckStore {
     return quizParsed.data;
   }
 
-  public async listJobs(
-    boardSlug?: string,
+  private async listJobsRaw(
+    slug: string,
     filter?: { status?: RefreshJobStatus; artifactType?: RefreshJobArtifactType },
   ): Promise<RefreshJob[]> {
-    const slug = await this.resolveBoardSlug(boardSlug);
     const dir = await this.safeBoardFilePath(slug, 'jobs');
     const files = await listFilesStrict(dir, '.yaml');
     const out: RefreshJob[] = [];
@@ -2231,15 +2233,58 @@ export class ContextDeckStore {
     return out.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
+  public async listJobs(
+    boardSlug?: string,
+    filter?: { status?: RefreshJobStatus; artifactType?: RefreshJobArtifactType },
+  ): Promise<PublicRefreshJob[]> {
+    const slug = await this.resolveBoardSlug(boardSlug);
+    const jobs = await this.listJobsRaw(slug, filter);
+    return redactJobsLeases(jobs);
+  }
+
   private async readJobById(slug: string, jobId: string): Promise<RefreshJob | null> {
     const validId = validateEntityId(jobId, 'jobId');
     const jobPath = await this.safeBoardFilePath(slug, 'jobs', `${validId}.yaml`);
     return readYamlStrict(jobPath, RefreshJobSchema);
   }
 
-  public async getJob(boardSlug: string | undefined, jobId: string): Promise<RefreshJob | null> {
+  public async getJob(boardSlug: string | undefined, jobId: string): Promise<PublicRefreshJob | null> {
     const slug = await this.resolveBoardSlug(boardSlug);
-    return this.readJobById(slug, jobId);
+    const job = await this.readJobById(slug, jobId);
+    return job ? redactJobLease(job) : null;
+  }
+
+  /**
+   * Lightweight loader for `cdeck worker` handlers: reads ONLY the board config, brief,
+   * decisions, and the single target artifact — never sessions, full event logs, or drift (H4, H13).
+   */
+  public async getWorkerJobContext(
+    boardSlug: string | undefined,
+    job: Pick<RefreshJob, 'artifactType' | 'artifactId'>,
+  ): Promise<{
+    config: BoardConfig;
+    brief: string;
+    decisions: Decision[];
+    artifact: Diagram | MediaArtifact | Quiz | null;
+  }> {
+    const slug = await this.resolveBoardSlug(boardSlug);
+    const briefPath = await this.safeBoardFilePath(slug, 'brief.md');
+    const [config, briefRaw, decisions, artifact] = await Promise.all([
+      this.readBoardConfig(slug),
+      readFileStrict(briefPath),
+      this.listDecisions(slug),
+      job.artifactType === 'diagram'
+        ? this.readDiagramById(slug, job.artifactId)
+        : job.artifactType === 'media'
+          ? this.readMediaById(slug, job.artifactId, { loadContent: true })
+          : this.readQuizById(slug, job.artifactId),
+    ]);
+    return {
+      config,
+      brief: briefRaw ?? '',
+      decisions,
+      artifact,
+    };
   }
 
   private async txnJournalExists(txnPath: string): Promise<boolean> {
@@ -4783,7 +4828,7 @@ export class ContextDeckStore {
         const mediaDir = await this.safeBoardFilePath(slug, 'media');
         const [artifacts, jobs, allFiles] = await Promise.all([
           this.listMedia(slug, { loadContent: false }),
-          this.listJobs(slug),
+          this.listJobsRaw(slug),
           listFilesStrict(mediaDir),
         ]);
 
@@ -5234,7 +5279,7 @@ export class ContextDeckStore {
 
     return this.mutate(boardSlug, actor, async (tx) => {
       // Dedupe active (queued or claimed) jobs per artifact (D19)
-      const existingJobs = await this.listJobs(tx.slug);
+      const existingJobs = await this.listJobsRaw(tx.slug);
       const active = existingJobs.find(
         (j) =>
           j.artifactType === input.artifactType &&
@@ -5401,7 +5446,7 @@ export class ContextDeckStore {
         }
         target = found;
       } else {
-        const allJobs = await this.listJobs(tx.slug);
+        const allJobs = await this.listJobsRaw(tx.slug);
         target =
           allJobs.find((j) => {
             if (!isClaimable(j)) return false;

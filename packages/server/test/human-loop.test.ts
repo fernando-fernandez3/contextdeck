@@ -379,6 +379,65 @@ describe('B3 Server: MCP artifact_confirm, job_*, media_update, quiz_update', ()
         arguments: { jobId: quizJob.id, leaseToken: qLease2, artifactVersion: 2 },
       });
       expect(doneQuiz.isError).not.toBe(true);
+
+      // H7: leaseToken MUST NOT leak in job_list, REST /jobs, REST /boards/:slug snapshot, or context-pack
+      const { job: secretJob } = await store.createRefreshJob('main', {
+        artifactType: 'media',
+        artifactId: media.id,
+      });
+      const claimSecret = await client.callTool({
+        name: 'job_claim',
+        arguments: { jobId: secretJob.id, claimedBy: 'worker-secret' },
+      });
+      const claimedSecret = JSON.parse((claimSecret.content as Array<{ text: string }>)[0].text) as {
+        id: string;
+        leaseToken: string;
+      };
+      expect(claimedSecret.leaseToken).toBeTruthy();
+
+      const renewSecret = await client.callTool({
+        name: 'job_renew',
+        arguments: { jobId: secretJob.id, leaseToken: claimedSecret.leaseToken },
+      });
+      const renewedSecret = JSON.parse((renewSecret.content as Array<{ text: string }>)[0].text) as {
+        leaseToken: string;
+      };
+      expect(renewedSecret.leaseToken).toBe(claimedSecret.leaseToken);
+
+      // MCP job_list omits leaseToken
+      const mcpList = await client.callTool({ name: 'job_list', arguments: {} });
+      const mcpListText = (mcpList.content as Array<{ text: string }>)[0].text;
+      expect(mcpListText).not.toContain(claimedSecret.leaseToken);
+      const mcpListParsed = JSON.parse(mcpListText) as Array<Record<string, unknown>>;
+      const listedSecret = mcpListParsed.find((j) => j.id === secretJob.id)!;
+      expect('leaseToken' in listedSecret).toBe(false);
+
+      // REST /jobs, /boards/:slug, and /context-pack omit leaseToken
+      const { app, token, close } = createApp({ store, port: 4311 });
+      try {
+        const restJobsRes = await app.request('http://127.0.0.1:4311/api/boards/main/jobs', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const restJobsText = await restJobsRes.text();
+        expect(restJobsText).not.toContain(claimedSecret.leaseToken);
+        const restJobs = (JSON.parse(restJobsText) as { jobs: Array<Record<string, unknown>> }).jobs;
+        expect('leaseToken' in restJobs.find((j) => j.id === secretJob.id)!).toBe(false);
+
+        const snapRes = await app.request('http://127.0.0.1:4311/api/boards/main', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const snapText = await snapRes.text();
+        expect(snapText).not.toContain(claimedSecret.leaseToken);
+        const snapJson = JSON.parse(snapText) as { jobs: Array<Record<string, unknown>> };
+        expect('leaseToken' in snapJson.jobs.find((j) => j.id === secretJob.id)!).toBe(false);
+
+        const packRes = await app.request('http://127.0.0.1:4311/api/boards/main/context-pack', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        expect(await packRes.text()).not.toContain(claimedSecret.leaseToken);
+      } finally {
+        await close();
+      }
     } finally {
       await client.close();
       await mcpServer.close();

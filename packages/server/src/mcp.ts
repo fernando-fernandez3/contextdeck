@@ -24,6 +24,8 @@ import {
   TaskColumnSchema,
   TaskPrioritySchema,
   generateContextPack,
+  redactJobLease,
+  redactJobsLeases,
   type WatchOptions,
 } from '@contextdeck/core';
 import { validateMcpMediaSourcePath } from './security.js';
@@ -707,7 +709,7 @@ export function createContextDeckMcpServer(
       const slug = await resolveSlug(board, sessionId);
       const jobs = await store.listJobs(slug, { status, artifactType });
       return {
-        content: [{ type: 'text', text: JSON.stringify(jobs, null, 2) }],
+        content: [{ type: 'text', text: JSON.stringify(redactJobsLeases(jobs), null, 2) }],
       };
     },
   );
@@ -815,7 +817,7 @@ export function createContextDeckMcpServer(
       );
       onMutate?.(slug);
       return {
-        content: [{ type: 'text', text: JSON.stringify(job, null, 2) }],
+        content: [{ type: 'text', text: JSON.stringify(redactJobLease(job), null, 2) }],
       };
     },
   );
@@ -825,7 +827,7 @@ export function createContextDeckMcpServer(
     {
       title: 'Complete Refresh Job',
       description:
-        'Mark a claimed refresh job done (or failed). Marking done strictly requires that the target artifact has a new version (> baseVersion) created with jobId === this job.',
+        'Mark a claimed refresh job done (or failed). Marking done strictly requires that the target artifact has a new version (> baseVersion) created by the active claim.',
       inputSchema: z
         .object({
           board: BoardSlugSchema.optional(),
@@ -849,7 +851,7 @@ export function createContextDeckMcpServer(
       });
       onMutate?.(slug);
       return {
-        content: [{ type: 'text', text: JSON.stringify(job, null, 2) }],
+        content: [{ type: 'text', text: JSON.stringify(redactJobLease(job), null, 2) }],
       };
     },
   );

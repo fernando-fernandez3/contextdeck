@@ -3,7 +3,7 @@
 When a decision is superseded in ContextDeck, dependent diagrams, explainer videos, docs, and quizzes are flagged **Stale**. Clicking **Queue refresh** (or running `cdeck job create`) writes a plain YAML refresh job under `.contextdeck/boards/<slug>/jobs/<jobId>.yaml`.
 
 Refresh jobs can be fulfilled in two ways:
-1. **By a connected coding agent** (Claude Code, Codex, Cursor, Grok, Antigravity) — queued jobs appear in the Context Pack (`## Queued Refresh Jobs`) and hook digests; agents call `job_claim`, publish a new artifact version referencing `jobId`, and call `job_complete`.
+1. **By a connected coding agent** (Claude Code, Codex, Cursor, Grok, Antigravity) — queued jobs appear in the Context Pack (`## Queued Refresh Jobs`) and hook digests; agents call `job_claim`, publish a new artifact version referencing both `jobId` and `leaseToken`, and call `job_complete`.
 2. **By a local worker** (`cdeck worker`) — runs user-configured local scripts or skills (video generators, quiz generators, diagram pipelines) on your machine.
 
 ---
@@ -13,9 +13,9 @@ Refresh jobs can be fulfilled in two ways:
 - **The ContextDeck server never executes commands.** HTTP/MCP clients can queue or claim jobs, never run shell commands.
 - **User-local config only.** `cdeck worker` reads handler definitions strictly from `~/.contextdeck/worker.yaml` (never from any repository or `.contextdeck/` directory).
 - **Explicit trust gate.** Before executing handlers, you must approve `~/.contextdeck/worker.yaml` with `cdeck worker trust`. ContextDeck stores the SHA-256 hash of `worker.yaml` in `~/.contextdeck/worker-trust.json` (mode `0600`). Any edit to `worker.yaml` invalidates trust until you re-run `cdeck worker trust`.
-- **No shell interpolation.** Handlers are specified as `argv` arrays and executed via `spawn(argv[0], argv.slice(1), { shell: false })`. Job details are passed via environment variables and a mode-`0600` temporary JSON file — never interpolated into a shell string.
-- **Atomic leases & timeouts.** Each claimed job gets a lease token with a 15-minute TTL (automatically renewed every 5 minutes while a handler runs) and an explicit per-handler `timeoutSec` (SIGTERM followed by SIGKILL).
-- **Verified completion.** A job can only be marked `done` when the target artifact has a strictly newer version (`version > baseVersion`) whose version history entry was created by that exact `jobId`.
+- **No shell interpolation.** Handlers are specified as `argv` arrays and executed via `spawn(argv[0], argv.slice(1), { shell: false })`. Job details are passed via environment variables and a mode-`0600` `job.json` inside a private mode-`0700` temporary directory — never interpolated into a shell string.
+- **Atomic leases & timeouts.** Each claimed job gets a lease token with a 15-minute TTL (automatically renewed every 5 minutes while a handler runs; failed renewal aborts the handler) and an explicit per-handler `timeoutSec` (terminating the handler process tree with SIGTERM followed by SIGKILL).
+- **Verified claim-bound completion.** Artifact writes carrying `jobId` must also present the active, unexpired `leaseToken` (via `--lease` in CLI, `leaseToken` in REST/MCP). A job can only be marked `done` when the target artifact has a strictly newer version (`version > baseVersion`) created by that exact active claim with a new media file, changed diagram content, or updated quiz questions.
 
 ---
 
@@ -43,8 +43,8 @@ handlers:
 ```
 
 Handler lookup priority for a job:
-1. For `media` artifacts: `media:<kind>` (e.g. `media:video`, `media:doc`) → `media` → `*`
-2. For `diagram` artifacts: `diagram` → `*`
+1. For `media` artifacts: `media:<kind>` (e.g. `media:video`, `media:doc`) → `<kind>` (legacy fallback) → `media` → `*`
+2. For `diagram` artifacts: `diagram:<kind>` (e.g. `diagram:mermaid`, `diagram:excalidraw`) → `<kind>` (legacy fallback) → `diagram` → `*`
 3. For `quiz` artifacts: `quiz` → `*`
 
 Approve and run the worker:
@@ -53,7 +53,7 @@ Approve and run the worker:
 cdeck worker trust
 # Process currently queued jobs once and exit:
 cdeck worker --once
-# Or run continuously, polling every 5 seconds:
+# Or run continuously, polling every 5 seconds (alias of --poll-ms 5000):
 cdeck worker --interval 5
 ```
 
@@ -96,7 +96,7 @@ The JSON file at `CONTEXTDECK_JOB_FILE` has the shape:
 }
 ```
 
-When the handler exits with code `0`, `cdeck worker` inspects the updated artifact, verifies `version > baseVersion` and `createdByJob === job.id`, and automatically marks the job `done`. If the handler exits non-zero, times out, or fails to publish a new version linked to `CONTEXTDECK_JOB_ID`, the worker marks the job `failed` with the captured stderr/error summary.
+When the handler exits with code `0`, `cdeck worker` verifies that the updated artifact has `version > baseVersion`, a history entry bound to the active claim (`jobId` + `leaseToken`), and changed content/file, and marks the job `done`. If the handler exits non-zero, times out, loses its lease, or fails to publish a valid new version linked to `CONTEXTDECK_JOB_ID` and `CONTEXTDECK_LEASE_TOKEN`, the worker marks the job `failed` with the captured stderr/error summary.
 
 ---
 
@@ -136,7 +136,7 @@ try {
     '--out-transcript', outTranscript,
   ], { stdio: 'inherit' });
 
-  // Publish immutable v<N> and link it to the claimed refresh job
+  // Publish immutable v<N> and link it to the claimed refresh job + active lease
   execFileSync('cdeck', [
     'media', 'update', payload.job.artifactId,
     '--dir', payload.projectRoot,
@@ -145,6 +145,7 @@ try {
     '--transcript', outTranscript,
     '--based-on', decisionIds,
     '--job', process.env.CONTEXTDECK_JOB_ID,
+    '--lease', process.env.CONTEXTDECK_LEASE_TOKEN,
     '--note', `Regenerated for ${decisionIds}`,
   ], { stdio: 'inherit' });
 } finally {
@@ -191,6 +192,7 @@ try {
     '--board', payload.boardSlug,
     '--file', outQuizJson,
     '--job', process.env.CONTEXTDECK_JOB_ID,
+    '--lease', process.env.CONTEXTDECK_LEASE_TOKEN,
     '--note', 'Refreshed stale questions for updated decisions',
   ], { stdio: 'inherit' });
 } finally {

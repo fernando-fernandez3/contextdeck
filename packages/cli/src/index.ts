@@ -28,7 +28,7 @@ import {
 } from '@contextdeck/core';
 import { runHookCli } from './hooks.js';
 import { HARNESS_TARGETS, setupHarness, type HarnessTarget } from './setup.js';
-import { runWorkerOnce } from './worker.js';
+import { runWorkerLoop, runWorkerOnce } from './worker.js';
 
 // Fast-path hook execution: avoids Commander error output and lazy-loads server deps,
 // guaranteeing silent exit 0 on unknown harness/event or any runtime failure (C5, D12)
@@ -856,11 +856,26 @@ const workerCmd = program
   .option('-d, --dir <path>', 'Workspace directory')
   .option('-b, --board <slug>', 'Limit to a single board slug')
   .option('--once', 'Process at most one available job and exit', false)
-  .option('--poll-ms <ms>', 'Polling interval in milliseconds', '3000')
+  .option('--interval <seconds>', 'Polling interval in seconds (alias of --poll-ms)')
+  .option('--poll-ms <ms>', 'Polling interval in milliseconds')
   .option('--name <label>', 'Worker claimant label')
   .action(async (opts) => {
     const { store } = resolveStore(opts.dir);
-    const pollMs = parseStrictIntFlag(opts.pollMs, '--poll-ms', 100);
+    if (opts.interval !== undefined && opts.pollMs !== undefined) {
+      throw new ValidationError('Cannot specify both --interval and --poll-ms.');
+    }
+    let pollMs = 3000;
+    if (opts.interval !== undefined) {
+      const trimmed = String(opts.interval).trim();
+      const secs = Number(trimmed);
+      if (!trimmed || !Number.isFinite(secs) || secs < 0.1) {
+        throw new ValidationError('Invalid --interval value: expected a number >= 0.1 seconds.');
+      }
+      pollMs = Math.round(secs * 1000);
+    } else if (opts.pollMs !== undefined) {
+      pollMs = parseStrictIntFlag(opts.pollMs, '--poll-ms', 100);
+    }
+
     if (opts.once) {
       const res = await runWorkerOnce(store, {
         boardSlug: opts.board,
@@ -878,19 +893,22 @@ const workerCmd = program
     process.on('SIGTERM', stop);
 
     console.log(`ContextDeck worker polling ${store.deckDir} (every ${pollMs}ms)...`);
-    while (!stopping) {
-      const res = await runWorkerOnce(store, {
-        boardSlug: opts.board,
-        workerName: opts.name,
-      });
-      if (res.processed) {
+    await runWorkerLoop(store, {
+      boardSlug: opts.board,
+      workerName: opts.name,
+      pollMs,
+      shouldStop: () => stopping,
+      onResult: (res) => {
         console.log(
           `[worker] ${res.boardSlug}/${res.jobId} -> ${res.status}${res.message ? `: ${res.message}` : ''}`,
         );
-        continue;
-      }
-      await new Promise((r) => setTimeout(r, pollMs));
-    }
+      },
+      onTransientError: (err) => {
+        console.error(
+          `[worker] transient error (continuing): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      },
+    });
   });
 
 workerCmd

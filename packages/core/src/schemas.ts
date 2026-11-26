@@ -395,6 +395,21 @@ export const RefreshJobSchema = z.object({
 
 export type RefreshJob = z.infer<typeof RefreshJobSchema>;
 
+/**
+ * Public view of a refresh job with the secret `leaseToken` omitted (D19, H7).
+ * Only `claimJob` and `renewJob` return the active `leaseToken`.
+ */
+export type PublicRefreshJob = Omit<RefreshJob, 'leaseToken'>;
+
+export function redactJobLease(job: RefreshJob | PublicRefreshJob): PublicRefreshJob {
+  const { leaseToken: _redacted, ...rest } = job as RefreshJob;
+  return rest;
+}
+
+export function redactJobsLeases(jobs: Array<RefreshJob | PublicRefreshJob>): PublicRefreshJob[] {
+  return jobs.map(redactJobLease);
+}
+
 export const ReaderBoardCursorSchema = z
   .object({
     lastReviewedRevision: z.number().int().min(0),
@@ -816,7 +831,7 @@ export interface BoardSnapshot {
   diagrams: Diagram[];
   media: MediaArtifact[];
   quizzes: Quiz[];
-  jobs: RefreshJob[];
+  jobs: PublicRefreshJob[];
   events: BoardEvent[];
   drift: DriftReport;
 }
