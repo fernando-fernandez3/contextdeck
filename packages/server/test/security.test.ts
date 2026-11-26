@@ -1088,4 +1088,44 @@ describe('E2 Server & MCP security (reproducing Bugs 2, 3, 4, 7-media, 8 + D5/D6
       await close();
     }
   });
+
+  it('R5-4: rejects media file serving when .contextdeck/boards is symlinked outside deckDir', async () => {
+    const base = await makeTempDir('cdeck-r5-4-rest-');
+    const outsideRoot = path.join(base, 'outside-repo');
+    const outsideStore = new ContextDeckStore(outsideRoot);
+    await outsideStore.createBoard({ title: 'Outside Main', slug: 'main' });
+    const outsideMedia = await outsideStore.addMedia('main', {
+      title: 'Outside Secret',
+      kind: 'doc',
+      content: 'OUTSIDE_BOARD_SECRET',
+    });
+
+    const wsRoot = path.join(base, 'workspace');
+    const deckDir = path.join(wsRoot, '.contextdeck');
+    await fs.mkdir(deckDir, { recursive: true });
+    await fs.symlink(outsideStore.boardsDir, path.join(deckDir, 'boards'));
+
+    const store = new ContextDeckStore({ deckDir, projectRoot: wsRoot });
+    const { app, token, close } = createApp({ store, port: 4310 });
+    try {
+      const mediaRes = await app.request(
+        `http://127.0.0.1:4310/api/boards/main/media/${outsideMedia.id}/file`,
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        },
+      );
+      expect(mediaRes.status).toBe(403);
+      const mediaBody = await mediaRes.text();
+      expect(mediaBody).not.toContain('OUTSIDE_BOARD_SECRET');
+      expect(JSON.parse(mediaBody)).toMatchObject({ code: 'SECURITY_ERROR' });
+
+      const listRes = await app.request('http://127.0.0.1:4310/api/boards', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      expect(listRes.status).toBe(403);
+      expect(await listRes.json()).toMatchObject({ code: 'SECURITY_ERROR' });
+    } finally {
+      await close();
+    }
+  });
 });

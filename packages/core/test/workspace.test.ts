@@ -364,6 +364,55 @@ describe('E4 workspace resolution, worktrees, global pointer, and watcher', () =
     await expect(fs.stat(txnPath)).resolves.toBeTruthy();
   });
 
+  it('R5-4: rejects symlinked boards directory and cross-board board.yaml aliases', async () => {
+    // 1. Symlinked .contextdeck/boards -> outsideBoardsDir
+    const base = await makeTempDir('cdeck-r5-4-');
+    const outsideRoot = path.join(base, 'outside-repo');
+    const outsideStore = new core.ContextDeckStore(outsideRoot);
+    await outsideStore.createBoard({ title: 'Outside Main', slug: 'main' });
+    const outsideMedia = await outsideStore.addMedia('main', {
+      title: 'Outside Secret',
+      kind: 'doc',
+      content: 'OUTSIDE_BOARD_SECRET',
+    });
+    const outsideTmp = path.join(outsideStore.boardPath('main'), 'media', '.tmp-upload-victim');
+    await fs.writeFile(outsideTmp, 'DO_NOT_DELETE', 'utf8');
+
+    const wsRoot = path.join(base, 'workspace');
+    const deckDir = path.join(wsRoot, '.contextdeck');
+    await fs.mkdir(deckDir, { recursive: true });
+    await fs.symlink(outsideStore.boardsDir, path.join(deckDir, 'boards'));
+
+    const store = new core.ContextDeckStore({ deckDir, projectRoot: wsRoot });
+    expect(() => store.boardPath('main')).toThrow(core.SecurityError);
+    await expect(store.listBoards()).rejects.toBeInstanceOf(core.SecurityError);
+    await expect(store.getSnapshot('main')).rejects.toBeInstanceOf(core.SecurityError);
+    await expect(store.resolveMediaFilePath('main', outsideMedia.id)).rejects.toBeInstanceOf(
+      core.SecurityError,
+    );
+
+    // addMedia staged-temp cleanup must NOT delete files inside symlinked outside boards dir
+    await expect(
+      store.addMedia('main', {
+        title: 'Bad URL',
+        kind: 'doc',
+        stagedTempPath: outsideTmp,
+        externalUrl: 'javascript:alert(1)',
+      }),
+    ).rejects.toThrow();
+    expect(await fs.readFile(outsideTmp, 'utf8')).toBe('DO_NOT_DELETE');
+
+    // 2. Cross-board board.yaml symlink alias (boards/alias/board.yaml -> ../other/board.yaml)
+    const aliasRoot = await makeTempDir('cdeck-r5-4-alias-');
+    const aliasStore = new core.ContextDeckStore(aliasRoot);
+    await aliasStore.createBoard({ title: 'Other', slug: 'other' });
+    const aliasDir = path.join(aliasStore.boardsDir, 'alias');
+    await fs.mkdir(aliasDir, { recursive: true });
+    await fs.symlink('../other/board.yaml', path.join(aliasDir, 'board.yaml'));
+
+    await expect(aliasStore.listBoards()).rejects.toBeInstanceOf(core.SecurityError);
+  });
+
   it('watcher ignores .runtime, .lock, and temp files and debounces per board', async () => {
     const base = await makeTempDir();
     const store = new core.ContextDeckStore({

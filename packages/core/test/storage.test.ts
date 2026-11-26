@@ -1234,4 +1234,79 @@ describe('E1 safe concurrent storage engine', () => {
     expect(restoredLegacy.supersededBy).toBeNull();
     expect('statusBeforeSupersede' in restoredLegacy).toBe(false);
   }, FSYNC_TEST_TIMEOUT_MS);
+
+  it('R5-5: skips all filesystem cleanup in createBoard and mutate catches after LockCompromisedError', async () => {
+    const stealLockDir = async (runtimeDir: string): Promise<void> => {
+      const lockDir = path.join(runtimeDir, 'lock.lock');
+      const replacementDir = path.join(runtimeDir, `lock.lock.stolen-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+      // Create replacement while lockDir still exists to guarantee a distinct inode
+      await fs.mkdir(replacementDir);
+      await fs.rm(lockDir, { recursive: true, force: true });
+      await fs.rename(replacementDir, lockDir);
+    };
+
+    // 1. Steal lock mid-createBoard -> LockCompromisedError and sentinel inside boards/<slug> survives
+    const dir1 = await makeTempDir('cdeck-r5-5-create-');
+    const store1 = new core.ContextDeckStore(dir1);
+    const sentinelPath = path.join(store1.boardsDir, 'stolen-board', 'sentinel.txt');
+    const origOpen = fs.open.bind(fs);
+    let createStolen = false;
+    const createOpenSpy = vi.spyOn(fs, 'open').mockImplementation(async (p, ...rest) => {
+      if (
+        !createStolen &&
+        String(p).includes(`${path.sep}boards${path.sep}stolen-board${path.sep}.tmp-`)
+      ) {
+        createStolen = true;
+        await stealLockDir(store1.runtimeDir);
+        await fs.writeFile(sentinelPath, 'NEW_LOCK_HOLDER_STATE', 'utf8');
+      }
+      return origOpen(p, ...rest);
+    });
+
+    try {
+      await expect(
+        store1.createBoard({ title: 'Stolen Board', slug: 'stolen-board' }),
+      ).rejects.toBeInstanceOf(core.LockCompromisedError);
+    } finally {
+      createOpenSpy.mockRestore();
+    }
+    expect(createStolen).toBe(true);
+    expect(await fs.readFile(sentinelPath, 'utf8')).toBe('NEW_LOCK_HOLDER_STATE');
+
+    // 2. Steal lock mid-mutate -> LockCompromisedError and mutate catch skips all fs.rm cleanup
+    const dir2 = await makeTempDir('cdeck-r5-5-mutate-');
+    const store2 = new core.ContextDeckStore(dir2);
+    await store2.createBoard({ title: 'Main', slug: 'main', brief: '# V1\n' });
+
+    let mutateStolen = false;
+    let capturedTmpPath: string | null = null;
+    const mutateOpenSpy = vi.spyOn(fs, 'open').mockImplementation(async (p, ...rest) => {
+      const target = String(p);
+      if (
+        !mutateStolen &&
+        target.includes(`${path.sep}boards${path.sep}main${path.sep}.tmp-`)
+      ) {
+        mutateStolen = true;
+        capturedTmpPath = target;
+        await stealLockDir(store2.runtimeDir);
+      }
+      return origOpen(p, ...rest);
+    });
+
+    try {
+      await expect(
+        store2.updateBrief('main', '# Should Abort\n', undefined, { baseRevision: 1 }),
+      ).rejects.toBeInstanceOf(core.LockCompromisedError);
+    } finally {
+      mutateOpenSpy.mockRestore();
+    }
+    expect(mutateStolen).toBe(true);
+    expect(capturedTmpPath).not.toBeNull();
+    // Without holding the lock, mutate's catch MUST NOT remove even its staged temp file
+    await expect(fs.stat(capturedTmpPath!)).resolves.toBeTruthy();
+    // And board state must remain at rev 1 / '# V1\n'
+    const snap = await store2.getSnapshot('main');
+    expect(snap.config.revision).toBe(1);
+    expect(snap.brief).toBe('# V1\n');
+  }, FSYNC_TEST_TIMEOUT_MS);
 });

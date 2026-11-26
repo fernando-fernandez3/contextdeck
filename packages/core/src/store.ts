@@ -55,6 +55,7 @@ import {
 import {
   ConflictError,
   CorruptDataError,
+  LockCompromisedError,
   NotFoundError,
   SecurityError,
   ValidationError,
@@ -286,9 +287,34 @@ export class ContextDeckStore {
     return existsSync(this.boardsDir);
   }
 
+  private assertBoardsDirSafeSync(): string {
+    const expectedBoardsDir = path.join(canonicalizePathSync(this.deckDir), 'boards');
+    const canonicalBoardsDir = canonicalizePathSync(this.boardsDir);
+    if (canonicalBoardsDir !== expectedBoardsDir) {
+      throw new SecurityError(
+        `Access denied: boards directory "${this.boardsDir}" resolves outside workspace deck.`,
+      );
+    }
+    return canonicalBoardsDir;
+  }
+
+  private async assertBoardsDirSafe(): Promise<string> {
+    const [canonicalDeckDir, canonicalBoardsDir] = await Promise.all([
+      canonicalizePath(this.deckDir),
+      canonicalizePath(this.boardsDir),
+    ]);
+    const expectedBoardsDir = path.join(canonicalDeckDir, 'boards');
+    if (canonicalBoardsDir !== expectedBoardsDir) {
+      throw new SecurityError(
+        `Access denied: boards directory "${this.boardsDir}" resolves outside workspace deck.`,
+      );
+    }
+    return canonicalBoardsDir;
+  }
+
   public boardPath(slug: string): string {
     const validSlug = validateBoardSlug(slug);
-    const canonicalBoardsDir = canonicalizePathSync(this.boardsDir);
+    const canonicalBoardsDir = this.assertBoardsDirSafeSync();
     const candidate = path.join(canonicalBoardsDir, validSlug);
     const realBoardDir = assertContainedPathSync(canonicalBoardsDir, candidate, {
       label: `board "${validSlug}"`,
@@ -375,21 +401,27 @@ export class ContextDeckStore {
       entries = await fs.readdir(this.boardsDir, { withFileTypes: true });
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        await this.assertBoardsDirSafe();
         return [];
       }
       throw err;
     }
+    await this.assertBoardsDirSafe();
 
     const configs: BoardConfig[] = [];
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       if (entry.name.startsWith('.')) continue;
-      validateBoardSlug(entry.name, 'board directory');
-      const boardYaml = await assertContainedPath(
-        this.boardsDir,
-        path.join(this.boardsDir, entry.name, 'board.yaml'),
-        { label: `board.yaml for "${entry.name}"` },
-      );
+      const boardDir = this.boardPath(entry.name);
+      const expectedBoardYaml = path.join(boardDir, 'board.yaml');
+      const boardYaml = await assertContainedPath(boardDir, expectedBoardYaml, {
+        label: `board.yaml for "${entry.name}"`,
+      });
+      if (boardYaml !== expectedBoardYaml) {
+        throw new SecurityError(
+          `Access denied: board.yaml for "${entry.name}" resolves to an aliased file.`,
+        );
+      }
       const cfg = await readYamlStrict(boardYaml, BoardConfigSchema);
       if (cfg) configs.push(cfg);
     }
@@ -412,6 +444,7 @@ export class ContextDeckStore {
     const slug = input.slug ? validateBoardSlug(input.slug) : validateBoardSlug(slugify(input.title));
 
     return withWorkspaceLock(this.runtimeDir, async (assertActive) => {
+      this.assertBoardsDirSafeSync();
       await ensureDir(this.boardsDir);
       const dir = this.boardPath(slug);
       const boardYamlPath = path.join(dir, 'board.yaml');
@@ -500,7 +533,10 @@ export class ContextDeckStore {
           checkEventDedupe: false,
         });
       } catch (err) {
-        if (!existsSync(path.join(this.runtimeDir, TXN_FILENAME))) {
+        if (
+          !(err instanceof LockCompromisedError) &&
+          !existsSync(path.join(this.runtimeDir, TXN_FILENAME))
+        ) {
           await Promise.all(stagedTmpPaths.map((p) => fs.rm(p, { force: true }).catch(() => {})));
           if (createdBoardDir) {
             await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -710,8 +746,12 @@ export class ContextDeckStore {
         });
         return result;
       } catch (err) {
-        // Only remove temp files we created if txn.json was NOT written (if txn.json exists, roll-forward needs them!)
-        if (!existsSync(path.join(this.runtimeDir, TXN_FILENAME))) {
+        // Skip all filesystem cleanup if the lock was compromised (R5-5), and never
+        // remove temp files once txn.json exists (roll-forward recovery needs them!).
+        if (
+          !(err instanceof LockCompromisedError) &&
+          !existsSync(path.join(this.runtimeDir, TXN_FILENAME))
+        ) {
           await Promise.all(createdTmpFiles.map((p) => fs.rm(p, { force: true }).catch(() => {})));
         }
         throw err;
@@ -2458,7 +2498,7 @@ export class ContextDeckStore {
           const base = path.basename(input.stagedTempPath);
           if (base.startsWith('.tmp-')) {
             await Promise.all([
-              canonicalizePath(this.boardsDir),
+              this.assertBoardsDirSafe(),
               canonicalizePath(input.stagedTempPath),
             ])
               .then(([canonicalBoardsDir, canonicalStaged]) =>
