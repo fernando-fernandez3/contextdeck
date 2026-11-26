@@ -498,4 +498,177 @@ describe('AC5.5-AC5.7 + C3/C4 + D13 cdeck setup and --uninstall', () => {
     await setupHarness(repo2, 'claude-code', { uninstall: true });
     await expect(fs.stat(localPath2)).rejects.toThrow();
   });
+
+  it('R2-4: legacy brief-hook cleanup preserves echo/compound user hooks and removes exact v0.1 commands (including quoted paths with spaces)', async () => {
+    // 1. User hook that merely mentions `status --brief-hook` in echo must NOT be removed
+    const repo1 = await makeTempDir('cdeck-r2-4-echo-');
+    const localPath1 = path.join(repo1, '.claude', 'settings.local.json');
+    await fs.mkdir(path.dirname(localPath1), { recursive: true });
+    const echoOnly = {
+      hooks: {
+        SessionStart: [
+          {
+            hooks: [
+              {
+                type: 'command',
+                command: 'echo "run cdeck status --brief-hook for status"',
+              },
+            ],
+          },
+        ],
+      },
+    };
+    const echoRaw = `${JSON.stringify(echoOnly, null, 2)}\n`;
+    await fs.writeFile(localPath1, echoRaw, 'utf8');
+
+    await setupHarness(repo1, 'claude-code');
+    expect(await fs.readFile(localPath1, 'utf8')).toBe(echoRaw);
+    await setupHarness(repo1, 'claude-code', { uninstall: true });
+    expect(await fs.readFile(localPath1, 'utf8')).toBe(echoRaw);
+
+    // 2. Compound user hook (`foo; cdeck status --brief-hook`) is kept, while exact v0.1 shapes
+    //    (with quoted path containing spaces and without --dir) are removed.
+    const repo2 = await makeTempDir('cdeck-r2-4-mixed-');
+    const localPath2 = path.join(repo2, '.claude', 'settings.local.json');
+    await fs.mkdir(path.dirname(localPath2), { recursive: true });
+    const mixed = {
+      hooks: {
+        SessionStart: [
+          {
+            matcher: '*',
+            hooks: [
+              { type: 'command', command: 'foo; cdeck status --brief-hook' },
+              { type: 'command', command: 'cdeck status --brief-hook && echo done' },
+              {
+                type: 'command',
+                command: 'cdeck status --brief-hook --dir "/tmp/my project with spaces"',
+              },
+              { type: 'command', command: 'cdeck status --brief-hook' },
+              {
+                type: 'command',
+                command: '"/usr/local/bin/cdeck" status --brief-hook --dir "/opt/repo"',
+              },
+            ],
+          },
+        ],
+      },
+    };
+    await fs.writeFile(localPath2, `${JSON.stringify(mixed, null, 2)}\n`, 'utf8');
+
+    await setupHarness(repo2, 'claude-code');
+    const afterMixed = JSON.parse(await fs.readFile(localPath2, 'utf8')) as {
+      hooks: { SessionStart: Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }> };
+    };
+    expect(afterMixed.hooks.SessionStart).toEqual([
+      {
+        matcher: '*',
+        hooks: [
+          { type: 'command', command: 'foo; cdeck status --brief-hook' },
+          { type: 'command', command: 'cdeck status --brief-hook && echo done' },
+        ],
+      },
+    ]);
+  });
+
+  it('R2-6: v0.1 --dir <rootDir> MCP entry is upgraded on install and removed on uninstall, while customized --dir other is preserved without false "(no absolute paths)" note', async () => {
+    // 1. Claude Code: v0.1 entry with exact rootDir -> install upgrades to v0.2 (no abs path)
+    const repo1 = await makeTempDir('cdeck-r2-6-upgrade-');
+    const mcpPath1 = path.join(repo1, '.mcp.json');
+    await fs.writeFile(
+      mcpPath1,
+      `${JSON.stringify(
+        { mcpServers: { contextdeck: { command: 'cdeck', args: ['mcp', '--dir', repo1] } } },
+        null,
+        2,
+      )}\n`,
+      'utf8',
+    );
+    const installRes1 = await setupHarness(repo1, 'claude-code');
+    const rawAfterInstall1 = await fs.readFile(mcpPath1, 'utf8');
+    expect(rawAfterInstall1).not.toContain(repo1);
+    expect(JSON.parse(rawAfterInstall1)).toEqual({
+      mcpServers: { contextdeck: { command: 'cdeck', args: ['mcp'] } },
+    });
+    expect(installRes1.notes.join(' ')).toContain('(no absolute paths)');
+
+    // 2. Claude Code: v0.1 entry with exact rootDir -> uninstall removes .mcp.json cleanly
+    const repo2 = await makeTempDir('cdeck-r2-6-uninstall-');
+    const mcpPath2 = path.join(repo2, '.mcp.json');
+    await fs.writeFile(
+      mcpPath2,
+      `${JSON.stringify(
+        { mcpServers: { contextdeck: { command: 'cdeck', args: ['mcp', '--dir', repo2] } } },
+        null,
+        2,
+      )}\n`,
+      'utf8',
+    );
+    await setupHarness(repo2, 'claude-code', { uninstall: true });
+    await expect(fs.stat(mcpPath2)).rejects.toThrow();
+
+    // 3. Cursor: v0.1 entry in .cursor/mcp.json -> upgraded on install and removed on uninstall
+    const cursorRepo1 = await makeTempDir('cdeck-r2-6-cursor-up-');
+    const cursorMcp1 = path.join(cursorRepo1, '.cursor', 'mcp.json');
+    await fs.mkdir(path.dirname(cursorMcp1), { recursive: true });
+    await fs.writeFile(
+      cursorMcp1,
+      `${JSON.stringify(
+        { mcpServers: { contextdeck: { command: 'cdeck', args: ['mcp', '--dir', cursorRepo1] } } },
+        null,
+        2,
+      )}\n`,
+      'utf8',
+    );
+    await setupHarness(cursorRepo1, 'cursor');
+    expect(JSON.parse(await fs.readFile(cursorMcp1, 'utf8'))).toEqual({
+      mcpServers: { contextdeck: { command: 'cdeck', args: ['mcp'] } },
+    });
+
+    const cursorRepo2 = await makeTempDir('cdeck-r2-6-cursor-rm-');
+    const cursorMcp2 = path.join(cursorRepo2, '.cursor', 'mcp.json');
+    await fs.mkdir(path.dirname(cursorMcp2), { recursive: true });
+    await fs.writeFile(
+      cursorMcp2,
+      `${JSON.stringify(
+        { mcpServers: { contextdeck: { command: 'cdeck', args: ['mcp', '--dir', cursorRepo2] } } },
+        null,
+        2,
+      )}\n`,
+      'utf8',
+    );
+    await setupHarness(cursorRepo2, 'cursor', { uninstall: true });
+    await expect(fs.stat(cursorMcp2)).rejects.toThrow();
+
+    // 4. Customized --dir pointing to another directory -> preserved on install and uninstall,
+    //    AND install MUST NOT falsely print "(no absolute paths)"!
+    const repo3 = await makeTempDir('cdeck-r2-6-custom-');
+    const otherDir = await makeTempDir('cdeck-r2-6-other-');
+    const mcpPath3 = path.join(repo3, '.mcp.json');
+    const customMcp = {
+      mcpServers: { contextdeck: { command: 'cdeck', args: ['mcp', '--dir', otherDir] } },
+    };
+    await fs.writeFile(mcpPath3, `${JSON.stringify(customMcp, null, 2)}\n`, 'utf8');
+
+    const customInstallRes = await setupHarness(repo3, 'claude-code');
+    expect(JSON.parse(await fs.readFile(mcpPath3, 'utf8'))).toEqual(customMcp);
+    expect(customInstallRes.notes.join(' ')).not.toContain('(no absolute paths)');
+
+    await setupHarness(repo3, 'claude-code', { uninstall: true });
+    expect(JSON.parse(await fs.readFile(mcpPath3, 'utf8'))).toEqual(customMcp);
+
+    // 5. v0.1 --dir <rootDir> WITH extra user key (env) -> still treated as customized & preserved (H15)
+    const repo4 = await makeTempDir('cdeck-r2-6-extra-');
+    const mcpPath4 = path.join(repo4, '.mcp.json');
+    const extraKeyMcp = {
+      mcpServers: {
+        contextdeck: { command: 'cdeck', args: ['mcp', '--dir', repo4], env: { FOO: '1' } },
+      },
+    };
+    await fs.writeFile(mcpPath4, `${JSON.stringify(extraKeyMcp, null, 2)}\n`, 'utf8');
+    const extraRes = await setupHarness(repo4, 'claude-code');
+    expect(JSON.parse(await fs.readFile(mcpPath4, 'utf8'))).toEqual(extraKeyMcp);
+    expect(extraRes.notes.join(' ')).not.toContain('(no absolute paths)');
+    await setupHarness(repo4, 'claude-code', { uninstall: true });
+    expect(JSON.parse(await fs.readFile(mcpPath4, 'utf8'))).toEqual(extraKeyMcp);
+  });
 });

@@ -100,12 +100,167 @@ function isExactInstallerMcpEntry(entry: unknown): boolean {
   );
 }
 
+/**
+ * R2-6: Match the exact v0.1 installer entry `{ command: 'cdeck', args: ['mcp', '--dir', <rootDir>] }`
+ * (no extra user fields, and `--dir` resolves to `rootDir`) so install upgrades it to the v0.2
+ * path-free entry and `--uninstall` removes it, while preserving customized entries (H15).
+ */
+function isLegacyInstallerMcpEntry(entry: unknown, rootDir: string): boolean {
+  if (!isPlainObject(entry)) return false;
+  const keys = Object.keys(entry);
+  if (keys.length !== 2 || entry.command !== 'cdeck' || !Array.isArray(entry.args)) {
+    return false;
+  }
+  if (
+    entry.args.length !== 3 ||
+    entry.args[0] !== 'mcp' ||
+    entry.args[1] !== '--dir' ||
+    typeof entry.args[2] !== 'string' ||
+    entry.args[2].trim().length === 0
+  ) {
+    return false;
+  }
+  return path.resolve(entry.args[2]) === path.resolve(rootDir);
+}
+
 function isOwnedHookCommand(cmd: unknown): boolean {
   return typeof cmd === 'string' && cmd.startsWith(HOOK_CMD_PREFIX);
 }
 
+const SHELL_META_OUTSIDE_QUOTES = /[;&|`$<>()\r\n]/;
+
+function tokenizeSimpleShellCommand(cmd: string): string[] | null {
+  const tokens: string[] = [];
+  let current = '';
+  let inToken = false;
+  let quote: '"' | "'" | null = null;
+
+  for (let i = 0; i < cmd.length; i += 1) {
+    const ch = cmd[i];
+    if (quote === "'") {
+      if (ch === "'") {
+        quote = null;
+      } else if (ch === '\n' || ch === '\r') {
+        return null;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') {
+        quote = null;
+      } else if (ch === '\\' && i + 1 < cmd.length && (cmd[i + 1] === '"' || cmd[i + 1] === '\\')) {
+        current += cmd[i + 1];
+        i += 1;
+      } else if (ch === '`' || ch === '\n' || ch === '\r') {
+        return null;
+      } else if (ch === '$' && cmd[i + 1] === '(') {
+        return null;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+
+    if (SHELL_META_OUTSIDE_QUOTES.test(ch)) {
+      return null;
+    }
+    if (ch === ' ' || ch === '\t') {
+      if (inToken) {
+        tokens.push(current);
+        current = '';
+        inToken = false;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      inToken = true;
+      continue;
+    }
+    if (ch === '\\' && i + 1 < cmd.length) {
+      current += cmd[i + 1];
+      i += 1;
+      inToken = true;
+      continue;
+    }
+    current += ch;
+    inToken = true;
+  }
+
+  if (quote !== null) return null;
+  if (inToken) tokens.push(current);
+  return tokens;
+}
+
+function execBaseName(token: string): string {
+  const parts = token.split(/[\\/]/);
+  return (parts[parts.length - 1] ?? '').toLowerCase();
+}
+
+const LEGACY_CDECK_EXECUTABLES = new Set([
+  'cdeck',
+  'cdeck.cmd',
+  'cdeck.exe',
+  'cdeck.js',
+  'contextdeck',
+  'contextdeck.cmd',
+  'contextdeck.exe',
+]);
+
+/**
+ * R2-4: Match only the exact v0.1 brief-hook command shape:
+ *   `<cdeck|node cli.js> status --brief-hook [--dir "<path>"]`
+ * Ambiguous, quoted-mention (`echo ...`), or compound (`;`, `&&`, `|`) commands are preserved.
+ */
 function isLegacyBriefHookCommand(cmd: unknown): boolean {
-  return typeof cmd === 'string' && cmd.includes(' status --brief-hook');
+  if (typeof cmd !== 'string') return false;
+  const trimmed = cmd.trim();
+  if (!trimmed) return false;
+
+  const tokens = tokenizeSimpleShellCommand(trimmed);
+  if (!tokens || tokens.length < 3) return false;
+
+  const base0 = execBaseName(tokens[0]);
+  let argStart = -1;
+  if (LEGACY_CDECK_EXECUTABLES.has(base0)) {
+    argStart = 1;
+  } else if ((base0 === 'node' || base0 === 'node.exe') && tokens.length >= 4) {
+    const script = tokens[1];
+    if (!script.startsWith('-') && /\.(?:m|c)?js$/i.test(script)) {
+      argStart = 2;
+    }
+  }
+  if (argStart === -1) return false;
+
+  const rest = tokens.slice(argStart);
+  if (rest[0] !== 'status' || rest[1] !== '--brief-hook') {
+    return false;
+  }
+  if (rest.length === 2) return true;
+  if (rest.length === 4 && rest[2] === '--dir' && rest[3].length > 0) return true;
+  if (rest.length === 3 && rest[2].startsWith('--dir=') && rest[2].length > '--dir='.length) {
+    return true;
+  }
+  return false;
+}
+
+function stringContainsAbsolutePath(value: string): boolean {
+  const withoutUrls = value.replace(/https?:\/\/\S+/gi, '');
+  if (path.isAbsolute(withoutUrls) || /^[A-Za-z]:[\\/]/.test(withoutUrls)) {
+    return true;
+  }
+  return /(?:^|[\s"'])(?:\/[A-Za-z0-9._-]|[A-Za-z]:[\\/])/.test(withoutUrls);
+}
+
+function jsonContainsAbsolutePath(value: unknown): boolean {
+  if (typeof value === 'string') return stringContainsAbsolutePath(value);
+  if (Array.isArray(value)) return value.some((item) => jsonContainsAbsolutePath(item));
+  if (isPlainObject(value)) {
+    return Object.values(value).some((v) => jsonContainsAbsolutePath(v));
+  }
+  return false;
 }
 
 async function readTextIfExists(filePath: string): Promise<string | null> {
@@ -140,6 +295,7 @@ function planMcpJson(
   filePath: string,
   existing: Record<string, unknown> | null,
   uninstall: boolean,
+  rootDir: string,
 ): FileAction {
   if (uninstall) {
     if (!existing) return { kind: 'noop', filePath };
@@ -148,8 +304,12 @@ function planMcpJson(
       throw new Error(`Invalid "mcpServers" field in "${filePath}": expected an object.`);
     }
     const servers = { ...existing.mcpServers };
-    if (servers.contextdeck === undefined || !isExactInstallerMcpEntry(servers.contextdeck)) {
-      // D13 / H15: Never delete an unowned or user-customized pre-existing `contextdeck` entry
+    const isInstallerOwned =
+      servers.contextdeck !== undefined &&
+      (isExactInstallerMcpEntry(servers.contextdeck) ||
+        isLegacyInstallerMcpEntry(servers.contextdeck, rootDir));
+    if (!isInstallerOwned) {
+      // D13 / H15 / R2-6: Remove only exact v0.2 or legacy v0.1 (`--dir <rootDir>`) installer entries
       return { kind: 'noop', filePath };
     }
     delete servers.contextdeck;
@@ -179,8 +339,11 @@ function planMcpJson(
         `Refusing to overwrite unowned "mcpServers.contextdeck" collision in "${filePath}". Remove or rename the existing entry first.`,
       );
     }
-    if (!isExactInstallerMcpEntry(servers.contextdeck)) {
-      // H15: Compatible user-customized entry (e.g. extra env/timeout/args) -> preserve untouched
+    const isInstallerOwned =
+      isExactInstallerMcpEntry(servers.contextdeck) ||
+      isLegacyInstallerMcpEntry(servers.contextdeck, rootDir);
+    if (!isInstallerOwned) {
+      // H15: Compatible user-customized entry (e.g. extra env/timeout/custom --dir) -> preserve untouched
       return { kind: 'noop', filePath };
     }
   }
@@ -730,32 +893,51 @@ export async function setupHarness(
       readJsonObjectStrict(localSettingsPath),
     ]);
 
-    actions.push(planMcpJson(mcpPath, existingMcp, uninstall));
-    actions.push(
-      planMatcherHooksJson(
-        settingsPath,
-        existingSettings,
-        {
-          SessionStart: {
-            matcher: 'startup|resume|clear|compact',
-            hooks: [{ type: 'command', command: 'cdeck hook claude-code SessionStart' }],
-          },
-          UserPromptSubmit: {
-            hooks: [{ type: 'command', command: 'cdeck hook claude-code UserPromptSubmit' }],
-          },
-          SessionEnd: {
-            hooks: [{ type: 'command', command: 'cdeck hook claude-code SessionEnd' }],
-          },
+    const mcpAction = planMcpJson(mcpPath, existingMcp, uninstall, rootDir);
+    const settingsAction = planMatcherHooksJson(
+      settingsPath,
+      existingSettings,
+      {
+        SessionStart: {
+          matcher: 'startup|resume|clear|compact',
+          hooks: [{ type: 'command', command: 'cdeck hook claude-code SessionStart' }],
         },
-        uninstall,
-      ),
+        UserPromptSubmit: {
+          hooks: [{ type: 'command', command: 'cdeck hook claude-code UserPromptSubmit' }],
+        },
+        SessionEnd: {
+          hooks: [{ type: 'command', command: 'cdeck hook claude-code SessionEnd' }],
+        },
+      },
+      uninstall,
     );
-    // H16: Clean up legacy v0.1 `status --brief-hook` from `.claude/settings.local.json`
-    actions.push(planLegacyClaudeLocalCleanup(localSettingsPath, existingLocalSettings));
+    // H16 / R2-4: Clean up legacy v0.1 `status --brief-hook` from `.claude/settings.local.json`
+    const localAction = planLegacyClaudeLocalCleanup(localSettingsPath, existingLocalSettings);
+    actions.push(mcpAction, settingsAction, localAction);
+
+    // R2-6: Never print "(no absolute paths)" if any absolute path remains in a file setup touched or preserved
+    const finalMcpObj =
+      mcpAction.kind === 'write'
+        ? JSON.parse(mcpAction.content)
+        : mcpAction.kind === 'noop'
+          ? existingMcp
+          : null;
+    const finalSettingsObj =
+      settingsAction.kind === 'write'
+        ? JSON.parse(settingsAction.content)
+        : settingsAction.kind === 'noop'
+          ? existingSettings
+          : null;
+    const finalLocalObj = localAction.kind === 'write' ? JSON.parse(localAction.content) : null;
+    const hasRemainingAbsPath =
+      jsonContainsAbsolutePath(finalMcpObj) ||
+      jsonContainsAbsolutePath(finalSettingsObj) ||
+      jsonContainsAbsolutePath(finalLocalObj);
+
     notes.push(
       uninstall
         ? 'Removed ContextDeck stdio MCP server from .mcp.json and lifecycle hooks from .claude/settings.json.'
-        : 'Configured stdio MCP server in .mcp.json and SessionStart/UserPromptSubmit/SessionEnd hooks in .claude/settings.json (no absolute paths).',
+        : `Configured stdio MCP server in .mcp.json and SessionStart/UserPromptSubmit/SessionEnd hooks in .claude/settings.json${hasRemainingAbsPath ? '' : ' (no absolute paths)'}.`,
     );
   } else if (target === 'codex') {
     const configPath = path.join(rootDir, '.codex', 'config.toml');
@@ -812,7 +994,7 @@ export async function setupHarness(
       readTextIfExists(rulePath),
     ]);
 
-    actions.push(planMcpJson(mcpPath, existingMcp, uninstall));
+    actions.push(planMcpJson(mcpPath, existingMcp, uninstall, rootDir));
     actions.push(
       planCursorHooksJson(
         hooksPath,
