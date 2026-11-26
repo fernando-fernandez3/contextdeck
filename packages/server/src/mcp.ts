@@ -18,6 +18,8 @@ import {
   MediaChapterSchema,
   MediaKindSchema,
   QuizQuestionSchema,
+  RefreshJobArtifactTypeSchema,
+  RefreshJobStatusSchema,
   SessionStatusSchema,
   TaskColumnSchema,
   TaskPrioritySchema,
@@ -417,6 +419,8 @@ export function createContextDeckMcpServer(
           description: z.string().max(MCP_MAX_TEXT_CHARS).optional(),
           basedOnDecisions: z.array(EntityIdSchema).max(100).optional(),
           sessionId: EntityIdSchema.nullable().optional(),
+          jobId: EntityIdSchema.optional().describe('Optional claimed refresh job ID fulfilled by this version'),
+          note: z.string().max(500).optional(),
           harness: z.string().max(100).optional(),
         })
         .strict(),
@@ -496,6 +500,69 @@ export function createContextDeckMcpServer(
   );
 
   server.registerTool(
+    'media_update',
+    {
+      title: 'Update Media Artifact (New Immutable Version)',
+      description:
+        'Create a new immutable version (<id>.v<N>.<ext>) of an existing media artifact (binary replacement, updated doc/html/json content, transcript, or decision links). Pass jobId when fulfilling a refresh job.',
+      inputSchema: z
+        .object({
+          board: BoardSlugSchema.optional(),
+          mediaId: EntityIdSchema,
+          title: z.string().min(1).max(300).optional(),
+          sourceFilePath: z
+            .string()
+            .max(1024)
+            .optional()
+            .describe('Local file path inside projectRoot or user-local mediaRoots'),
+          externalUrl: HttpUrlSchema.optional(),
+          content: z.string().max(MCP_MAX_TEXT_CHARS).optional(),
+          transcript: z.string().max(MCP_MAX_TEXT_CHARS).optional(),
+          chapters: z.array(MediaChapterSchema).max(200).optional(),
+          durationSec: z.number().nonnegative().optional(),
+          tags: z.array(z.string().max(100)).max(50).optional(),
+          basedOnDecisions: z.array(EntityIdSchema).max(100).optional(),
+          jobId: EntityIdSchema.optional().describe('Optional claimed refresh job ID fulfilled by this version'),
+          note: z.string().max(500).optional(),
+          sessionId: EntityIdSchema.nullable().optional(),
+          harness: z.string().max(100).optional(),
+        })
+        .strict(),
+    },
+    async ({ board, mediaId, harness, sessionId, sourceFilePath, ...patch }) => {
+      const slug = await resolveSlug(board, sessionId);
+      let safeSourcePath: string | undefined;
+      if (sourceFilePath !== undefined) {
+        safeSourcePath = await validateMcpMediaSourcePath(sourceFilePath, {
+          projectRoot: store.projectRoot,
+          deckDir: store.deckDir,
+          maxMediaBytes,
+          env,
+          homeDir,
+        });
+      }
+      const updated = await store.updateMedia(
+        slug,
+        mediaId,
+        {
+          ...patch,
+          ...(safeSourcePath !== undefined ? { sourceFilePath: safeSourcePath } : {}),
+          maxBytes: maxMediaBytes,
+        },
+        {
+          type: 'agent',
+          harness: harness ?? 'mcp',
+          sessionId: sessionId ?? undefined,
+        },
+      );
+      onMutate?.(slug);
+      return {
+        content: [{ type: 'text', text: JSON.stringify(updated, null, 2) }],
+      };
+    },
+  );
+
+  server.registerTool(
     'quiz_create',
     {
       title: 'Create Interactive Knowledge-Check Quiz',
@@ -529,36 +596,242 @@ export function createContextDeckMcpServer(
   );
 
   server.registerTool(
-    'artifact_refresh',
+    'quiz_update',
     {
-      title: 'Mark Stale Artifact Aligned',
+      title: 'Update Quiz (Preserves Attempts)',
       description:
-        'After updating a stale diagram, video, quiz, or task to reflect newer decisions, call this to realign its decision references and clear staleness alerts.',
+        'Publish a new version of an existing quiz while preserving all past human quiz attempts. Pass jobId when fulfilling a refresh job.',
       inputSchema: z
         .object({
           board: BoardSlugSchema.optional(),
-          artifactType: z.enum(['diagram', 'media', 'quiz', 'task']),
+          quizId: EntityIdSchema,
+          title: z.string().min(1).max(300).optional(),
+          topic: z.string().max(300).optional(),
+          description: z.string().max(MCP_MAX_TEXT_CHARS).optional(),
+          questions: z.array(QuizQuestionSchema).min(1).max(100).optional(),
+          basedOnDecisions: z.array(EntityIdSchema).max(100).optional(),
+          jobId: EntityIdSchema.optional().describe('Optional claimed refresh job ID fulfilled by this version'),
+          note: z.string().max(500).optional(),
+          sessionId: EntityIdSchema.nullable().optional(),
+          harness: z.string().max(100).optional(),
+        })
+        .strict(),
+    },
+    async ({ board, quizId, harness, sessionId, ...patch }) => {
+      const slug = await resolveSlug(board, sessionId);
+      const quiz = await store.updateQuiz(slug, quizId, patch, {
+        type: 'agent',
+        harness: harness ?? 'mcp',
+        sessionId: sessionId ?? undefined,
+      });
+      onMutate?.(slug);
+      return {
+        content: [{ type: 'text', text: JSON.stringify(quiz, null, 2) }],
+      };
+    },
+  );
+
+  server.registerTool(
+    'artifact_confirm',
+    {
+      title: 'Confirm Stale Artifact Still Accurate (Agent)',
+      description:
+        'Record an agent confirmation (with required note) that a stale diagram, media artifact, or quiz still holds against the latest superseding decision(s), without rewriting basedOnDecisions. Automatically re-stales on the next supersession.',
+      inputSchema: z
+        .object({
+          board: BoardSlugSchema.optional(),
+          artifactType: RefreshJobArtifactTypeSchema,
           artifactId: EntityIdSchema,
+          note: z.string().min(1).max(1000).describe('Required rationale explaining why the artifact is still accurate'),
+          decisionIds: z.array(EntityIdSchema).max(100).optional(),
           harness: z.string().max(100).optional(),
           sessionId: EntityIdSchema.optional(),
         })
         .strict(),
     },
-    async ({ board, artifactType, artifactId, harness, sessionId }) => {
+    async ({ board, artifactType, artifactId, note, decisionIds, harness, sessionId }) => {
       const slug = await resolveSlug(board, sessionId);
-      await store.refreshArtifactDecisions(slug, artifactType, artifactId, {
+      // D14: MCP-originated confirmations are ALWAYS labeled as agent confirmations, never human.
+      const updated = await store.confirmArtifact(
+        slug,
+        artifactType,
+        artifactId,
+        { note, decisionIds },
+        {
+          type: 'agent',
+          harness: harness ?? 'mcp',
+          sessionId,
+          label: harness ?? 'mcp',
+        },
+      );
+      onMutate?.(slug);
+      return {
+        content: [{ type: 'text', text: JSON.stringify(updated, null, 2) }],
+      };
+    },
+  );
+
+  server.registerTool(
+    'job_list',
+    {
+      title: 'List Refresh Jobs',
+      description: 'List queued, claimed, completed, or failed artifact refresh jobs on the board.',
+      inputSchema: z
+        .object({
+          board: BoardSlugSchema.optional(),
+          sessionId: EntityIdSchema.optional(),
+          status: RefreshJobStatusSchema.optional(),
+          artifactType: RefreshJobArtifactTypeSchema.optional(),
+        })
+        .strict(),
+    },
+    async ({ board, sessionId, status, artifactType }) => {
+      const slug = await resolveSlug(board, sessionId);
+      const jobs = await store.listJobs(slug, { status, artifactType });
+      return {
+        content: [{ type: 'text', text: JSON.stringify(jobs, null, 2) }],
+      };
+    },
+  );
+
+  server.registerTool(
+    'job_claim',
+    {
+      title: 'Claim Refresh Job (Atomic Lease)',
+      description:
+        'Atomically claim a queued (or lease-expired) refresh job and receive a leaseToken valid for 15 minutes (or ttlMs).',
+      inputSchema: z
+        .object({
+          board: BoardSlugSchema.optional(),
+          sessionId: EntityIdSchema.optional(),
+          jobId: EntityIdSchema.optional(),
+          artifactType: RefreshJobArtifactTypeSchema.optional(),
+          mediaKind: MediaKindSchema.optional(),
+          claimedBy: z.string().min(1).max(200).optional(),
+          ttlMs: z.number().int().min(1000).max(24 * 60 * 60 * 1000).optional(),
+          harness: z.string().max(100).optional(),
+        })
+        .strict(),
+    },
+    async ({ board, sessionId, harness, claimedBy, ...input }) => {
+      const slug = await resolveSlug(board, sessionId);
+      const claimer = claimedBy ?? (sessionId ? `${harness ?? 'mcp'}:${sessionId}` : harness ?? 'mcp');
+      const job = await store.claimJob(
+        slug,
+        { ...input, claimedBy: claimer },
+        {
+          type: 'agent',
+          harness: harness ?? 'mcp',
+          sessionId,
+          label: claimer,
+        },
+      );
+      if (job) onMutate?.(slug);
+      return {
+        content: [{ type: 'text', text: JSON.stringify(job, null, 2) }],
+      };
+    },
+  );
+
+  server.registerTool(
+    'job_renew',
+    {
+      title: 'Renew Refresh Job Lease',
+      description: 'Extend the lease TTL for a currently claimed refresh job using its leaseToken.',
+      inputSchema: z
+        .object({
+          board: BoardSlugSchema.optional(),
+          sessionId: EntityIdSchema.optional(),
+          jobId: EntityIdSchema,
+          leaseToken: z.string().min(1).max(128),
+          ttlMs: z.number().int().min(1000).max(24 * 60 * 60 * 1000).optional(),
+          harness: z.string().max(100).optional(),
+        })
+        .strict(),
+    },
+    async ({ board, sessionId, jobId, leaseToken, ttlMs, harness }) => {
+      const slug = await resolveSlug(board, sessionId);
+      const job = await store.renewJob(
+        slug,
+        jobId,
+        { leaseToken, ttlMs },
+        {
+          type: 'agent',
+          harness: harness ?? 'mcp',
+          sessionId,
+        },
+      );
+      return {
+        content: [{ type: 'text', text: JSON.stringify(job, null, 2) }],
+      };
+    },
+  );
+
+  server.registerTool(
+    'job_release',
+    {
+      title: 'Release Refresh Job Lease',
+      description: 'Return a claimed refresh job back to queued status using its leaseToken.',
+      inputSchema: z
+        .object({
+          board: BoardSlugSchema.optional(),
+          sessionId: EntityIdSchema.optional(),
+          jobId: EntityIdSchema,
+          leaseToken: z.string().min(1).max(128),
+          reason: z.string().max(1000).optional(),
+          harness: z.string().max(100).optional(),
+        })
+        .strict(),
+    },
+    async ({ board, sessionId, jobId, leaseToken, reason, harness }) => {
+      const slug = await resolveSlug(board, sessionId);
+      const job = await store.releaseJob(
+        slug,
+        jobId,
+        { leaseToken, reason },
+        {
+          type: 'agent',
+          harness: harness ?? 'mcp',
+          sessionId,
+        },
+      );
+      onMutate?.(slug);
+      return {
+        content: [{ type: 'text', text: JSON.stringify(job, null, 2) }],
+      };
+    },
+  );
+
+  server.registerTool(
+    'job_complete',
+    {
+      title: 'Complete Refresh Job',
+      description:
+        'Mark a claimed refresh job done (or failed). Marking done strictly requires that the target artifact has a new version (> baseVersion) created with jobId === this job.',
+      inputSchema: z
+        .object({
+          board: BoardSlugSchema.optional(),
+          sessionId: EntityIdSchema.optional(),
+          jobId: EntityIdSchema,
+          leaseToken: z.string().min(1).max(128),
+          status: z.enum(['done', 'failed']).optional(),
+          artifactVersion: z.number().int().min(1).optional(),
+          summary: z.string().max(2000).optional(),
+          error: z.string().max(2000).optional(),
+          harness: z.string().max(100).optional(),
+        })
+        .strict(),
+    },
+    async ({ board, sessionId, jobId, harness, ...input }) => {
+      const slug = await resolveSlug(board, sessionId);
+      const job = await store.completeJob(slug, jobId, input, {
         type: 'agent',
         harness: harness ?? 'mcp',
         sessionId,
       });
       onMutate?.(slug);
       return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ refreshed: true, artifactType, artifactId }, null, 2),
-          },
-        ],
+        content: [{ type: 'text', text: JSON.stringify(job, null, 2) }],
       };
     },
   );

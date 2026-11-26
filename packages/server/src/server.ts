@@ -24,6 +24,7 @@ export interface StartServerOptions {
 export function resolveDefaultWebDistDir(): string | undefined {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const candidates = [
+    path.resolve(here, '../web-dist'),
     path.resolve(here, '../../web/dist'),
     path.resolve(here, '../../../web/dist'),
   ];
