@@ -62,16 +62,6 @@ export function sanitizeMermaidSvg(svg: string): string {
 
 export function wrapHtmlArtifactSrcDoc(html: string): string {
   const cspMeta = `<meta http-equiv="Content-Security-Policy" content="${HTML_ARTIFACT_CSP}">`;
-  const source = html || '';
-  const headMatch = source.match(/<head\b[^>]*>/i);
-  if (headMatch && headMatch.index !== undefined) {
-    const insertAt = headMatch.index + headMatch[0].length;
-    return `${source.slice(0, insertAt)}\n${cspMeta}\n${source.slice(insertAt)}`;
-  }
-  const htmlMatch = source.match(/<html\b[^>]*>/i);
-  if (htmlMatch && htmlMatch.index !== undefined) {
-    const insertAt = htmlMatch.index + htmlMatch[0].length;
-    return `${source.slice(0, insertAt)}\n<head>${cspMeta}</head>\n${source.slice(insertAt)}`;
-  }
-  return `<!doctype html><html><head>${cspMeta}</head><body>${source}</body></html>`;
+  const source = (html || '').replace(/^\uFEFF?\s*(?:<!doctype\b[^>]*>\s*)*/i, '');
+  return `<!doctype html>${cspMeta}${source}`;
 }

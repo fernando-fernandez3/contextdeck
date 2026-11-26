@@ -94,12 +94,44 @@ export function isLoopbackHost(host: string): boolean {
   );
 }
 
-export function formatHostForUrl(host: string): string {
-  const trimmed = host.trim();
-  if (trimmed.includes(':') && !trimmed.startsWith('[')) {
-    return `[${trimmed}]`;
+function parseHostEntry(rawHost: string): { hostPart: string; portPart?: string } {
+  const clean = rawHost.trim().toLowerCase();
+  if (!clean) return { hostPart: '' };
+
+  if (clean.startsWith('[')) {
+    const bracketed = clean.match(/^(\[[^\]]+\])(?::(\d+))?$/);
+    if (bracketed) {
+      return { hostPart: bracketed[1], portPart: bracketed[2] };
+    }
+    return { hostPart: clean };
   }
-  return trimmed;
+
+  const firstColon = clean.indexOf(':');
+  const lastColon = clean.lastIndexOf(':');
+  if (firstColon === -1) {
+    return { hostPart: clean };
+  }
+  // Only a single unbracketed colon carries a port (H16); multiple colons indicate bare IPv6.
+  if (firstColon === lastColon) {
+    const maybePort = clean.slice(firstColon + 1);
+    if (/^\d+$/.test(maybePort)) {
+      return { hostPart: clean.slice(0, firstColon), portPart: maybePort };
+    }
+    return { hostPart: clean };
+  }
+  return { hostPart: `[${clean}]` };
+}
+
+export function formatHostForUrl(host: string): string {
+  return parseHostEntry(host).hostPart;
+}
+
+export function formatHostPortForUrl(rawHost: string, defaultPort?: number): string {
+  const { hostPart, portPart } = parseHostEntry(rawHost);
+  if (!hostPart) return '';
+  if (portPart !== undefined) return `${hostPart}:${portPart}`;
+  if (defaultPort !== undefined) return `${hostPart}:${defaultPort}`;
+  return hostPart;
 }
 
 export interface HostPolicy {
@@ -136,19 +168,8 @@ export function buildHostPolicy(options: {
 
   const allowedHosts = new Set<string>();
   const addHostEntry = (rawHost: string) => {
-    const clean = rawHost.trim().toLowerCase();
-    if (!clean) return;
-    // Check if host already includes explicit port (handle IPv6 [::1]:4310)
-    const hasExplicitPort = clean.startsWith('[')
-      ? /\]:\d+$/.test(clean)
-      : /:\d+$/.test(clean);
-    if (hasExplicitPort) {
-      allowedHosts.add(clean);
-    } else if (port !== undefined) {
-      const formatted = formatHostForUrl(clean);
-      allowedHosts.add(`${formatted}:${port}`);
-    } else {
-      const formatted = formatHostForUrl(clean);
+    const formatted = formatHostPortForUrl(rawHost, port);
+    if (formatted) {
       allowedHosts.add(formatted);
     }
   };
@@ -278,7 +299,11 @@ export async function validateMcpMediaSourcePath(
 
   let realFilePath: string;
   try {
-    realFilePath = await fs.realpath(path.resolve(rawSourcePath));
+    // H14: Resolve relative sourceFilePath against projectRoot rather than process.cwd()
+    const candidatePath = path.isAbsolute(rawSourcePath)
+      ? path.resolve(rawSourcePath)
+      : path.resolve(options.projectRoot ?? process.cwd(), rawSourcePath);
+    realFilePath = await fs.realpath(candidatePath);
   } catch {
     throw new SecurityError('sourceFilePath does not exist or cannot be accessed.');
   }

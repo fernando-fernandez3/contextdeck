@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import { serve } from '@hono/node-server';
 import { ContextDeckStore } from '@contextdeck/core';
 import { createApp } from './app.js';
-import { buildHostPolicy, formatHostForUrl, isLoopbackHost } from './security.js';
+import { buildHostPolicy, formatHostPortForUrl, isLoopbackHost } from './security.js';
 
 export interface StartServerOptions {
   deckDir?: string;
@@ -92,11 +92,13 @@ export async function startServer(options: StartServerOptions): Promise<{
     server.once('error', onError);
   });
 
-  const displayHost =
-    host === '0.0.0.0' || host === '::'
-      ? (allowedHosts[0]?.replace(/:\d+$/, '') || '127.0.0.1')
-      : formatHostForUrl(host);
-  const url = `http://${displayHost}:${port}`;
+  const displayAuthority =
+    host === '0.0.0.0' || host === '::' || host === '[::]'
+      ? allowedHosts[0]
+        ? formatHostPortForUrl(allowedHosts[0], port)
+        : `127.0.0.1:${port}`
+      : formatHostPortForUrl(host, port);
+  const url = `http://${displayAuthority}`;
   const mcpUrl = `${url}/mcp`;
   const initialCode = mintBootstrapCode();
   const launchUrl = `${url}/auth?code=${initialCode}`;

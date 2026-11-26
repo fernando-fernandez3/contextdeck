@@ -1,9 +1,10 @@
 import fs from 'node:fs/promises';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ContextDeckStore, seedDemoBoard } from '@contextdeck/core';
-import { createApp, startServer } from '../src/index.js';
+import { buildHostPolicy, createApp, startServer } from '../src/index.js';
 
 const tmpDirs: string[] = [];
 
@@ -553,6 +554,16 @@ describe('E2 Server & MCP security (reproducing Bugs 2, 3, 4, 7-media, 8 + D5/D6
       expect(okAttempt.result?.isError).toBeFalsy();
       expect(okAttempt.result?.content?.[0]?.text).toContain('Allowed Doc');
 
+      // H14: Relative sourceFilePath resolves against projectRoot (not process.cwd())
+      const relAttempt = await callMcp('media_attach', {
+        board: 'demo',
+        title: 'Relative Project Doc',
+        kind: 'doc',
+        sourceFilePath: 'docs/allowed.txt',
+      });
+      expect(relAttempt.result?.isError).toBeFalsy();
+      expect(relAttempt.result?.content?.[0]?.text).toContain('Relative Project Doc');
+
       // Allow external root ONLY when configured in user-local ~/.contextdeck/config.yaml
       const outsideAllowedDir = await makeTempDir('cdeck-media-root-');
       const outsideAllowedFile = path.join(outsideAllowedDir, 'clip.txt');
@@ -727,6 +738,211 @@ describe('E2 Server & MCP security (reproducing Bugs 2, 3, 4, 7-media, 8 + D5/D6
       const chunk = new TextDecoder().decode(value);
       expect(chunk).toContain('event: connected');
       ac.abort();
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('H13: real-HTTP oversized chunked upload, mid-upload abort, and truncated multipart body never crash server or leak temps', async () => {
+    const dir = await makeTempDir('cdeck-h13-');
+    const store = new ContextDeckStore({
+      deckDir: path.join(dir, '.contextdeck'),
+      projectRoot: dir,
+      maxMediaBytes: 1024,
+    });
+    await seedDemoBoard(store, 'demo');
+
+    const port = 4421;
+    const srv = await startServer({
+      deckDir: store.deckDir,
+      projectRoot: dir,
+      host: '127.0.0.1',
+      port,
+      maxMediaBytes: 1024,
+    });
+
+    const assertServerAlive = async () => {
+      const health = await fetch(`${srv.url}/api/health`);
+      expect(health.status).toBe(200);
+      expect(await health.json()).toEqual({ ok: true, name: 'contextdeck' });
+    };
+
+    const mediaDir = path.join(store.boardPath('demo'), 'media');
+
+    try {
+      // 1. Real HTTP chunked 4 KB upload (> 1 KB limit) -> 413, server stays alive
+      const boundary1 = '----h13ChunkedBoundary';
+      const status1 = await new Promise<number>((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port,
+            path: '/api/boards/demo/media',
+            method: 'POST',
+            headers: {
+              'Content-Type': `multipart/form-data; boundary=${boundary1}`,
+              Authorization: `Bearer ${srv.token}`,
+              'Transfer-Encoding': 'chunked',
+            },
+          },
+          (res) => {
+            res.resume();
+            res.on('end', () => resolve(res.statusCode ?? 0));
+          },
+        );
+        req.on('error', (err) => {
+          // Server may close socket early after sending 413 while chunks are still writing
+          if ((err as NodeJS.ErrnoException).code === 'EPIPE' || (err as NodeJS.ErrnoException).code === 'ECONNRESET') {
+            return;
+          }
+          reject(err);
+        });
+        req.write(
+          `--${boundary1}\r\n` +
+            `Content-Disposition: form-data; name="title"\r\n\r\nOversized\r\n` +
+            `--${boundary1}\r\n` +
+            `Content-Disposition: form-data; name="kind"\r\n\r\nvideo\r\n` +
+            `--${boundary1}\r\n` +
+            `Content-Disposition: form-data; name="file"; filename="big.mp4"\r\n` +
+            `Content-Type: video/mp4\r\n\r\n`,
+        );
+        setTimeout(() => {
+          if (!req.destroyed) req.write('A'.repeat(2048));
+        }, 15);
+        setTimeout(() => {
+          if (!req.destroyed) {
+            req.write('B'.repeat(2048));
+            req.end(`\r\n--${boundary1}--\r\n`);
+          }
+        }, 30);
+      });
+      expect(status1).toBe(413);
+      await assertServerAlive();
+
+      // 2. Client aborts mid-upload -> server stays alive, no leftover .tmp-upload-*
+      const boundary2 = '----h13AbortBoundary';
+      await new Promise<void>((resolve) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port,
+          path: '/api/boards/demo/media',
+          method: 'POST',
+          headers: {
+            'Content-Type': `multipart/form-data; boundary=${boundary2}`,
+            Authorization: `Bearer ${srv.token}`,
+            'Transfer-Encoding': 'chunked',
+          },
+        });
+        req.on('error', () => resolve());
+        req.on('close', () => resolve());
+        req.write(
+          `--${boundary2}\r\n` +
+            `Content-Disposition: form-data; name="file"; filename="aborted.mp4"\r\n` +
+            `Content-Type: video/mp4\r\n\r\n` +
+            'PARTIAL_BYTES_BEFORE_ABORT',
+        );
+        setTimeout(() => {
+          req.destroy();
+        }, 40);
+      });
+      // Give server cleanup a moment to settle after client socket abort
+      await new Promise((r) => setTimeout(r, 120));
+      await assertServerAlive();
+      const filesAfterAbort = await fs.readdir(mediaDir);
+      expect(filesAfterAbort.some((f) => f.startsWith('.tmp-upload-'))).toBe(false);
+
+      // 3. Truncated multipart body without closing boundary -> 400, server stays alive
+      const boundary3 = '----h13TruncatedBoundary';
+      const truncatedBody =
+        `--${boundary3}\r\n` +
+        `Content-Disposition: form-data; name="file"; filename="trunc.mp4"\r\n` +
+        `Content-Type: video/mp4\r\n\r\n` +
+        'TRUNCATED_WITHOUT_END_BOUNDARY';
+      const truncRes = await fetch(`${srv.url}/api/boards/demo/media`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': `multipart/form-data; boundary=${boundary3}`,
+          Authorization: `Bearer ${srv.token}`,
+        },
+        body: truncatedBody,
+      });
+      expect(truncRes.status).toBe(400);
+      await assertServerAlive();
+      const filesAfterTrunc = await fs.readdir(mediaDir);
+      expect(filesAfterTrunc.some((f) => f.startsWith('.tmp-upload-'))).toBe(false);
+    } finally {
+      await srv.close();
+    }
+  }, 20_000);
+
+  it('H16: parses bare IPv6 --allowed-hosts correctly and preserves explicit port in launchUrl', async () => {
+    const policy = buildHostPolicy({
+      host: '0.0.0.0',
+      port: 4429,
+      allowRemote: true,
+      allowedHosts: ['2001:db8::1', '192.168.1.5:8080', '[2001:db8::2]:8443'],
+    });
+    expect(policy.allowedHosts.has('[2001:db8::1]:4429')).toBe(true);
+    expect(policy.allowedHosts.has('2001:db8::1')).toBe(false);
+    expect(policy.allowedHosts.has('192.168.1.5:8080')).toBe(true);
+    expect(policy.allowedHosts.has('[2001:db8::2]:8443')).toBe(true);
+
+    const dir = await makeTempDir('cdeck-h16-');
+    const store = new ContextDeckStore(dir);
+    await seedDemoBoard(store, 'demo');
+
+    const srv = await startServer({
+      deckDir: store.deckDir,
+      projectRoot: dir,
+      host: '0.0.0.0',
+      port: 4422,
+      allowRemote: true,
+      allowedHosts: ['192.168.1.5:8080', '2001:db8::1'],
+    });
+    try {
+      expect(srv.url).toBe('http://192.168.1.5:8080');
+      expect(srv.launchUrl.startsWith('http://192.168.1.5:8080/auth?code=')).toBe(true);
+
+      // Sending a request with the Host header from launchUrl must be accepted (302), not rejected (421)
+      const launchParsed = new URL(srv.launchUrl);
+      const status = await new Promise<number>((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port: 4422,
+            path: `${launchParsed.pathname}${launchParsed.search}`,
+            method: 'GET',
+            headers: { Host: launchParsed.host },
+          },
+          (res) => {
+            res.resume();
+            res.on('end', () => resolve(res.statusCode ?? 0));
+          },
+        );
+        req.on('error', reject);
+        req.end();
+      });
+      expect(status).toBe(302);
+
+      // Bare IPv6 allowedHost must also be accepted with Host: [2001:db8::1]:4422
+      const ipv6Status = await new Promise<number>((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port: 4422,
+            path: '/api/health',
+            method: 'GET',
+            headers: { Host: '[2001:db8::1]:4422' },
+          },
+          (res) => {
+            res.resume();
+            res.on('end', () => resolve(res.statusCode ?? 0));
+          },
+        );
+        req.on('error', reject);
+        req.end();
+      });
+      expect(ipv6Status).toBe(200);
     } finally {
       await srv.close();
     }

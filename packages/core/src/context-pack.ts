@@ -9,6 +9,7 @@ import {
   UNTRUSTED_BOARD_CONTENT_HEADER,
   capSingleLine,
   isMeaningfulEvent,
+  neutralizeUntrustedDelimiters,
 } from './drift.js';
 
 export interface ContextPackOptions {
@@ -23,10 +24,11 @@ const MAX_SUMMARY_CHARS = 300;
 
 function appendSectionWithinBudget(
   sections: string[],
-  candidate: string,
+  rawCandidate: string,
   remainingChars: number,
   allowPartialTruncate = false,
 ): number {
+  const candidate = neutralizeUntrustedDelimiters(rawCandidate);
   if (!candidate || remainingChars <= 0) return remainingChars;
   const separator = sections.length > 0 ? '\n\n' : '';
   const needed = separator.length + candidate.length;
@@ -100,7 +102,7 @@ export function generateContextPack(
   } = options;
 
   const headerLines = [
-    `# ContextDeck Shared Context: ${capSingleLine(snapshot.config.title, MAX_TITLE_CHARS)}`,
+    `# ContextDeck Shared Context: ${neutralizeUntrustedDelimiters(capSingleLine(snapshot.config.title, MAX_TITLE_CHARS))}`,
     `> Board: \`${snapshot.config.slug}\` | Revision: \`rev ${snapshot.config.revision}\` | Updated: ${snapshot.config.updatedAt}`,
   ];
   const header = headerLines.join('\n');
@@ -237,7 +239,7 @@ export function generateContextPack(
     remaining = appendSectionWithinBudget(bodySections, lines.join('\n'), remaining, true);
   }
 
-  const innerBody = bodySections.join('\n\n');
+  const innerBody = neutralizeUntrustedDelimiters(bodySections.join('\n\n'));
   const full = `${header}\n\n${UNTRUSTED_BOARD_CONTENT_HEADER}\n\n${innerBody}\n\n${UNTRUSTED_BOARD_CONTENT_FOOTER}${protocolBlock}`;
   if (full.length <= maxChars) {
     return full;

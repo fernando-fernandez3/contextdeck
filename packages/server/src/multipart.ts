@@ -5,7 +5,7 @@ import path from 'node:path';
 import { Readable } from 'node:stream';
 import type { ReadableStream as WebReadableStream } from 'node:stream/web';
 import Busboy from 'busboy';
-import { PayloadTooLargeError, ValidationError } from '@contextdeck/core';
+import { ContextDeckError, PayloadTooLargeError, ValidationError } from '@contextdeck/core';
 
 export interface ParsedMultipartUpload {
   fields: Record<string, string>;
@@ -59,14 +59,38 @@ export async function parseStreamingMultipartUpload(options: {
     let fileWritePromise: Promise<void> | null = null;
     let activeTmpPath: string | null = null;
     let activeWriteStream: fs.WriteStream | null = null;
+    let activeFileStream: NodeJS.ReadableStream | null = null;
     let settled = false;
+    let inputEnded = false;
     let totalWireBytes = 0;
 
+    const toMultipartError = (err: unknown): Error => {
+      if (err instanceof ContextDeckError) return err;
+      const msg = err instanceof Error ? err.message : String(err);
+      return new ValidationError(`Invalid or truncated multipart upload: ${msg}`);
+    };
+
     const cleanupTemp = async () => {
-      if (activeWriteStream) {
-        activeWriteStream.destroy();
-        activeWriteStream = null;
+      const fsStream = activeFileStream;
+      activeFileStream = null;
+      const ws = activeWriteStream;
+      activeWriteStream = null;
+
+      if (fsStream && ws) {
+        fsStream.unpipe(ws);
+        fsStream.resume();
       }
+
+      // H13 / H15: Always await the write stream's 'close' before deleting the temp file (Windows safe).
+      if (ws && !ws.closed) {
+        await new Promise<void>((resClose) => {
+          const done = () => resClose();
+          ws.once('close', done);
+          ws.once('error', done);
+          ws.destroy();
+        });
+      }
+
       if (activeTmpPath) {
         const toDelete = activeTmpPath;
         activeTmpPath = null;
@@ -74,9 +98,14 @@ export async function parseStreamingMultipartUpload(options: {
       }
     };
 
+    const onAbort = () => {
+      fail(new ValidationError('Multipart upload aborted by client.'));
+    };
+
     const fail = (err: Error) => {
       if (settled) return;
       settled = true;
+      request.signal?.removeEventListener('abort', onAbort);
       nodeStream.unpipe(busboy);
       setImmediate(() => {
         nodeStream.destroy();
@@ -104,20 +133,39 @@ export async function parseStreamingMultipartUpload(options: {
     });
 
     busboy.on('file', (fieldName, stream, info) => {
-      if (fieldName !== 'file') {
+      if (settled || fieldName !== 'file') {
+        // H13: Swallow errors on ignored parts before draining
+        stream.on('error', () => {});
         stream.resume();
         return;
       }
 
       const tmpPath = path.join(mediaDir, `.tmp-upload-${crypto.randomBytes(8).toString('hex')}`);
       activeTmpPath = tmpPath;
+      activeFileStream = stream;
       const ws = fs.createWriteStream(tmpPath, { flags: 'wx', mode: 0o644 });
       activeWriteStream = ws;
 
       let fileBytes = 0;
       let hitLimit = false;
+      let wsFinished = false;
 
       fileWritePromise = new Promise<void>((resFile) => {
+        let fileResolved = false;
+        const finishFile = () => {
+          if (!fileResolved) {
+            fileResolved = true;
+            resFile();
+          }
+        };
+
+        // H13: Always attach an error listener to Busboy's FileStream so truncated bodies or
+        // busboy.destroy() never emit an uncaught 'error' event.
+        stream.on('error', (err) => {
+          fail(toMultipartError(err));
+          finishFile();
+        });
+
         stream.on('limit', () => {
           hitLimit = true;
           stream.unpipe(ws);
@@ -126,7 +174,7 @@ export async function parseStreamingMultipartUpload(options: {
             `Uploaded file exceeds maximum allowed size of ${maxMediaBytes} bytes.`,
           );
           fail(err);
-          resFile();
+          finishFile();
         });
 
         stream.on('data', (chunk: Buffer) => {
@@ -139,18 +187,25 @@ export async function parseStreamingMultipartUpload(options: {
               `Uploaded file exceeds maximum allowed size of ${maxMediaBytes} bytes.`,
             );
             fail(err);
-            resFile();
+            finishFile();
           }
         });
 
         ws.on('error', (err) => {
-          fail(err);
-          resFile();
+          fail(toMultipartError(err));
+          finishFile();
         });
 
-        ws.on('finish', async () => {
-          if (hitLimit || settled) {
-            resFile();
+        ws.on('finish', () => {
+          wsFinished = true;
+        });
+
+        ws.on('close', async () => {
+          if (activeWriteStream === ws) {
+            activeWriteStream = null;
+          }
+          if (!wsFinished || hitLimit || settled) {
+            finishFile();
             return;
           }
           try {
@@ -160,17 +215,16 @@ export async function parseStreamingMultipartUpload(options: {
             } finally {
               await fh.close();
             }
-            activeWriteStream = null;
             fileResult = {
               tmpPath,
               fileName: info.filename || 'upload.bin',
               mimeType: info.mimeType || 'application/octet-stream',
               bytesWritten: fileBytes,
             };
-            resFile();
+            finishFile();
           } catch (err) {
             fail(err instanceof Error ? err : new Error(String(err)));
-            resFile();
+            finishFile();
           }
         });
 
@@ -187,7 +241,7 @@ export async function parseStreamingMultipartUpload(options: {
     });
 
     busboy.on('error', (err) => {
-      fail(err instanceof Error ? err : new Error(String(err)));
+      fail(toMultipartError(err));
     });
 
     busboy.on('close', () => {
@@ -197,11 +251,12 @@ export async function parseStreamingMultipartUpload(options: {
         .then(() => {
           if (settled) return;
           settled = true;
+          request.signal?.removeEventListener('abort', onAbort);
           activeTmpPath = null; // ownership transferred to caller
           resolve({ fields, file: fileResult });
         })
         .catch((err) => {
-          fail(err instanceof Error ? err : new Error(String(err)));
+          fail(toMultipartError(err));
         });
     });
 
@@ -216,9 +271,24 @@ export async function parseStreamingMultipartUpload(options: {
         );
       }
     });
-    nodeStream.on('error', (err) => {
-      fail(err instanceof Error ? err : new Error(String(err)));
+    nodeStream.on('end', () => {
+      inputEnded = true;
     });
+    nodeStream.on('error', (err) => {
+      fail(toMultipartError(err));
+    });
+    nodeStream.on('close', () => {
+      if (!inputEnded && !settled) {
+        fail(new ValidationError('Multipart upload aborted before completion.'));
+      }
+    });
+    if (request.signal) {
+      if (request.signal.aborted) {
+        onAbort();
+        return;
+      }
+      request.signal.addEventListener('abort', onAbort, { once: true });
+    }
     nodeStream.pipe(busboy);
   });
 }

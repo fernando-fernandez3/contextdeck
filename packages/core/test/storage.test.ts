@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as core from '../src/index.js';
 
 const tmpDirs: string[] = [];
@@ -572,4 +572,77 @@ describe('E1 safe concurrent storage engine', () => {
       store.updateDecision('main', d1.id, { supersedes: d3.id }),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
   }, FSYNC_TEST_TIMEOUT_MS);
+
+  it('H15: retries transient EBUSY/EPERM/EACCES errors in retryOnTransientFsError and linkCreateAtomic', async () => {
+    let calls = 0;
+    const result = await core.retryOnTransientFsError(
+      async () => {
+        calls += 1;
+        if (calls < 3) {
+          const err = new Error('busy') as NodeJS.ErrnoException;
+          err.code = calls === 1 ? 'EBUSY' : 'EPERM';
+          throw err;
+        }
+        return 'ok';
+      },
+      { attempts: 5, initialDelayMs: 1 },
+    );
+    expect(result).toBe('ok');
+    expect(calls).toBe(3);
+
+    // Non-transient errors fail immediately on attempt 1
+    let nonTransientCalls = 0;
+    await expect(
+      core.retryOnTransientFsError(
+        async () => {
+          nonTransientCalls += 1;
+          const err = new Error('missing') as NodeJS.ErrnoException;
+          err.code = 'ENOENT';
+          throw err;
+        },
+        { attempts: 5, initialDelayMs: 1 },
+      ),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(nonTransientCalls).toBe(1);
+
+    // linkCreateAtomic retries transient EBUSY on link and unlink
+    const dir = await makeTempDir('cdeck-h15-');
+    const src = path.join(dir, '.tmp-item');
+    const dst = path.join(dir, 'item.md');
+    await fs.writeFile(src, 'payload', 'utf8');
+
+    const origLink = fs.link.bind(fs);
+    const origUnlink = fs.unlink.bind(fs);
+    let linkTries = 0;
+    let unlinkTries = 0;
+    const linkSpy = vi.spyOn(fs, 'link').mockImplementation(async (existingPath, newPath) => {
+      linkTries += 1;
+      if (linkTries === 1) {
+        const err = new Error('transient link busy') as NodeJS.ErrnoException;
+        err.code = 'EBUSY';
+        throw err;
+      }
+      return origLink(existingPath, newPath);
+    });
+    const unlinkSpy = vi.spyOn(fs, 'unlink').mockImplementation(async (target) => {
+      unlinkTries += 1;
+      if (unlinkTries === 1) {
+        const err = new Error('transient unlink perm') as NodeJS.ErrnoException;
+        err.code = 'EPERM';
+        throw err;
+      }
+      return origUnlink(target);
+    });
+
+    try {
+      await core.linkCreateAtomic(src, dst);
+      expect(linkTries).toBe(2);
+      expect(unlinkTries).toBe(2);
+      expect(await fs.readFile(dst, 'utf8')).toBe('payload');
+      await expect(fs.stat(src)).rejects.toThrow();
+    } finally {
+      linkSpy.mockRestore();
+      unlinkSpy.mockRestore();
+    }
+  });
 });

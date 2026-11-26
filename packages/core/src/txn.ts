@@ -52,30 +52,38 @@ export type TxnOp = z.infer<typeof TxnOpSchema>;
 export type TxnEventEntry = z.infer<typeof TxnEventSchema>;
 export type TxnJournal = z.infer<typeof TxnJournalSchema>;
 
-function isTransientRenameError(err: unknown): boolean {
+function isTransientFsError(err: unknown): boolean {
   const code = (err as NodeJS.ErrnoException | undefined)?.code;
   return code === 'EPERM' || code === 'EBUSY' || code === 'EACCES';
 }
 
-export async function renameWithRetry(src: string, dst: string, attempts = 5): Promise<void> {
-  let delayMs = 15;
+export async function retryOnTransientFsError<T>(
+  op: () => Promise<T>,
+  options: { attempts?: number; initialDelayMs?: number } = {},
+): Promise<T> {
+  const { attempts = 5, initialDelayMs = 15 } = options;
+  let delayMs = initialDelayMs;
   for (let i = 0; i < attempts; i += 1) {
     try {
-      await fs.rename(src, dst);
-      return;
+      return await op();
     } catch (err) {
-      if (i === attempts - 1 || !isTransientRenameError(err)) {
+      if (i === attempts - 1 || !isTransientFsError(err)) {
         throw err;
       }
       await new Promise((r) => setTimeout(r, delayMs));
       delayMs *= 2;
     }
   }
+  throw new Error('retryOnTransientFsError exhausted without result');
 }
 
-export async function linkCreateAtomic(src: string, dst: string): Promise<void> {
+export async function renameWithRetry(src: string, dst: string, attempts = 5): Promise<void> {
+  await retryOnTransientFsError(() => fs.rename(src, dst), { attempts });
+}
+
+export async function linkCreateAtomic(src: string, dst: string, attempts = 5): Promise<void> {
   try {
-    await fs.link(src, dst);
+    await retryOnTransientFsError(() => fs.link(src, dst), { attempts });
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'EEXIST') {
@@ -88,7 +96,7 @@ export async function linkCreateAtomic(src: string, dst: string): Promise<void> 
       throw err;
     }
   }
-  await fs.unlink(src).catch((err) => {
+  await retryOnTransientFsError(() => fs.unlink(src), { attempts }).catch((err) => {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
   });
 }

@@ -57,6 +57,35 @@ describe('@contextdeck/web content security (Bug 7, AC2.7, AC2.9, D5)', () => {
     expect(wrapped2.indexOf(HTML_ARTIFACT_CSP)).toBeLessThan(wrapped2.indexOf('<title>T</title>'));
   });
 
+  it('H12: prevents HTML artifact CSP meta bypasses via comments, rawtext/RCDATA, or leading scripts', () => {
+    const bypassInputs = [
+      '<!-- <head> --><script>fetch("https://example.invalid")</script>',
+      '<style><head></style><script>fetch("https://example.invalid")</script>',
+      '<title><head></title><script>fetch("https://example.invalid")</script>',
+      '<script>fetch("https://example.invalid")</script><html><head></head>',
+      '<!doctype html><html><head><title>Doc</title></head><body><script>1</script></body></html>',
+    ];
+
+    for (const input of bypassInputs) {
+      const wrapped = wrapHtmlArtifactSrcDoc(input);
+      const doc = new DOMParser().parseFromString(wrapped, 'text/html');
+      const cspMetas = doc.querySelectorAll('meta[http-equiv="Content-Security-Policy"]');
+      expect(cspMetas).toHaveLength(1);
+      const meta = cspMetas[0];
+      expect(meta.getAttribute('content')).toBe(HTML_ARTIFACT_CSP);
+      expect(doc.head.firstElementChild).toBe(meta);
+
+      // Nothing may precede the CSP meta in document order (every other element in head/body comes after)
+      const allElements = Array.from(doc.querySelectorAll('*')).filter(
+        (el) => el !== doc.documentElement && el !== doc.head && el !== meta,
+      );
+      for (const el of allElements) {
+        const pos = meta.compareDocumentPosition(el);
+        expect(pos & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      }
+    }
+  });
+
   it('validates http(s) URLs strictly', () => {
     expect(isSafeHttpUrl('https://example.com/a')).toBe(true);
     expect(isSafeHttpUrl('http://127.0.0.1:4310')).toBe(true);
