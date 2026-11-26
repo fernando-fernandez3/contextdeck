@@ -10,6 +10,7 @@ import { resolveHandlerForJob, runWorkerLoop, runWorkerOnce } from '../src/worke
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CLI_BIN = path.resolve(here, '../dist/index.js');
 const tmpDirs: string[] = [];
+const spawnedPids: number[] = [];
 
 async function makeTempDir(prefix = 'cdeck-b3-cli-'): Promise<string> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -708,6 +709,174 @@ setTimeout(() => {}, 10000);
       expect(renewRes.message).toMatch(/renewal/i);
       expect(renewElapsed).toBeLessThan(4_500);
       expect((await store.getJob('main', renewFailJob.id))?.status).toBe('queued');
+    },
+  );
+});
+
+describe('B3 Hardening Round 2 G1: CLI dedupe redaction, pre-spawn failure cleanup, and SIGTERM-ignoring grandchild kill (R2-3, R2-7, R2-1)', () => {
+  afterEach(() => {
+    while (spawnedPids.length > 0) {
+      const pid = spawnedPids.pop()!;
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        // already dead
+      }
+    }
+  });
+
+  it('R2-3: cdeck job create deduplication against a claimed job does not print leaseToken to stdout', async () => {
+    const dir = await makeTempDir('cdeck-r2-3-cli-');
+    const store = new ContextDeckStore({ deckDir: path.join(dir, '.contextdeck'), projectRoot: dir });
+    await store.createBoard({ title: 'R2-3 CLI', slug: 'main' });
+    const d1 = await store.recordDecision('main', { title: 'D1' });
+    const diag = await store.upsertDiagram('main', {
+      title: 'Flow',
+      kind: 'mermaid',
+      content: 'flowchart LR\nA-->B',
+      basedOnDecisions: [d1.id],
+    });
+    await store.recordDecision('main', { title: 'D2', supersedes: d1.id });
+    const { job } = await store.createRefreshJob('main', {
+      artifactType: 'diagram',
+      artifactId: diag.id,
+    });
+    const claimed = await store.claimJob('main', { jobId: job.id, claimedBy: 'worker-cli-secret' });
+    expect(claimed?.leaseToken).toBeTruthy();
+
+    const dedupeRes = await runCli(
+      ['job', 'create', 'diagram', diag.id, '--dir', dir, '--board', 'main'],
+      { cwd: dir },
+    );
+    expect(dedupeRes.code).toBe(0);
+    expect(dedupeRes.stdout).not.toContain(claimed!.leaseToken!);
+    const parsed = JSON.parse(dedupeRes.stdout) as { deduplicated: boolean; job: Record<string, unknown> };
+    expect(parsed.deduplicated).toBe(true);
+    expect('leaseToken' in parsed.job).toBe(false);
+    expect('leaseTokenHash' in parsed.job).toBe(false);
+  });
+
+  it('R2-7: pre-spawn setup failure (corrupt quiz JSON) fails the claimed job cleanly with no leftover temp dir', async () => {
+    const base = await makeTempDir('cdeck-r2-7-');
+    const fakeHome = path.join(base, 'home');
+    const repo = path.join(base, 'repo');
+    await fs.mkdir(fakeHome, { recursive: true });
+    await fs.mkdir(repo, { recursive: true });
+    const env = { CONTEXTDECK_HOME: fakeHome };
+
+    const store = new ContextDeckStore({ deckDir: path.join(repo, '.contextdeck'), projectRoot: repo });
+    await store.createBoard({ title: 'R2-7', slug: 'main' });
+    const d1 = await store.recordDecision('main', { title: 'D1' });
+    const quiz = await store.createQuiz('main', {
+      title: 'Corruptible Quiz',
+      basedOnDecisions: [d1.id],
+      questions: [
+        {
+          id: 'q1',
+          prompt: 'Ok?',
+          type: 'true_false',
+          correctAnswer: 'true',
+          explanation: 'yes',
+          relatedDecisionIds: [d1.id],
+        },
+      ],
+    });
+    await store.recordDecision('main', { title: 'D2', supersedes: d1.id });
+    const { job } = await store.createRefreshJob('main', {
+      artifactType: 'quiz',
+      artifactId: quiz.id,
+    });
+
+    // Corrupt quiz JSON on disk after job is queued
+    const quizPath = path.join(repo, '.contextdeck', 'boards', 'main', 'quizzes', `${quiz.id}.quiz.json`);
+    await fs.writeFile(quizPath, '{ not valid json', 'utf8');
+
+    await fs.writeFile(
+      path.join(fakeHome, 'worker.yaml'),
+      `handlers:\n  quiz:\n    argv: [${JSON.stringify(process.execPath)}, "-e", "process.exit(0)"]\n    timeoutSec: 10\n`,
+      'utf8',
+    );
+    expect((await runCli(['worker', 'trust'], { cwd: repo, env })).code).toBe(0);
+
+    const beforeTmp = new Set((await fs.readdir(os.tmpdir())).filter((n) => n.startsWith('cdeck-job-')));
+    const res = await runWorkerOnce(store, { workerName: 'w-r2-7', env });
+    const afterTmp = (await fs.readdir(os.tmpdir())).filter(
+      (n) => n.startsWith('cdeck-job-') && !beforeTmp.has(n),
+    );
+
+    expect(res.processed).toBe(true);
+    expect(res.status).toBe('failed');
+    expect(res.jobId).toBe(job.id);
+    expect(res.message).toMatch(/corrupt|setup/i);
+    const persisted = await store.getJob('main', job.id);
+    expect(persisted?.status).toBe('failed');
+    expect(afterTmp).toEqual([]);
+  });
+
+  it.skipIf(process.platform === 'win32')(
+    'R2-1: timeout finishes process-group SIGKILL escalation even when direct child closes early and grandchild ignores SIGTERM',
+    async () => {
+      const base = await makeTempDir('cdeck-r2-1-');
+      const fakeHome = path.join(base, 'home');
+      const repo = path.join(base, 'repo');
+      await fs.mkdir(fakeHome, { recursive: true });
+      await fs.mkdir(repo, { recursive: true });
+      const env = { CONTEXTDECK_HOME: fakeHome };
+
+      const store = new ContextDeckStore({ deckDir: path.join(repo, '.contextdeck'), projectRoot: repo });
+      await store.createBoard({ title: 'R2-1', slug: 'main' });
+      const d1 = await store.recordDecision('main', { title: 'D1' });
+      const diag = await store.upsertDiagram('main', {
+        title: 'Sigterm Grandchild',
+        kind: 'mermaid',
+        content: 'flowchart LR\nA-->1',
+        basedOnDecisions: [d1.id],
+      });
+      await store.recordDecision('main', { title: 'D2', supersedes: d1.id });
+      const { job } = await store.createRefreshJob('main', {
+        artifactType: 'diagram',
+        artifactId: diag.id,
+      });
+
+      const pidFile = path.join(base, 'grandchild.pid');
+      const handlerScript = path.join(base, 'sigterm-ignore-grandchild.cjs');
+      // Exact Codex H6 repro: grandchild ignores SIGTERM and uses stdio: 'ignore' so direct child closes immediately on SIGTERM
+      await fs.writeFile(
+        handlerScript,
+        `const fs = require('node:fs');
+const child = require('node:child_process').spawn(process.execPath, [
+  '-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"
+], { stdio: 'ignore' });
+fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid), 'utf8');
+console.log(child.pid);
+setInterval(()=>{},1000);
+`,
+        'utf8',
+      );
+      await fs.writeFile(
+        path.join(fakeHome, 'worker.yaml'),
+        `handlers:\n  diagram:\n    argv: [${JSON.stringify(process.execPath)}, ${JSON.stringify(handlerScript)}]\n    timeoutSec: 1\n`,
+        'utf8',
+      );
+      expect((await runCli(['worker', 'trust'], { cwd: repo, env })).code).toBe(0);
+
+      const res = await runWorkerOnce(store, { workerName: 'w-r2-1', env });
+      const grandchildPid = Number((await fs.readFile(pidFile, 'utf8')).trim());
+      expect(Number.isInteger(grandchildPid) && grandchildPid > 0).toBe(true);
+      spawnedPids.push(grandchildPid);
+
+      expect(res.processed).toBe(true);
+      expect(res.status).toBe('failed');
+      expect((await store.getJob('main', job.id))?.status).toBe('failed');
+
+      await new Promise((r) => setTimeout(r, 500));
+      let errCode: string | undefined;
+      try {
+        process.kill(grandchildPid, 0);
+      } catch (err) {
+        errCode = (err as NodeJS.ErrnoException).code;
+      }
+      expect(errCode).toBe('ESRCH');
     },
   );
 });

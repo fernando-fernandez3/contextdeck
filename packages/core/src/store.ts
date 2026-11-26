@@ -54,6 +54,7 @@ import {
   type BoardEvent,
   type BoardSnapshot,
   type CatchUpReport,
+  type ClaimedRefreshJob,
   type ContextUpdatePayload,
   type Decision,
   type DecisionStatus,
@@ -3218,8 +3219,31 @@ export class ContextDeckStore {
     return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
   }
 
-  private static computeClaimFingerprint(leaseToken: string): string {
-    return ContextDeckStore.sha256Hex(leaseToken).slice(0, 16);
+  private static getStoredLeaseHash(job: RefreshJob): string | null {
+    if (job.leaseTokenHash) return job.leaseTokenHash;
+    // R2-4 read-compat: accept legacy job files that stored a raw leaseToken without a hash
+    if (job.leaseToken) return ContextDeckStore.sha256Hex(job.leaseToken);
+    return null;
+  }
+
+  private static verifyLeaseToken(job: RefreshJob, presentedToken: string): string | null {
+    const storedHash = ContextDeckStore.getStoredLeaseHash(job);
+    if (!storedHash || !presentedToken) return null;
+    const presentedHash = ContextDeckStore.sha256Hex(presentedToken);
+    const a = Buffer.from(storedHash, 'hex');
+    const b = Buffer.from(presentedHash, 'hex');
+    if (a.length !== b.length || a.length !== 32) return null;
+    return crypto.timingSafeEqual(a, b) ? storedHash : null;
+  }
+
+  private static computeClaimFingerprintFromHash(leaseTokenHash: string): string {
+    return leaseTokenHash.slice(0, 16);
+  }
+
+  private static serializeJobForDisk(job: RefreshJob): string {
+    // R2-4: Never write raw leaseToken to git-trackable board YAML; persist only leaseTokenHash.
+    const { leaseToken: _omitted, ...diskJob } = job;
+    return dumpYaml(diskJob);
   }
 
   private async validateActiveJobClaim(
@@ -3248,12 +3272,13 @@ export class ContextDeckStore {
         `Refresh job "${jobId}" targets ${job.artifactType}/${job.artifactId}, not ${artifactType}/${artifactId}.`,
       );
     }
-    if (job.status !== 'claimed' || !job.leaseToken) {
+    if (job.status !== 'claimed' || !ContextDeckStore.getStoredLeaseHash(job)) {
       throw new ConflictError(
         `Refresh job "${jobId}" is not actively claimed (status: ${job.status}).`,
       );
     }
-    if (job.leaseToken !== leaseToken) {
+    const verifiedHash = ContextDeckStore.verifyLeaseToken(job, leaseToken);
+    if (!verifiedHash) {
       throw new ConflictError(`Invalid lease token for refresh job "${jobId}".`);
     }
     if (job.leaseExpiresAt && Date.parse(job.leaseExpiresAt) <= nowMs) {
@@ -3261,7 +3286,7 @@ export class ContextDeckStore {
     }
     return {
       job,
-      claimFingerprint: ContextDeckStore.computeClaimFingerprint(leaseToken),
+      claimFingerprint: ContextDeckStore.computeClaimFingerprintFromHash(verifiedHash),
     };
   }
 
@@ -5482,11 +5507,11 @@ export class ContextDeckStore {
       reason?: string;
     },
     actor: Actor = DEFAULT_ACTOR,
-  ): Promise<{ job: RefreshJob; deduplicated: boolean }> {
+  ): Promise<{ job: PublicRefreshJob; deduplicated: boolean }> {
     const input = parseStrict(CreateRefreshJobInputSchema.omit({ actor: true }), rawInput, 'refresh job');
 
     return this.mutate(boardSlug, actor, async (tx) => {
-      // Dedupe active (queued or claimed) jobs per artifact (D19)
+      // Dedupe active (queued or claimed) jobs per artifact (D19, R2-3: always redact lease fields)
       const existingJobs = await this.listJobsRaw(tx.slug);
       const active = existingJobs.find(
         (j) =>
@@ -5495,7 +5520,7 @@ export class ContextDeckStore {
           (j.status === 'queued' || j.status === 'claimed'),
       );
       if (active) {
-        return { job: active, deduplicated: true };
+        return { job: redactJobLease(active), deduplicated: true };
       }
 
       const decisions = await this.listDecisions(tx.slug);
@@ -5577,7 +5602,7 @@ export class ContextDeckStore {
         ...(inputContentHash ? { inputContentHash } : {}),
         status: 'queued',
         claimedBy: null,
-        leaseToken: null,
+        leaseTokenHash: null,
         claimedAt: null,
         leaseExpiresAt: null,
         result: null,
@@ -5590,7 +5615,7 @@ export class ContextDeckStore {
       const jobPath = await assertContainedPath(jobsDir, path.join(jobsDir, `${job.id}.yaml`), {
         label: `job "${job.id}"`,
       });
-      tx.stageFile(jobPath, dumpYaml(job), { noClobber: true });
+      tx.stageFile(jobPath, ContextDeckStore.serializeJobForDisk(job), { noClobber: true });
       tx.addEvent({
         kind: 'job.created',
         entityId: job.id,
@@ -5605,12 +5630,13 @@ export class ContextDeckStore {
         },
       });
 
-      return { job, deduplicated: false };
+      return { job: redactJobLease(job), deduplicated: false };
     });
   }
 
   /**
-   * Atomically claim a queued (or lease-expired) refresh job with a lease token and 15 min TTL (AC7.4, D19).
+   * Atomically claim a queued (or lease-expired) refresh job with a lease token and 15 min TTL (AC7.4, D19, R2-4).
+   * Persists only `leaseTokenHash` on disk and returns the raw `leaseToken` once to the caller.
    */
   public async claimJob(
     boardSlug: string | undefined,
@@ -5623,7 +5649,7 @@ export class ContextDeckStore {
       now?: Date;
     },
     actor: Actor = DEFAULT_ACTOR,
-  ): Promise<RefreshJob | null> {
+  ): Promise<ClaimedRefreshJob | null> {
     const { now: nowOpt, ...schemaInput } = rawInput;
     const input = parseStrict(ClaimJobInputSchema.omit({ actor: true }), schemaInput, 'job claim');
     const nowDate = nowOpt ?? new Date();
@@ -5666,37 +5692,39 @@ export class ContextDeckStore {
       }
 
       const leaseToken = crypto.randomBytes(16).toString('hex');
+      const leaseTokenHash = ContextDeckStore.sha256Hex(leaseToken);
       const leaseExpiresAt = new Date(nowMs + ttlMs).toISOString();
+      const { leaseToken: _legacyToken, ...cleanTarget } = target;
       const updated = RefreshJobSchema.parse({
-        ...target,
+        ...cleanTarget,
         status: 'claimed',
         claimedBy: input.claimedBy,
-        leaseToken,
+        leaseTokenHash,
         claimedAt: nowStr,
         leaseExpiresAt,
         updatedAt: nowStr,
       });
 
       const jobPath = await this.safeBoardFilePath(tx.slug, 'jobs', `${updated.id}.yaml`);
-      tx.stageFile(jobPath, dumpYaml(updated));
+      tx.stageFile(jobPath, ContextDeckStore.serializeJobForDisk(updated));
       tx.addEvent({
         kind: 'job.claimed',
         entityId: updated.id,
         summary: `Claimed refresh job ${updated.id} by ${input.claimedBy}`,
       });
-      return updated;
+      return { ...redactJobLease(updated), leaseToken };
     });
   }
 
   /**
-   * Renew an active job lease with a matching lease token (D19).
+   * Renew an active job lease with a matching lease token (D19, R2-4).
    */
   public async renewJob(
     boardSlug: string | undefined,
     jobId: string,
     rawInput: { leaseToken: string; ttlMs?: number; now?: Date },
     actor: Actor = DEFAULT_ACTOR,
-  ): Promise<RefreshJob> {
+  ): Promise<ClaimedRefreshJob> {
     validateEntityId(jobId, 'jobId');
     const { now: nowOpt, ...schemaInput } = rawInput;
     const input = parseStrict(RenewJobInputSchema.omit({ actor: true }), schemaInput, 'job renew');
@@ -5710,38 +5738,44 @@ export class ContextDeckStore {
       if (!existing) {
         throw new NotFoundError(`Refresh job "${jobId}" not found on board "${tx.slug}".`);
       }
-      if (existing.status !== 'claimed' || !existing.leaseToken || existing.leaseToken !== input.leaseToken) {
+      const verifiedHash =
+        existing.status === 'claimed'
+          ? ContextDeckStore.verifyLeaseToken(existing, input.leaseToken)
+          : null;
+      if (!verifiedHash) {
         throw new ConflictError(`Invalid lease token or job "${jobId}" is not actively claimed.`);
       }
       if (existing.leaseExpiresAt && Date.parse(existing.leaseExpiresAt) <= nowMs) {
         throw new ConflictError(`Lease for refresh job "${jobId}" has already expired.`);
       }
 
+      const { leaseToken: _legacyToken, ...cleanExisting } = existing;
       const updated = RefreshJobSchema.parse({
-        ...existing,
+        ...cleanExisting,
+        leaseTokenHash: verifiedHash,
         leaseExpiresAt: new Date(nowMs + ttlMs).toISOString(),
         updatedAt: nowStr,
       });
       const jobPath = await this.safeBoardFilePath(tx.slug, 'jobs', `${updated.id}.yaml`);
-      tx.stageFile(jobPath, dumpYaml(updated));
+      tx.stageFile(jobPath, ContextDeckStore.serializeJobForDisk(updated));
       tx.addEvent({
         kind: 'job.renewed',
         entityId: updated.id,
         summary: `Renewed lease for refresh job ${updated.id}`,
       });
-      return updated;
+      return { ...redactJobLease(updated), leaseToken: input.leaseToken };
     });
   }
 
   /**
-   * Release a claimed job back to `queued` using its lease token (D19).
+   * Release a claimed job back to `queued` using its lease token (D19, R2-3, R2-4).
    */
   public async releaseJob(
     boardSlug: string | undefined,
     jobId: string,
     rawInput: { leaseToken: string; reason?: string },
     actor: Actor = DEFAULT_ACTOR,
-  ): Promise<RefreshJob> {
+  ): Promise<PublicRefreshJob> {
     validateEntityId(jobId, 'jobId');
     const input = parseStrict(ReleaseJobInputSchema.omit({ actor: true }), rawInput, 'job release');
 
@@ -5750,21 +5784,26 @@ export class ContextDeckStore {
       if (!existing) {
         throw new NotFoundError(`Refresh job "${jobId}" not found on board "${tx.slug}".`);
       }
-      if (existing.status !== 'claimed' || !existing.leaseToken || existing.leaseToken !== input.leaseToken) {
+      const verifiedHash =
+        existing.status === 'claimed'
+          ? ContextDeckStore.verifyLeaseToken(existing, input.leaseToken)
+          : null;
+      if (!verifiedHash) {
         throw new ConflictError(`Invalid lease token or job "${jobId}" is not claimed.`);
       }
 
+      const { leaseToken: _legacyToken, ...cleanExisting } = existing;
       const updated = RefreshJobSchema.parse({
-        ...existing,
+        ...cleanExisting,
         status: 'queued',
         claimedBy: null,
-        leaseToken: null,
+        leaseTokenHash: null,
         claimedAt: null,
         leaseExpiresAt: null,
         updatedAt: nowIso(),
       });
       const jobPath = await this.safeBoardFilePath(tx.slug, 'jobs', `${updated.id}.yaml`);
-      tx.stageFile(jobPath, dumpYaml(updated));
+      tx.stageFile(jobPath, ContextDeckStore.serializeJobForDisk(updated));
       tx.addEvent({
         kind: 'job.released',
         entityId: updated.id,
@@ -5772,12 +5811,12 @@ export class ContextDeckStore {
           ? `Released refresh job ${updated.id}: ${input.reason}`
           : `Released refresh job ${updated.id} back to queue`,
       });
-      return updated;
+      return redactJobLease(updated);
     });
   }
 
   /**
-   * Complete (or fail) a claimed refresh job (AC7.4, D19).
+   * Complete (or fail) a claimed refresh job (AC7.4, D19, R2-3, R2-4).
    * When completing as `done`, strictly requires that the target artifact has a new version
    * (`version > baseVersion`) whose history entry has `createdByJob === job.id`.
    */
@@ -5793,7 +5832,7 @@ export class ContextDeckStore {
       now?: Date;
     },
     actor: Actor = DEFAULT_ACTOR,
-  ): Promise<RefreshJob> {
+  ): Promise<PublicRefreshJob> {
     validateEntityId(jobId, 'jobId');
     const { now: nowOpt, ...schemaInput } = rawInput;
     const input = parseStrict(CompleteJobInputSchema.omit({ actor: true }), schemaInput, 'job complete');
@@ -5807,18 +5846,24 @@ export class ContextDeckStore {
       if (!existing) {
         throw new NotFoundError(`Refresh job "${jobId}" not found on board "${tx.slug}".`);
       }
-      if (existing.status !== 'claimed' || !existing.leaseToken || existing.leaseToken !== input.leaseToken) {
+      const verifiedHash =
+        existing.status === 'claimed'
+          ? ContextDeckStore.verifyLeaseToken(existing, input.leaseToken)
+          : null;
+      if (!verifiedHash) {
         throw new ConflictError(`Invalid lease token or job "${jobId}" is not claimed.`);
       }
       if (existing.leaseExpiresAt && Date.parse(existing.leaseExpiresAt) <= nowMs) {
         throw new ConflictError(`Lease for refresh job "${jobId}" has expired; reclaim before completing.`);
       }
 
+      const { leaseToken: _legacyToken, ...cleanExisting } = existing;
+
       if (targetStatus === 'failed') {
         const failed = RefreshJobSchema.parse({
-          ...existing,
+          ...cleanExisting,
           status: 'failed',
-          leaseToken: null,
+          leaseTokenHash: null,
           leaseExpiresAt: null,
           result: {
             ...(input.error ? { error: input.error } : {}),
@@ -5827,19 +5872,19 @@ export class ContextDeckStore {
           updatedAt: nowStr,
         });
         const jobPath = await this.safeBoardFilePath(tx.slug, 'jobs', `${failed.id}.yaml`);
-        tx.stageFile(jobPath, dumpYaml(failed));
+        tx.stageFile(jobPath, ContextDeckStore.serializeJobForDisk(failed));
         tx.addEvent({
           kind: 'job.failed',
           entityId: failed.id,
           summary: `Refresh job ${failed.id} failed${input.error ? `: ${input.error}` : ''}`,
         });
-        return failed;
+        return redactJobLease(failed);
       }
 
       // D19 / AC7.4 strict verification: artifact must have version > baseVersion,
-      // createdByJob === job.id AND createdByClaim === fingerprint(leaseToken),
+      // createdByJob === job.id AND createdByClaim === fingerprint(leaseTokenHash),
       // and must have changed the underlying media file / diagram content / quiz questions.
-      const expectedClaim = ContextDeckStore.computeClaimFingerprint(existing.leaseToken);
+      const expectedClaim = ContextDeckStore.computeClaimFingerprintFromHash(verifiedHash);
       let artifactVersion: number;
       let history: ArtifactVersionEntry[];
       let currentDiagram: Diagram | null = null;
@@ -5933,9 +5978,9 @@ export class ContextDeckStore {
       }
 
       const completed = RefreshJobSchema.parse({
-        ...existing,
+        ...cleanExisting,
         status: 'done',
-        leaseToken: null,
+        leaseTokenHash: null,
         leaseExpiresAt: null,
         result: {
           artifactVersion: claimedVersion,
@@ -5944,7 +5989,7 @@ export class ContextDeckStore {
         updatedAt: nowStr,
       });
       const jobPath = await this.safeBoardFilePath(tx.slug, 'jobs', `${completed.id}.yaml`);
-      tx.stageFile(jobPath, dumpYaml(completed));
+      tx.stageFile(jobPath, ContextDeckStore.serializeJobForDisk(completed));
       tx.addEvent({
         kind: 'job.completed',
         entityId: completed.id,
@@ -5955,7 +6000,7 @@ export class ContextDeckStore {
           artifactVersion: claimedVersion,
         },
       });
-      return completed;
+      return redactJobLease(completed);
     });
   }
 

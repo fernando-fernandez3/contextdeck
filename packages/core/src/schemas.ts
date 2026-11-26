@@ -385,7 +385,10 @@ export const RefreshJobSchema = z.object({
   inputContentHash: z.string().regex(/^[0-9a-f]{64}$/).optional(),
   status: RefreshJobStatusSchema.default('queued'),
   claimedBy: z.string().max(200).nullable().default(null),
-  leaseToken: z.string().max(128).nullable().default(null),
+  // R2-4: Persist only a SHA-256 verifier hash in git-trackable board YAML, never the raw leaseToken.
+  leaseTokenHash: z.string().regex(/^[0-9a-f]{64}$/).nullable().default(null),
+  // Legacy read-only back-compat: accepted when loading older files; never written back on mutation.
+  leaseToken: z.string().max(128).nullable().optional(),
   claimedAt: IsoDateTimeSchema.nullable().default(null),
   leaseExpiresAt: IsoDateTimeSchema.nullable().default(null),
   result: RefreshJobResultSchema.nullable().default(null),
@@ -396,17 +399,26 @@ export const RefreshJobSchema = z.object({
 export type RefreshJob = z.infer<typeof RefreshJobSchema>;
 
 /**
- * Public view of a refresh job with the secret `leaseToken` omitted (D19, H7).
- * Only `claimJob` and `renewJob` return the active `leaseToken`.
+ * Public view of a refresh job with lease secret and verifier hash omitted (D19, H7, R2-3, R2-4).
+ * Only `claimJob` and `renewJob` return the active `leaseToken` to the claim holder.
  */
-export type PublicRefreshJob = Omit<RefreshJob, 'leaseToken'>;
+export type PublicRefreshJob = Omit<RefreshJob, 'leaseToken' | 'leaseTokenHash'>;
 
-export function redactJobLease(job: RefreshJob | PublicRefreshJob): PublicRefreshJob {
-  const { leaseToken: _redacted, ...rest } = job as RefreshJob;
+/**
+ * Claimed view returned exclusively to the active lease holder (`claimJob` / `renewJob`).
+ */
+export type ClaimedRefreshJob = PublicRefreshJob & { leaseToken: string };
+
+export function redactJobLease(
+  job: RefreshJob | PublicRefreshJob | ClaimedRefreshJob,
+): PublicRefreshJob {
+  const { leaseToken: _redactedToken, leaseTokenHash: _redactedHash, ...rest } = job as RefreshJob;
   return rest;
 }
 
-export function redactJobsLeases(jobs: Array<RefreshJob | PublicRefreshJob>): PublicRefreshJob[] {
+export function redactJobsLeases(
+  jobs: Array<RefreshJob | PublicRefreshJob | ClaimedRefreshJob>,
+): PublicRefreshJob[] {
   return jobs.map(redactJobLease);
 }
 

@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -260,10 +261,11 @@ describe('B3 Core: Refresh Jobs, Leases, Dedupe, Completion Gate, and Neon 15 Di
     });
     expect(Date.parse(renewed.leaseExpiresAt!)).toBeGreaterThan(Date.parse(claimed!.leaseExpiresAt!));
 
-    // Release returns job to queued
+    // Release returns job to queued (R2-3/R2-4: redacted PublicRefreshJob omits leaseToken & leaseTokenHash)
     const released = await store.releaseJob('main', r1.job.id, { leaseToken: claimed!.leaseToken! });
     expect(released.status).toBe('queued');
-    expect(released.leaseToken).toBeNull();
+    expect('leaseToken' in released).toBe(false);
+    expect('leaseTokenHash' in released).toBe(false);
 
     // Reclaim, then expire lease after 16 min -> another worker can reclaim
     const c2 = await store.claimJob('main', { jobId: r1.job.id, claimedBy: 'worker-1', now: t0 });
@@ -1092,5 +1094,185 @@ describe('B3 Hardening G3: Confirm conflict/validation, Catch up otherChanges/ch
     const hookMs = performance.now() - tHook0;
     expect(hookSync.action).toBe('digest');
     expect(hookMs).toBeLessThan(300 * ciFactor);
+  });
+});
+
+describe('B3 Hardening Round 2 G1: Refresh-job lease secrecy (R2-3, R2-4)', () => {
+  it('R2-3: createRefreshJob deduplication against a claimed job omits leaseToken and leaseTokenHash', async () => {
+    const dir = await makeTempDir('cdeck-r2-3-core-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'R2-3', slug: 'main' });
+
+    const d1 = await store.recordDecision('main', { title: 'D1' });
+    const diag = await store.upsertDiagram('main', {
+      title: 'Flow',
+      kind: 'mermaid',
+      content: 'flowchart LR\nA-->B',
+      basedOnDecisions: [d1.id],
+    });
+    await store.recordDecision('main', { title: 'D2', supersedes: d1.id });
+
+    const created = await store.createRefreshJob('main', {
+      artifactType: 'diagram',
+      artifactId: diag.id,
+    });
+    expect(created.deduplicated).toBe(false);
+    expect('leaseToken' in created.job).toBe(false);
+    expect('leaseTokenHash' in created.job).toBe(false);
+
+    const claimed = await store.claimJob('main', { jobId: created.job.id, claimedBy: 'worker-secret' });
+    expect(claimed?.leaseToken).toBeTruthy();
+
+    const deduped = await store.createRefreshJob('main', {
+      artifactType: 'diagram',
+      artifactId: diag.id,
+    });
+    expect(deduped.deduplicated).toBe(true);
+    expect(deduped.job.id).toBe(created.job.id);
+    expect(deduped.job.status).toBe('claimed');
+    expect('leaseToken' in deduped.job).toBe(false);
+    expect('leaseTokenHash' in deduped.job).toBe(false);
+    expect(JSON.stringify(deduped)).not.toContain(claimed!.leaseToken);
+  });
+
+  it('R2-4: persists only sha256 leaseTokenHash on disk, validates with right/wrong token, and accepts & migrates legacy raw-token job files', async () => {
+    const dir = await makeTempDir('cdeck-r2-4-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'R2-4', slug: 'main' });
+
+    const d1 = await store.recordDecision('main', { title: 'D1' });
+    const diag = await store.upsertDiagram('main', {
+      title: 'Flow',
+      kind: 'mermaid',
+      content: 'flowchart LR\nA-->1',
+      basedOnDecisions: [d1.id],
+    });
+    const d2 = await store.recordDecision('main', { title: 'D2', supersedes: d1.id });
+
+    const { job } = await store.createRefreshJob('main', {
+      artifactType: 'diagram',
+      artifactId: diag.id,
+    });
+
+    const t0 = new Date('2026-11-26T15:00:00.000Z');
+    const claimed = await store.claimJob('main', { jobId: job.id, claimedBy: 'worker-hash', now: t0 });
+    expect(claimed?.leaseToken).toBeTruthy();
+    const rawToken = claimed!.leaseToken;
+    const expectedHash = crypto.createHash('sha256').update(rawToken, 'utf8').digest('hex');
+
+    // Job YAML on disk must contain ONLY the sha256 hash, NEVER the raw lease token
+    const jobYamlPath = path.join(dir, '.contextdeck', 'boards', 'main', 'jobs', `${job.id}.yaml`);
+    const diskYaml = await fs.readFile(jobYamlPath, 'utf8');
+    expect(diskYaml).not.toContain(rawToken);
+    expect(diskYaml).toContain(`leaseTokenHash: ${expectedHash}`);
+    expect(diskYaml).not.toMatch(/^leaseToken:/m);
+
+    // Wrong token rejected on renew, artifact write, and complete
+    await expect(
+      store.renewJob('main', job.id, { leaseToken: 'wrong-token', now: new Date(t0.getTime() + 60_000) }),
+    ).rejects.toThrow(/lease/i);
+    await expect(
+      store.upsertDiagram('main', {
+        id: diag.id,
+        title: diag.title,
+        kind: 'mermaid',
+        content: 'flowchart LR\nA-->2',
+        basedOnDecisions: [d2.id],
+        jobId: job.id,
+        leaseToken: 'wrong-token',
+        now: new Date(t0.getTime() + 60_000),
+      }),
+    ).rejects.toThrow(/lease/i);
+    await expect(
+      store.completeJob('main', job.id, {
+        leaseToken: 'wrong-token',
+        status: 'failed',
+        error: 'nope',
+        now: new Date(t0.getTime() + 60_000),
+      }),
+    ).rejects.toThrow(/lease/i);
+
+    // Right token passes on renew, artifact write (with createdByClaim derived from hash), and complete
+    const renewed = await store.renewJob('main', job.id, {
+      leaseToken: rawToken,
+      now: new Date(t0.getTime() + 60_000),
+    });
+    expect(renewed.status).toBe('claimed');
+
+    const v2 = await store.upsertDiagram('main', {
+      id: diag.id,
+      title: diag.title,
+      kind: 'mermaid',
+      content: 'flowchart LR\nA-->2',
+      basedOnDecisions: [d2.id],
+      jobId: job.id,
+      leaseToken: rawToken,
+      now: new Date(t0.getTime() + 120_000),
+    });
+    expect(v2.history.find((h) => h.version === 2)?.createdByClaim).toBe(expectedHash.slice(0, 16));
+
+    const completed = await store.completeJob('main', job.id, {
+      leaseToken: rawToken,
+      artifactVersion: 2,
+      now: new Date(t0.getTime() + 180_000),
+    });
+    expect(completed.status).toBe('done');
+    expect('leaseToken' in completed).toBe(false);
+    expect('leaseTokenHash' in completed).toBe(false);
+
+    // Read-compat: legacy raw-token YAML file (no leaseTokenHash) still validates and migrates on mutation
+    const { job: legacyJob } = await store.createRefreshJob('main', {
+      artifactType: 'diagram',
+      artifactId: diag.id,
+    });
+    const legacyToken = 'legacy-raw-token-abc1234567890';
+    const legacyHash = crypto.createHash('sha256').update(legacyToken, 'utf8').digest('hex');
+    const legacyYamlPath = path.join(dir, '.contextdeck', 'boards', 'main', 'jobs', `${legacyJob.id}.yaml`);
+    const legacyExpires = new Date(t0.getTime() + 15 * 60 * 1000).toISOString();
+    const legacyRawYaml = await fs.readFile(legacyYamlPath, 'utf8');
+    const legacyPatched = legacyRawYaml
+      .replace(/^status: queued$/m, 'status: claimed')
+      .replace(/^claimedBy: null$/m, 'claimedBy: legacy-worker')
+      .replace(/^leaseTokenHash: null$/m, `leaseToken: ${legacyToken}`)
+      .replace(/^leaseToken: null$/m, `leaseToken: ${legacyToken}`)
+      .replace(/^claimedAt: null$/m, `claimedAt: '${t0.toISOString()}'`)
+      .replace(/^leaseExpiresAt: null$/m, `leaseExpiresAt: '${legacyExpires}'`);
+    await fs.writeFile(legacyYamlPath, legacyPatched, 'utf8');
+
+    // Wrong token fails against legacy file
+    await expect(
+      store.renewJob('main', legacyJob.id, {
+        leaseToken: 'not-the-legacy-token',
+        now: new Date(t0.getTime() + 60_000),
+      }),
+    ).rejects.toThrow(/lease/i);
+
+    // Right legacy token renews AND migrates the file on disk to hash-only
+    await store.renewJob('main', legacyJob.id, {
+      leaseToken: legacyToken,
+      now: new Date(t0.getTime() + 60_000),
+    });
+    const migratedYaml = await fs.readFile(legacyYamlPath, 'utf8');
+    expect(migratedYaml).not.toContain(legacyToken);
+    expect(migratedYaml).toContain(`leaseTokenHash: ${legacyHash}`);
+    expect(migratedYaml).not.toMatch(/^leaseToken:/m);
+
+    // And subsequent write + complete with legacyToken succeeds against the migrated hash
+    await store.upsertDiagram('main', {
+      id: diag.id,
+      title: diag.title,
+      kind: 'mermaid',
+      content: 'flowchart LR\nA-->3',
+      basedOnDecisions: [d2.id],
+      jobId: legacyJob.id,
+      leaseToken: legacyToken,
+      now: new Date(t0.getTime() + 120_000),
+    });
+    const legacyDone = await store.completeJob('main', legacyJob.id, {
+      leaseToken: legacyToken,
+      artifactVersion: 3,
+      now: new Date(t0.getTime() + 180_000),
+    });
+    expect(legacyDone.status).toBe('done');
   });
 });

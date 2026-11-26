@@ -10,6 +10,7 @@ import {
   SecurityError,
   assertWorkerConfigTrusted,
   loadWorkerConfig,
+  type ClaimedRefreshJob,
   type PublicRefreshJob,
   type RefreshJob,
   type WorkerConfig,
@@ -129,6 +130,13 @@ function executeHandlerSpawn(params: {
     let timedOut = false;
     let aborted = false;
     let terminating = false;
+    // R2-1: On POSIX, once timeout/abort fires, keep the SIGTERM -> SIGKILL process-group
+    // escalation running to completion even if the direct child closes early (e.g., grandchild
+    // ignoring SIGTERM with stdio: 'ignore'), and resolve only after escalation finishes.
+    let escalationDone = !isPosix;
+    let childClosed = false;
+    let closeCode: number | null = null;
+    let closeSignal: NodeJS.Signals | null = null;
     let settled = false;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
     let pipeCloseTimer: ReturnType<typeof setTimeout> | undefined;
@@ -178,12 +186,24 @@ function executeHandlerSpawn(params: {
       terminating = true;
 
       killProcessTree(child.pid, 'SIGTERM', child);
+      if (!isPosix) {
+        // Windows: killProcessTree already issued taskkill /T /F
+        escalationDone = true;
+        schedulePipeDeadline(1_000, null, 'SIGKILL');
+        return;
+      }
+
+      escalationDone = false;
       killTimer = setTimeout(() => {
         killProcessTree(child.pid, 'SIGKILL', child);
-        // H6: Bound waiting for pipe closure even if a detached descendant held an fd open
-        schedulePipeDeadline(1_000, null, 'SIGKILL');
+        escalationDone = true;
+        if (childClosed) {
+          finish(closeCode, closeSignal);
+        } else {
+          // H6: Bound waiting for pipe closure even if a detached descendant held an fd open
+          schedulePipeDeadline(1_000, null, 'SIGKILL');
+        }
       }, 1_000);
-      killTimer.unref();
     };
 
     const onAbort = () => {
@@ -224,14 +244,19 @@ function executeHandlerSpawn(params: {
     });
 
     child.on('exit', (code, signal) => {
-      if (terminating) {
-        // Ensure pipes close promptly if direct child exited after SIGTERM/SIGKILL
+      if (terminating && escalationDone) {
+        // Ensure pipes close promptly if direct child exited after SIGKILL
         schedulePipeDeadline(1_000, code, signal);
       }
     });
 
     child.on('close', (code, signal) => {
-      finish(code, signal);
+      childClosed = true;
+      closeCode = code;
+      closeSignal = signal;
+      if (!terminating || escalationDone) {
+        finish(code, signal);
+      }
     });
   });
 }
@@ -277,7 +302,7 @@ export async function runWorkerOnce(
     : await store.listBoards();
 
   const nowMs = Date.now();
-  let claimed: RefreshJob | null = null;
+  let claimed: ClaimedRefreshJob | null = null;
   let chosen: { slug: string; handlerKey: string; handler: WorkerHandlerConfig } | null = null;
 
   // H5: Scan claimable jobs; if another worker races and wins the claim (ConflictError),
@@ -332,57 +357,77 @@ export async function runWorkerOnce(
     }
   };
 
-  // H4 & H13: Load ONLY the board config, brief, decisions, and target artifact (no full snapshot!)
-  const ctx = await store.getWorkerJobContext(chosen.slug, claimed);
-  const decisionMap = new Map(ctx.decisions.map((d) => [d.id, d]));
-  const jobPayload = {
-    job: claimed,
-    board: chosen.slug,
-    boardSlug: chosen.slug,
-    boardTitle: ctx.config.title,
-    boardRevision: ctx.config.revision,
-    deckDir: store.deckDir,
-    projectRoot: store.projectRoot ?? null,
-    brief: ctx.brief,
-    artifact: ctx.artifact,
-    decisions: ctx.decisions,
-    decisionsBefore: claimed.decisionsBefore.map((id) => decisionMap.get(id)).filter(Boolean),
-    decisionsNow: claimed.decisionsNow.map((id) => decisionMap.get(id)).filter(Boolean),
-  };
-
-  // H8: Write job.json with wx + 0600 inside a private 0700 mkdtemp directory
-  const jobDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cdeck-job-'));
-  if (process.platform !== 'win32') {
-    await fs.chmod(jobDir, 0o700);
-  }
-  const jobFile = path.join(jobDir, 'job.json');
-  await fs.writeFile(jobFile, `${JSON.stringify(jobPayload, null, 2)}\n`, {
-    encoding: 'utf8',
-    mode: 0o600,
-    flag: 'wx',
-  });
-
-  // Periodic lease renewal for long-running handlers; stop handler immediately if renewal fails (H6)
-  const abortController = new AbortController();
-  let leaseRenewalError: unknown = null;
-  let renewInFlight = false;
-  const renewTimer = setInterval(() => {
-    if (renewInFlight || abortController.signal.aborted) return;
-    renewInFlight = true;
-    void store
-      .renewJob(chosen!.slug, claimed!.id, { leaseToken }, workerActor)
-      .catch((err) => {
-        leaseRenewalError = err;
-        clearInterval(renewTimer);
-        abortController.abort();
-      })
-      .finally(() => {
-        renewInFlight = false;
-      });
-  }, renewIntervalMs);
-  renewTimer.unref();
+  // R2-7: Open try/finally immediately after acquiring the claim so any pre-spawn
+  // setup failure fails the job cleanly and cleans up temp dir/timer without wedging it.
+  let jobDir: string | null = null;
+  let renewTimer: ReturnType<typeof setInterval> | null = null;
 
   try {
+    let jobFile: string;
+    try {
+      // H4 & H13: Load ONLY the board config, brief, decisions, and target artifact (no full snapshot!)
+      const ctx = await store.getWorkerJobContext(chosen.slug, claimed);
+      const decisionMap = new Map(ctx.decisions.map((d) => [d.id, d]));
+      const jobPayload = {
+        job: claimed,
+        board: chosen.slug,
+        boardSlug: chosen.slug,
+        boardTitle: ctx.config.title,
+        boardRevision: ctx.config.revision,
+        deckDir: store.deckDir,
+        projectRoot: store.projectRoot ?? null,
+        brief: ctx.brief,
+        artifact: ctx.artifact,
+        decisions: ctx.decisions,
+        decisionsBefore: claimed.decisionsBefore.map((id) => decisionMap.get(id)).filter(Boolean),
+        decisionsNow: claimed.decisionsNow.map((id) => decisionMap.get(id)).filter(Boolean),
+      };
+
+      // H8: Write job.json with wx + 0600 inside a private 0700 mkdtemp directory
+      jobDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cdeck-job-'));
+      if (process.platform !== 'win32') {
+        await fs.chmod(jobDir, 0o700);
+      }
+      jobFile = path.join(jobDir, 'job.json');
+      await fs.writeFile(jobFile, `${JSON.stringify(jobPayload, null, 2)}\n`, {
+        encoding: 'utf8',
+        mode: 0o600,
+        flag: 'wx',
+      });
+    } catch (setupErr) {
+      const msg = `Handler "${chosen.handlerKey}" setup failed: ${
+        setupErr instanceof Error ? setupErr.message : String(setupErr)
+      }`;
+      await safeFailJob(msg);
+      return {
+        processed: true,
+        boardSlug: chosen.slug,
+        jobId: claimed.id,
+        status: 'failed',
+        message: msg,
+      };
+    }
+
+    // Periodic lease renewal for long-running handlers; stop handler immediately if renewal fails (H6)
+    const abortController = new AbortController();
+    let leaseRenewalError: unknown = null;
+    let renewInFlight = false;
+    renewTimer = setInterval(() => {
+      if (renewInFlight || abortController.signal.aborted) return;
+      renewInFlight = true;
+      void store
+        .renewJob(chosen!.slug, claimed!.id, { leaseToken }, workerActor)
+        .catch((err) => {
+          leaseRenewalError = err;
+          if (renewTimer) clearInterval(renewTimer);
+          abortController.abort();
+        })
+        .finally(() => {
+          renewInFlight = false;
+        });
+    }, renewIntervalMs);
+    renewTimer.unref();
+
     const childEnv: NodeJS.ProcessEnv = {
       ...env,
       ...(chosen.handler.env ?? {}),
@@ -506,8 +551,10 @@ export async function runWorkerOnce(
       };
     }
   } finally {
-    clearInterval(renewTimer);
-    await fs.rm(jobDir, { recursive: true, force: true }).catch(() => {});
+    if (renewTimer) clearInterval(renewTimer);
+    if (jobDir) {
+      await fs.rm(jobDir, { recursive: true, force: true }).catch(() => {});
+    }
   }
 }
 
