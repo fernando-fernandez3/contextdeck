@@ -977,4 +977,30 @@ describe('E2 Server & MCP security (reproducing Bugs 2, 3, 4, 7-media, 8 + D5/D6
       await close();
     }
   });
+
+  it('R3-4: PATCH /api/boards/:slug/tasks/:id returns 500 CORRUPT_DATA on corrupt task file', async () => {
+    const dir = await makeTempDir('cdeck-r3-4-rest-');
+    const store = new ContextDeckStore(dir);
+    await seedDemoBoard(store, 'demo');
+
+    const badTaskPath = path.join(store.boardPath('demo'), 'tasks', 'task_bad.md');
+    await fs.writeFile(badTaskPath, '---\nnot: [valid: yaml\n---\n', 'utf8');
+
+    const { app, token, close } = createApp({ store, port: 4310 });
+    try {
+      const res = await app.request('http://127.0.0.1:4310/api/boards/demo/tasks/task_bad', {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ title: 'Updated' }),
+      });
+      expect(res.status).toBe(500);
+      const body = (await res.json()) as { code?: string; error?: string };
+      expect(body.code).toBe('CORRUPT_DATA');
+    } finally {
+      await close();
+    }
+  });
 });

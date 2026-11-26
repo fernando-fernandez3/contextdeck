@@ -1182,6 +1182,28 @@ export class ContextDeckStore {
     return parsed.data;
   }
 
+  private async readQuizById(slug: string, quizId: string): Promise<Quiz | null> {
+    const validId = validateEntityId(quizId, 'quizId');
+    const quizPath = await this.safeBoardFilePath(slug, 'quizzes', `${validId}.quiz.json`);
+    const raw = await readFileStrict(quizPath);
+    if (raw === null) return null;
+    let parsedJson: unknown;
+    try {
+      parsedJson = JSON.parse(raw);
+    } catch (err) {
+      throw new CorruptDataError(
+        `Corrupt quiz JSON at ${quizPath}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    const quizParsed = QuizSchema.safeParse(parsedJson);
+    if (!quizParsed.success) {
+      throw new CorruptDataError(
+        `Invalid quiz schema in ${quizPath}: ${formatZodError(quizParsed.error)}`,
+      );
+    }
+    return quizParsed.data;
+  }
+
   /**
    * Consistent snapshot reader (E1 + D1):
    * reads board.yaml revision first and last; retries up to 3 times if revision changed;
@@ -2062,19 +2084,11 @@ export class ContextDeckStore {
     const patch = parseStrict(PatchTaskInputSchema.omit({ actor: true }), rawPatch, 'task patch');
 
     return this.mutate(boardSlug, actor, async (tx) => {
-      const taskPath = await this.safeBoardFilePath(tx.slug, 'tasks', `${taskId}.md`);
-      const raw = await readFileStrict(taskPath);
-      if (raw === null) {
+      const existing = await this.readTaskById(tx.slug, taskId);
+      if (!existing) {
         throw new NotFoundError(`Task "${taskId}" not found on board "${tx.slug}".`);
       }
-      const { data, body } = parseFrontmatter<Record<string, unknown>>(raw);
-      const parsedExisting = TaskSchema.safeParse({ ...data, description: body });
-      if (!parsedExisting.success) {
-        throw new CorruptDataError(
-          `Invalid task schema in ${taskPath}: ${formatZodError(parsedExisting.error)}`,
-        );
-      }
-      const existing = parsedExisting.data;
+      const taskPath = await this.safeBoardFilePath(tx.slug, 'tasks', `${existing.id}.md`);
 
       const updated = TaskSchema.parse({
         ...existing,
@@ -2117,9 +2131,14 @@ export class ContextDeckStore {
       let existing: Task | null = null;
       const raw = await readFileStrict(taskPath);
       if (raw !== null) {
-        const { data, body } = parseFrontmatter<Record<string, unknown>>(raw);
-        const parsed = TaskSchema.safeParse({ ...data, description: body });
-        if (parsed.success) existing = parsed.data;
+        try {
+          const { data, body } = parseFrontmatter<Record<string, unknown>>(raw);
+          const parsed = TaskSchema.safeParse({ ...data, description: body });
+          if (parsed.success) existing = parsed.data;
+        } catch {
+          // Deleting a corrupt task file must succeed as the user's remedy (R3-4)
+          existing = null;
+        }
       }
       tx.stageDelete(taskPath);
       tx.addEvent({
@@ -2443,26 +2462,11 @@ export class ContextDeckStore {
     const input = parseStrict(SubmitQuizAttemptInputSchema.omit({ actor: true }), rawInput, 'quiz attempt');
 
     return this.mutate(boardSlug, actor, async (tx) => {
-      const quizPath = await this.safeBoardFilePath(tx.slug, 'quizzes', `${quizId}.quiz.json`);
-      const raw = await readFileStrict(quizPath);
-      if (raw === null) {
+      const quiz = await this.readQuizById(tx.slug, quizId);
+      if (!quiz) {
         throw new NotFoundError(`Quiz "${quizId}" not found on board "${tx.slug}".`);
       }
-      let parsedJson: unknown;
-      try {
-        parsedJson = JSON.parse(raw);
-      } catch (err) {
-        throw new CorruptDataError(
-          `Corrupt quiz JSON at ${quizPath}: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-      const quizParsed = QuizSchema.safeParse(parsedJson);
-      if (!quizParsed.success) {
-        throw new CorruptDataError(
-          `Invalid quiz schema in ${quizPath}: ${formatZodError(quizParsed.error)}`,
-        );
-      }
-      const quiz = quizParsed.data;
+      const quizPath = await this.safeBoardFilePath(tx.slug, 'quizzes', `${quiz.id}.quiz.json`);
       const { score, total, percentage } = scoreQuizAttempt(quiz.questions, input.answers);
       const attempt = QuizAttemptSchema.parse({
         id: shortId('att'),
@@ -2556,10 +2560,9 @@ export class ContextDeckStore {
       }
 
       if (artifactType === 'quiz') {
-        const quizPath = await this.safeBoardFilePath(tx.slug, 'quizzes', `${artifactId}.quiz.json`);
-        const raw = await readFileStrict(quizPath);
-        if (raw === null) throw new NotFoundError(`Quiz "${artifactId}" not found.`);
-        const quiz = QuizSchema.parse(JSON.parse(raw));
+        const quiz = await this.readQuizById(tx.slug, artifactId);
+        if (!quiz) throw new NotFoundError(`Quiz "${artifactId}" not found.`);
+        const quizPath = await this.safeBoardFilePath(tx.slug, 'quizzes', `${quiz.id}.quiz.json`);
         const ev = tx.addEvent({
           kind: 'artifact.refreshed',
           entityId: quiz.id,

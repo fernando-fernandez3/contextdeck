@@ -686,4 +686,54 @@ describe('E1 safe concurrent storage engine', () => {
       unlinkSpy.mockRestore();
     }
   });
+
+  it('R3-4: throws CorruptDataError on corrupt task patch and quiz refresh, and allows deleteTask on corrupt task', async () => {
+    const dir = await makeTempDir('cdeck-r3-4-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main' });
+
+    const badTaskPath = path.join(store.boardPath('main'), 'tasks', 'task_bad.md');
+    await fs.writeFile(badTaskPath, '---\nnot: [valid: yaml\n---\n', 'utf8');
+
+    const badQuizPath = path.join(store.boardPath('main'), 'quizzes', 'quiz_bad.quiz.json');
+    await fs.writeFile(badQuizPath, '{not-json', 'utf8');
+
+    const badSchemaQuizPath = path.join(
+      store.boardPath('main'),
+      'quizzes',
+      'quiz_bad_schema.quiz.json',
+    );
+    await fs.writeFile(
+      badSchemaQuizPath,
+      JSON.stringify({ id: 'quiz_bad_schema', title: 'Bad', questions: [] }),
+      'utf8',
+    );
+
+    await expect(
+      store.patchTask('main', 'task_bad', { title: 'Updated' }),
+    ).rejects.toBeInstanceOf(core.CorruptDataError);
+    await expect(
+      store.patchTask('main', 'task_bad', { title: 'Updated' }),
+    ).rejects.toMatchObject({ code: 'CORRUPT_DATA' });
+
+    await expect(
+      store.refreshArtifactDecisions('main', 'quiz', 'quiz_bad'),
+    ).rejects.toBeInstanceOf(core.CorruptDataError);
+    await expect(
+      store.refreshArtifactDecisions('main', 'quiz', 'quiz_bad'),
+    ).rejects.toMatchObject({ code: 'CORRUPT_DATA' });
+
+    await expect(
+      store.refreshArtifactDecisions('main', 'quiz', 'quiz_bad_schema'),
+    ).rejects.toBeInstanceOf(core.CorruptDataError);
+
+    // Deleting a corrupt task file must succeed and log task.deleted with entityId only
+    await expect(store.deleteTask('main', 'task_bad')).resolves.toBeUndefined();
+    await expect(fs.stat(badTaskPath)).rejects.toThrow();
+
+    const events = await store.readEvents('main');
+    const delEvt = events.find((e) => e.kind === 'task.deleted' && e.entityId === 'task_bad');
+    expect(delEvt).toBeDefined();
+    expect(delEvt?.details).toEqual({ before: null, after: null });
+  }, FSYNC_TEST_TIMEOUT_MS);
 });
