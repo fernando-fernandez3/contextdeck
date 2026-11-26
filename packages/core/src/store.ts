@@ -1991,17 +1991,65 @@ export class ContextDeckStore {
         updatedAt: now,
       });
 
-      // H9: Keep supersession graph consistent using the shared helper (rejects self-supersede and cycles)
+      // H9 / R3-5: Keep supersession graph consistent using the shared helper
+      // (rejects self-supersede and cycles) and restore previous target when supersedes changes away.
+      const prevSupersedes = existing.supersedes ?? null;
+      const nextSupersedes = patch.supersedes !== undefined ? patch.supersedes : prevSupersedes;
+      const supersedesChanged = patch.supersedes !== undefined && nextSupersedes !== prevSupersedes;
       const supersedingTarget =
         patch.supersedes !== undefined && patch.supersedes !== null ? patch.supersedes : null;
+
       let oldDecision: Decision | undefined;
       if (supersedingTarget) {
         oldDecision = await this.applySupersessionUnlocked(tx, updated.id, supersedingTarget, now);
       }
 
+      let restoredPrevious: { before: Decision; after: Decision } | undefined;
+      if (supersedesChanged && prevSupersedes) {
+        const prevTarget = await this.readDecisionById(tx.slug, prevSupersedes);
+        if (prevTarget && prevTarget.supersededBy === updated.id) {
+          const restoredTarget = DecisionSchema.parse({
+            ...prevTarget,
+            supersededBy: null,
+            status: prevTarget.status === 'superseded' ? 'accepted' : prevTarget.status,
+            updatedAt: now,
+          });
+          const prevPath = await this.safeBoardFilePath(
+            tx.slug,
+            'decisions',
+            `${restoredTarget.id}.md`,
+          );
+          const { rationale: prevRat, ...prevFm } = restoredTarget;
+          tx.stageFile(prevPath, stringifyFrontmatter(prevFm, prevRat));
+          restoredPrevious = { before: prevTarget, after: restoredTarget };
+        }
+      }
+
       const decPath = await this.safeBoardFilePath(tx.slug, 'decisions', `${updated.id}.md`);
       const { rationale, ...frontmatter } = updated;
       tx.stageFile(decPath, stringifyFrontmatter(frontmatter, rationale));
+
+      if (restoredPrevious) {
+        tx.addEvent({
+          kind: 'decision.updated',
+          entityId: restoredPrevious.after.id,
+          summary: `Restored decision ${restoredPrevious.after.id} ("${restoredPrevious.after.title}") [${restoredPrevious.after.status}] (no longer superseded by ${updated.id})`,
+          details: {
+            before: {
+              status: restoredPrevious.before.status,
+              title: restoredPrevious.before.title,
+              summary: restoredPrevious.before.summary,
+            },
+            after: {
+              status: restoredPrevious.after.status,
+              title: restoredPrevious.after.title,
+              summary: restoredPrevious.after.summary,
+            },
+            unSupersededBy: updated.id,
+          },
+        });
+      }
+
       if (supersedingTarget) {
         tx.addEvent({
           kind: 'decision.superseded',
@@ -2009,6 +2057,7 @@ export class ContextDeckStore {
           summary: `Updated decision ${updated.id} ("${updated.title}"), superseding ${supersedingTarget}`,
           details: {
             supersedes: supersedingTarget,
+            ...(supersedesChanged && prevSupersedes ? { previousSupersedes: prevSupersedes } : {}),
             before: oldDecision
               ? {
                   id: oldDecision.id,
@@ -2031,6 +2080,7 @@ export class ContextDeckStore {
           entityId: updated.id,
           summary: `Updated decision ${updated.id} ("${updated.title}") [${updated.status}]`,
           details: {
+            ...(supersedesChanged && prevSupersedes ? { clearedSupersedes: prevSupersedes } : {}),
             before: { status: existing.status, title: existing.title, summary: existing.summary },
             after: { status: updated.status, title: updated.title, summary: updated.summary },
           },

@@ -614,6 +614,92 @@ describe('E1 safe concurrent storage engine', () => {
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
   }, FSYNC_TEST_TIMEOUT_MS);
 
+  it('R3-5: clears and reassigns supersedes cleanly, restoring old targets and emitting events', async () => {
+    const dir = await makeTempDir('cdeck-r3-5-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main' });
+
+    // 1. Null clear: B supersedes A, then clear B.supersedes -> null
+    const a = await store.recordDecision('main', { title: 'A auth', summary: 'jwt' });
+    const b = await store.recordDecision('main', {
+      title: 'B auth',
+      summary: 'sessions',
+      supersedes: a.id,
+    });
+    const revBeforeClear = (await store.getSnapshot('main')).config.revision;
+
+    await store.updateDecision('main', b.id, { supersedes: null });
+    const snapAfterClear = await store.getSnapshot('main');
+    const aAfterClear = snapAfterClear.decisions.find((d) => d.id === a.id)!;
+    const bAfterClear = snapAfterClear.decisions.find((d) => d.id === b.id)!;
+
+    expect(bAfterClear.supersedes).toBeNull();
+    expect(aAfterClear.status).toBe('accepted');
+    expect(aAfterClear.supersededBy).toBeNull();
+
+    const clearEvents = snapAfterClear.events.filter((e) => e.revision > revBeforeClear);
+    expect(
+      clearEvents.some((e) => e.kind === 'decision.updated' && e.entityId === a.id),
+    ).toBe(true);
+    expect(
+      clearEvents.some((e) => e.kind === 'decision.updated' && e.entityId === b.id),
+    ).toBe(true);
+
+    // 2. Reassignment: D supersedes C, then reassign D -> E
+    const c = await store.recordDecision('main', { title: 'C cache', summary: 'redis' });
+    const d = await store.recordDecision('main', {
+      title: 'D cache',
+      summary: 'memcached',
+      supersedes: c.id,
+    });
+    const eDec = await store.recordDecision('main', { title: 'E cache', summary: 'in-memory' });
+    const revBeforeReassign = (await store.getSnapshot('main')).config.revision;
+
+    // Self-supersede / cycle during reassignment must fail without restoring C
+    await expect(
+      store.updateDecision('main', d.id, { supersedes: d.id }),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    const snapAfterRejected = await store.getSnapshot('main');
+    expect(snapAfterRejected.decisions.find((x) => x.id === c.id)?.status).toBe('superseded');
+    expect(snapAfterRejected.decisions.find((x) => x.id === c.id)?.supersededBy).toBe(d.id);
+
+    await store.updateDecision('main', d.id, { supersedes: eDec.id });
+    const snapAfterReassign = await store.getSnapshot('main');
+    const cAfter = snapAfterReassign.decisions.find((x) => x.id === c.id)!;
+    const dAfter = snapAfterReassign.decisions.find((x) => x.id === d.id)!;
+    const eAfter = snapAfterReassign.decisions.find((x) => x.id === eDec.id)!;
+
+    expect(dAfter.supersedes).toBe(eDec.id);
+    expect(cAfter.status).toBe('accepted');
+    expect(cAfter.supersededBy).toBeNull();
+    expect(eAfter.status).toBe('superseded');
+    expect(eAfter.supersededBy).toBe(d.id);
+
+    const reassignEvents = snapAfterReassign.events.filter((e) => e.revision > revBeforeReassign);
+    expect(
+      reassignEvents.some((e) => e.kind === 'decision.updated' && e.entityId === c.id),
+    ).toBe(true);
+    const supEvt = reassignEvents.find(
+      (e) => e.kind === 'decision.superseded' && e.entityId === d.id,
+    );
+    expect(supEvt).toBeDefined();
+    expect(supEvt?.details?.supersedes).toBe(eDec.id);
+
+    // 3. Deprecated old target keeps deprecated status when un-superseded
+    const dep = await store.recordDecision('main', { title: 'Deprecated base', summary: 'old' });
+    const rep = await store.recordDecision('main', {
+      title: 'Replacement',
+      summary: 'new',
+      supersedes: dep.id,
+    });
+    await store.updateDecision('main', dep.id, { status: 'deprecated' });
+    await store.updateDecision('main', rep.id, { supersedes: null });
+    const snapDep = await store.getSnapshot('main');
+    const depAfter = snapDep.decisions.find((x) => x.id === dep.id)!;
+    expect(depAfter.supersededBy).toBeNull();
+    expect(depAfter.status).toBe('deprecated');
+  }, FSYNC_TEST_TIMEOUT_MS);
+
   it('H15: retries transient EBUSY/EPERM/EACCES errors in retryOnTransientFsError and linkCreateAtomic', async () => {
     let calls = 0;
     const result = await core.retryOnTransientFsError(
