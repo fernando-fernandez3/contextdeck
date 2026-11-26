@@ -405,6 +405,86 @@ describe('E1 safe concurrent storage engine', () => {
     expect(await fs.stat(txnPath)).toBeTruthy();
   }, FSYNC_TEST_TIMEOUT_MS);
 
+  it('C6: rejects txn.json when events[].line JSON id mismatches eventId or is invalid JSON before op 0 runs', async () => {
+    const root = await makeTempDir('cdeck-c6-');
+    const store = new core.ContextDeckStore(root);
+    await store.createBoard({ title: 'Main', slug: 'main' });
+    const task = await store.upsertTask('main', { title: 'Must survive C6' });
+    const taskPath = path.join(store.boardPath('main'), 'tasks', `${task.id}.md`);
+    const eventsPath = path.join(store.boardPath('main'), 'events.jsonl');
+    const eventsBefore = await fs.readFile(eventsPath, 'utf8');
+    const txnPath = path.join(store.runtimeDir, 'txn.json');
+
+    // Case 1: eventId mismatch
+    await fs.writeFile(
+      txnPath,
+      JSON.stringify({
+        id: 'txn_c6_mismatch',
+        boardSlug: 'main',
+        ops: [{ kind: 'unlink', finalPath: `boards/main/tasks/${task.id}.md` }],
+        events: [
+          {
+            eventsPath: 'boards/main/events.jsonl',
+            eventId: 'evt_expected',
+            line: '{"id":"evt_different","revision":99}\n',
+          },
+        ],
+      }),
+      'utf8',
+    );
+    await expect(
+      core.recoverPendingTxn(store.runtimeDir, undefined, store.deckDir),
+    ).rejects.toBeInstanceOf(core.CorruptDataError);
+    expect(await fs.stat(taskPath)).toBeTruthy();
+    expect(await fs.readFile(eventsPath, 'utf8')).toBe(eventsBefore);
+
+    // Case 2: unparseable JSON line
+    await fs.writeFile(
+      txnPath,
+      JSON.stringify({
+        id: 'txn_c6_badjson',
+        boardSlug: 'main',
+        ops: [{ kind: 'unlink', finalPath: `boards/main/tasks/${task.id}.md` }],
+        events: [
+          {
+            eventsPath: 'boards/main/events.jsonl',
+            eventId: 'evt_expected',
+            line: '{not-valid-json\n',
+          },
+        ],
+      }),
+      'utf8',
+    );
+    await expect(
+      core.recoverPendingTxn(store.runtimeDir, undefined, store.deckDir),
+    ).rejects.toBeInstanceOf(core.CorruptDataError);
+    expect(await fs.stat(taskPath)).toBeTruthy();
+    expect(await fs.readFile(eventsPath, 'utf8')).toBe(eventsBefore);
+
+    // Case 3: multi-line JSONL injection inside events[].line
+    await fs.writeFile(
+      txnPath,
+      JSON.stringify({
+        id: 'txn_c6_multiline',
+        boardSlug: 'main',
+        ops: [{ kind: 'unlink', finalPath: `boards/main/tasks/${task.id}.md` }],
+        events: [
+          {
+            eventsPath: 'boards/main/events.jsonl',
+            eventId: 'evt_expected',
+            line: '{"id":"evt_expected"}\n{"id":"evt_injected"}\n',
+          },
+        ],
+      }),
+      'utf8',
+    );
+    await expect(
+      core.recoverPendingTxn(store.runtimeDir, undefined, store.deckDir),
+    ).rejects.toBeInstanceOf(core.CorruptDataError);
+    expect(await fs.stat(taskPath)).toBeTruthy();
+    expect(await fs.readFile(eventsPath, 'utf8')).toBe(eventsBefore);
+  }, FSYNC_TEST_TIMEOUT_MS);
+
   it('H1: stores relative paths inside txn.json during faulted writes', async () => {
     const dir = await makeTempDir('cdeck-h1-rel-');
     const store = new core.ContextDeckStore(dir);

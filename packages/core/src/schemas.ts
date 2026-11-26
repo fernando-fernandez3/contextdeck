@@ -9,6 +9,16 @@ export const EntityIdSchema = z
   .string()
   .regex(ENTITY_ID_REGEX, 'Entity ID must be alphanumeric, dash, or underscore (max 81 chars)');
 
+export const IsoDateTimeSchema = z
+  .string()
+  .regex(
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/,
+    'Timestamp must be a valid ISO-8601 datetime string',
+  )
+  .refine((value) => Number.isFinite(Date.parse(value)), {
+    message: 'Timestamp must be a parseable ISO-8601 datetime string',
+  });
+
 export const HttpUrlSchema = z.string().refine(
   (value) => {
     try {
@@ -60,8 +70,8 @@ export const BoardConfigSchema = z.object({
   description: z.string().default(''),
   revision: z.number().int().min(1).default(1),
   lenses: z.array(LensConfigSchema).default(DEFAULT_LENSES),
-  createdAt: z.string(),
-  updatedAt: z.string(),
+  createdAt: IsoDateTimeSchema,
+  updatedAt: IsoDateTimeSchema,
 });
 
 export type BoardConfig = z.infer<typeof BoardConfigSchema>;
@@ -80,8 +90,8 @@ export const SessionSchema = z.object({
   summary: z.string().default(''),
   focusFiles: z.array(z.string()).default([]),
   lastSyncedRevision: z.number().int().min(0).default(1),
-  createdAt: z.string(),
-  updatedAt: z.string(),
+  createdAt: IsoDateTimeSchema,
+  updatedAt: IsoDateTimeSchema,
 });
 
 export type Session = z.infer<typeof SessionSchema>;
@@ -99,8 +109,8 @@ export const DecisionSchema = z.object({
   tags: z.array(z.string()).default([]),
   summary: z.string().default(''),
   rationale: z.string().default(''),
-  createdAt: z.string(),
-  updatedAt: z.string(),
+  createdAt: IsoDateTimeSchema,
+  updatedAt: IsoDateTimeSchema,
 });
 
 export type Decision = z.infer<typeof DecisionSchema>;
@@ -121,8 +131,8 @@ export const TaskSchema = z.object({
   linkedDecisionIds: z.array(EntityIdSchema).default([]),
   tags: z.array(z.string()).default([]),
   description: z.string().default(''),
-  createdAt: z.string(),
-  updatedAt: z.string(),
+  createdAt: IsoDateTimeSchema,
+  updatedAt: IsoDateTimeSchema,
 });
 
 export type Task = z.infer<typeof TaskSchema>;
@@ -139,8 +149,8 @@ export const DiagramSchema = z.object({
   basedOnDecisions: z.array(EntityIdSchema).default([]),
   sessionId: EntityIdSchema.nullable().optional(),
   boardRevisionAtUpdate: z.number().int().min(1).default(1),
-  createdAt: z.string(),
-  updatedAt: z.string(),
+  createdAt: IsoDateTimeSchema,
+  updatedAt: IsoDateTimeSchema,
 });
 
 export type Diagram = z.infer<typeof DiagramSchema>;
@@ -162,7 +172,7 @@ export type QuizQuestion = z.infer<typeof QuizQuestionSchema>;
 
 export const QuizAttemptSchema = z.object({
   id: EntityIdSchema,
-  takenAt: z.string(),
+  takenAt: IsoDateTimeSchema,
   score: z.number().int().nonnegative(),
   total: z.number().int().positive(),
   percentage: z.number().min(0).max(100),
@@ -182,8 +192,8 @@ export const QuizSchema = z.object({
   basedOnDecisions: z.array(EntityIdSchema).default([]),
   sessionId: EntityIdSchema.nullable().optional(),
   boardRevisionAtUpdate: z.number().int().min(1).default(1),
-  createdAt: z.string(),
-  updatedAt: z.string(),
+  createdAt: IsoDateTimeSchema,
+  updatedAt: IsoDateTimeSchema,
 });
 
 export type Quiz = z.infer<typeof QuizSchema>;
@@ -215,8 +225,8 @@ export const MediaArtifactSchema = z.object({
   boardRevisionAtUpdate: z.number().int().min(1).default(1),
   customLensId: EntityIdSchema.optional(),
   metadata: z.record(z.string(), z.unknown()).default({}),
-  createdAt: z.string(),
-  updatedAt: z.string(),
+  createdAt: IsoDateTimeSchema,
+  updatedAt: IsoDateTimeSchema,
 });
 
 export type MediaArtifact = z.infer<typeof MediaArtifactSchema>;
@@ -235,7 +245,7 @@ export type Actor = z.infer<typeof ActorSchema>;
 export const BoardEventSchema = z.object({
   id: EntityIdSchema,
   revision: z.number().int().min(1),
-  timestamp: z.string(),
+  timestamp: IsoDateTimeSchema,
   actor: ActorSchema,
   kind: z.string().min(1),
   entityId: z.string().optional(),

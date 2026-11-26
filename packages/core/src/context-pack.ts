@@ -101,11 +101,18 @@ export function generateContextPack(
     maxChars = DEFAULT_MAX_CHARS,
   } = options;
 
+  const safeTitle = neutralizeUntrustedDelimiters(
+    capSingleLine(String(snapshot.config.title), MAX_TITLE_CHARS),
+  );
+  const safeSlug = neutralizeUntrustedDelimiters(capSingleLine(String(snapshot.config.slug), 100));
+  const safeUpdatedAt = neutralizeUntrustedDelimiters(
+    capSingleLine(String(snapshot.config.updatedAt), 64),
+  );
   const headerLines = [
-    `# ContextDeck Shared Context: ${neutralizeUntrustedDelimiters(capSingleLine(snapshot.config.title, MAX_TITLE_CHARS))}`,
-    `> Board: \`${snapshot.config.slug}\` | Revision: \`rev ${snapshot.config.revision}\` | Updated: ${snapshot.config.updatedAt}`,
+    `# ContextDeck Shared Context: ${safeTitle}`,
+    `> Board: \`${safeSlug}\` | Revision: \`rev ${snapshot.config.revision}\` | Updated: ${safeUpdatedAt}`,
   ];
-  const header = headerLines.join('\n');
+  const header = neutralizeUntrustedDelimiters(headerLines.join('\n'));
   const protocolBlock = includeUpdateProtocol
     ? `\n\n${buildUpdateProtocolBlock(snapshot.config.revision)}`
     : '';

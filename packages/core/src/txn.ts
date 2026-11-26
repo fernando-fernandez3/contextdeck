@@ -589,10 +589,34 @@ async function validateAndResolveTxnJournal(
       }
     }
     await assertBoardDirSafe(evInfo.canonicalSegments[1], `events[${i}].eventsPath`);
+    const trimmedLine = ev.line.trim();
+    if (!trimmedLine || trimmedLine.includes('\n') || trimmedLine.includes('\r')) {
+      throw new CorruptDataError(
+        `Invalid transaction journal events[${i}].line: must be a single JSON line.`,
+      );
+    }
+    let parsedEvent: unknown;
+    try {
+      parsedEvent = JSON.parse(trimmedLine);
+    } catch (err) {
+      throw new CorruptDataError(
+        `Invalid transaction journal events[${i}].line: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (
+      !parsedEvent ||
+      typeof parsedEvent !== 'object' ||
+      Array.isArray(parsedEvent) ||
+      (parsedEvent as { id?: unknown }).id !== ev.eventId
+    ) {
+      throw new CorruptDataError(
+        `Invalid transaction journal events[${i}].line: parsed event id does not match eventId "${ev.eventId}".`,
+      );
+    }
     resolvedEvents.push({
       eventsPath: evInfo.absPath,
       eventId: ev.eventId,
-      line: ev.line,
+      line: ev.line.endsWith('\n') ? ev.line : `${trimmedLine}\n`,
     });
   }
 
