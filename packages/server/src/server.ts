@@ -21,12 +21,13 @@ export interface StartServerOptions {
   bootstrapTtlMs?: number;
 }
 
-export function resolveDefaultWebDistDir(): string | undefined {
-  const here = path.dirname(fileURLToPath(import.meta.url));
+export function resolveDefaultWebDistDir(
+  baseDir: string = path.dirname(fileURLToPath(import.meta.url)),
+): string | undefined {
   const candidates = [
-    path.resolve(here, '../web-dist'),
-    path.resolve(here, '../../web/dist'),
-    path.resolve(here, '../../../web/dist'),
+    path.resolve(baseDir, '../../web/dist'),
+    path.resolve(baseDir, '../../../web/dist'),
+    path.resolve(baseDir, '../web-dist'),
   ];
   return candidates.find((p) => fs.existsSync(path.join(p, 'index.html')));
 }

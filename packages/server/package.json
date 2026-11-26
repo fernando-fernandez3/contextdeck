@@ -31,7 +31,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "prepack": "pnpm run build && node ./scripts/copy-web-dist.mjs",
+    "prepack": "pnpm --filter @contextdeck/web build && pnpm run build && node ./scripts/copy-web-dist.mjs",
+    "postpack": "node -e \"require('node:fs').rmSync('web-dist', { recursive: true, force: true })\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },

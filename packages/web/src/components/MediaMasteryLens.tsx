@@ -640,12 +640,13 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
                 <div className="space-y-3">
                   {activeMedia.filePath || isSafeHttpUrl(activeMedia.externalUrl) ? (
                     <video
+                      key={activeMedia.filePath ?? activeMedia.externalUrl ?? activeMedia.id}
                       ref={videoRef}
                       controls
                       className="w-full rounded-lg border border-zinc-800 bg-black max-h-[400px]"
                       src={
                         activeMedia.filePath
-                          ? `/api/boards/${encodeURIComponent(snapshot.config.slug)}/media/${encodeURIComponent(activeMedia.id)}/file`
+                          ? `/api/boards/${encodeURIComponent(snapshot.config.slug)}/media/${encodeURIComponent(activeMedia.id)}/file?v=${activeMedia.version ?? 1}`
                           : activeMedia.externalUrl
                       }
                     />
@@ -698,9 +699,10 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
 
               {activeMedia.kind === 'audio' && activeMedia.filePath && (
                 <audio
+                  key={activeMedia.filePath ?? activeMedia.id}
                   controls
                   className="w-full"
-                  src={`/api/boards/${encodeURIComponent(snapshot.config.slug)}/media/${encodeURIComponent(activeMedia.id)}/file`}
+                  src={`/api/boards/${encodeURIComponent(snapshot.config.slug)}/media/${encodeURIComponent(activeMedia.id)}/file?v=${activeMedia.version ?? 1}`}
                 />
               )}
 

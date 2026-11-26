@@ -7,6 +7,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { ContextDeckStore } from '@contextdeck/core';
 import { createApp } from '../src/app.js';
 import { createContextDeckMcpServer } from '../src/mcp.js';
+import { resolveDefaultWebDistDir } from '../src/server.js';
 
 const tmpDirs: string[] = [];
 
@@ -218,9 +219,17 @@ describe('B3 Server: REST catchup, confirmations, jobs, and versioned updates', 
         },
       );
       expect(goodMultipart.status).toBe(200);
-      const patchedMedia = (await goodMultipart.json()) as { version: number; filePath: string };
+      const patchedMedia = (await goodMultipart.json()) as {
+        version: number;
+        filePath: string;
+        history: Array<{ version: number; actor?: { type: string; label?: string } }>;
+      };
       expect(patchedMedia.version).toBe(2);
       expect(patchedMedia.filePath).toBe(`${media.id}.v2.mp4`);
+      // H19: bearer multipart PATCH must NOT label actor as human/web-ui
+      const v2Hist = patchedMedia.history.find((h) => h.version === 2);
+      expect(v2Hist?.actor?.type).toBe('agent');
+      expect(v2Hist?.actor?.label).not.toBe('web-ui');
 
       const doneM = await app.request(
         `http://127.0.0.1:4310/api/boards/main/jobs/${mJob.id}/complete`,
@@ -563,5 +572,28 @@ describe('B3 Server: MCP artifact_confirm, job_*, media_update, quiz_update', ()
       await client.close();
       await mcpServer.close();
     }
+  });
+});
+
+describe('B3 Hardening G4: Packaging web-dist resolver order (H16)', () => {
+  it('H16: prefers monorepo ../../web/dist over packed ../web-dist when both exist, falling back to ../web-dist', async () => {
+    const base = await makeTempDir('cdeck-h16-');
+    const serverDist = path.join(base, 'packages', 'server', 'dist');
+    const serverWebDist = path.join(base, 'packages', 'server', 'web-dist');
+    const monoWebDist = path.join(base, 'packages', 'web', 'dist');
+    await fs.mkdir(serverDist, { recursive: true });
+    await fs.mkdir(serverWebDist, { recursive: true });
+    await fs.mkdir(monoWebDist, { recursive: true });
+
+    // Neither has index.html yet -> undefined
+    expect(resolveDefaultWebDistDir(serverDist)).toBeUndefined();
+
+    // Only ../web-dist exists -> returns ../web-dist (installed npm package case)
+    await fs.writeFile(path.join(serverWebDist, 'index.html'), '<html>packed</html>', 'utf8');
+    expect(resolveDefaultWebDistDir(serverDist)).toBe(serverWebDist);
+
+    // Both exist (monorepo checkout after pack) -> prefers ../../web/dist!
+    await fs.writeFile(path.join(monoWebDist, 'index.html'), '<html>monorepo</html>', 'utf8');
+    expect(resolveDefaultWebDistDir(serverDist)).toBe(monoWebDist);
   });
 });

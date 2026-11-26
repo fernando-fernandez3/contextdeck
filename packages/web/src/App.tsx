@@ -61,7 +61,27 @@ export function App() {
   const [authenticated, setAuthenticated] = useState(false);
   const [packModal, setPackModal] = useState<'export' | 'import' | null>(null);
   const [overflowOpen, setOverflowOpen] = useState(false);
-  const [theme, setTheme] = useState<'dark' | 'light'>('dark');
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
+    try {
+      const saved = window.localStorage.getItem('contextdeck_theme');
+      if (saved === 'light' || saved === 'dark') return saved;
+    } catch {
+      // ignore storage errors
+    }
+    return 'dark';
+  });
+
+  const toggleTheme = useCallback(() => {
+    setTheme((prev) => {
+      const next = prev === 'dark' ? 'light' : 'dark';
+      try {
+        window.localStorage.setItem('contextdeck_theme', next);
+      } catch {
+        // ignore storage errors
+      }
+      return next;
+    });
+  }, []);
 
   // Create Board modal
   const [showNewBoard, setShowNewBoard] = useState(false);
@@ -79,7 +99,8 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    document.documentElement.classList.toggle('light', theme === 'light');
+    document.documentElement.classList.remove('dark', 'light');
+    document.documentElement.classList.add(theme);
   }, [theme]);
 
   useEffect(() => {
@@ -191,7 +212,7 @@ export function App() {
   const hasDemoBoard = boards.some((b) => b.slug === 'realtime-sync-v2');
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col min-w-0 overflow-x-clip">
+    <div className="cd-app-shell min-h-screen bg-zinc-950 text-zinc-100 flex flex-col min-w-0 overflow-x-clip">
       <header className="sticky top-0 z-30 border-b border-zinc-800 bg-zinc-950">
         <div className="max-w-[1440px] mx-auto px-3 sm:px-6 h-14 flex items-center justify-between gap-2 sm:gap-4 min-w-0">
           <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1">
@@ -290,9 +311,9 @@ export function App() {
 
             <button
               type="button"
-              onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
+              onClick={toggleTheme}
               className="hidden md:inline-flex p-1.5 rounded-lg border border-zinc-800 bg-zinc-900 hover:bg-zinc-800 text-zinc-400 hover:text-zinc-100"
-              title="Toggle theme"
+              title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
               aria-label="Toggle theme"
             >
               {theme === 'dark' ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
@@ -364,7 +385,7 @@ export function App() {
                     type="button"
                     onClick={() => {
                       setOverflowOpen(false);
-                      setTheme((t) => (t === 'dark' ? 'light' : 'dark'));
+                      toggleTheme();
                     }}
                     className="w-full text-left px-3 py-2 text-xs text-zinc-200 hover:bg-zinc-800 flex items-center gap-2"
                   >
@@ -452,6 +473,7 @@ export function App() {
           >
             {activeLens === 'catchup' && catchUp && (
               <CatchUpLens
+                key={snapshot.config.slug}
                 boardSlug={snapshot.config.slug}
                 catchUp={catchUp}
                 onUpdated={() => void loadBoardsAndSnapshot(activeSlug)}
@@ -459,6 +481,7 @@ export function App() {
             )}
             {activeLens === 'brief' && (
               <BriefLens
+                key={snapshot.config.slug}
                 snapshot={snapshot}
                 onRefresh={() => void loadBoardsAndSnapshot(activeSlug)}
                 onNavigateLens={selectLens}
@@ -466,24 +489,28 @@ export function App() {
             )}
             {activeLens === 'sessions' && (
               <SessionsLens
+                key={snapshot.config.slug}
                 snapshot={snapshot}
                 onRefresh={() => void loadBoardsAndSnapshot(activeSlug)}
               />
             )}
             {activeLens === 'decisions' && (
               <DecisionsCanvasLens
+                key={snapshot.config.slug}
                 snapshot={snapshot}
                 onRefresh={() => void loadBoardsAndSnapshot(activeSlug)}
               />
             )}
             {activeLens === 'tasks' && (
               <TasksLens
+                key={snapshot.config.slug}
                 snapshot={snapshot}
                 onRefresh={() => void loadBoardsAndSnapshot(activeSlug)}
               />
             )}
             {activeLens === 'media' && (
               <MediaMasteryLens
+                key={snapshot.config.slug}
                 snapshot={snapshot}
                 onRefresh={() => void loadBoardsAndSnapshot(activeSlug)}
               />

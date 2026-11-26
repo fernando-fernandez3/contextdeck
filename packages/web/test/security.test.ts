@@ -49,6 +49,39 @@ describe('@contextdeck/web content security (Bug 7, AC2.7, AC2.9, D5)', () => {
     expect(cleaned.toLowerCase()).not.toContain('javascript:');
   });
 
+  it('H15: blocks protocol-relative //, <image>, SVG <style> @import/external url(), <form>/<input>, and non-fragment <use> hrefs', () => {
+    const v1 = sanitizeMermaidSvg('<svg><a href="//evil.example/phish"><text>x</text></a></svg>');
+    expect(v1).not.toContain('//evil.example');
+
+    const v2 = sanitizeMermaidSvg(
+      '<svg><image href="https://evil.example/pixel.png" width="10" height="10"/></svg>',
+    );
+    expect(v2.toLowerCase()).not.toContain('<image');
+    expect(v2).not.toContain('evil.example');
+
+    const v3 = sanitizeMermaidSvg(
+      '<svg><style>@import url("https://evil.example/x.css"); .node { background: url(https://evil.example/bg.png); fill: #fff; }</style><rect width="10" height="10"/></svg>',
+    );
+    expect(v3.toLowerCase()).not.toContain('@import');
+    expect(v3).not.toContain('evil.example');
+    expect(v3).toContain('fill: #fff');
+
+    const v4 = sanitizeMermaidSvg(
+      '<svg><foreignObject><div xmlns="http://www.w3.org/1999/xhtml"><form action="https://evil.example"><input name="x"/><textarea></textarea><button>Go</button></form><span>Safe Label</span></div></foreignObject></svg>',
+    );
+    expect(v4.toLowerCase()).not.toContain('<form');
+    expect(v4.toLowerCase()).not.toContain('<input');
+    expect(v4.toLowerCase()).not.toContain('<textarea');
+    expect(v4.toLowerCase()).not.toContain('<button');
+    expect(v4).toContain('Safe Label');
+
+    const v5 = sanitizeMermaidSvg(
+      '<svg><use href="https://evil.example/sprite.svg#x"/><use href="#local-arrow"/></svg>',
+    );
+    expect(v5).not.toContain('evil.example');
+    expect(v5).toContain('#local-arrow');
+  });
+
   it('wraps HTML artifact srcDoc with strict no-network CSP meta tag', () => {
     const rawFragment = '<h1>Widget</h1><script>console.log(1)</script>';
     const wrapped1 = wrapHtmlArtifactSrcDoc(rawFragment);

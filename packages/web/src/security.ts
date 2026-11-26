@@ -11,7 +11,18 @@ export const MERMAID_CONFIG = {
   fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
 };
 
-const SAFE_URI_REGEX = /^(?:https?:\/\/|mailto:|\/|#)/i;
+const SAFE_URI_REGEX = /^(?:https?:\/\/|mailto:|\/(?!\/)|#)/i;
+const SAFE_SVG_URI_REGEX = /^(?:https?:\/\/|\/(?!\/)|#|[^a-z/\s]|(?![a-z][a-z0-9+.\-]*:)[a-z])/i;
+
+function sanitizeSvgStyleText(cssText: string): string {
+  // Strip CSS comments that could obfuscate @import or url(), strip @import rules,
+  // and replace any external/non-fragment url(...) with none (H15, D5).
+  return cssText
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/@(?:\\69|\\49|i)(?:\\6d|\\4d|m)(?:\\70|\\50|p)(?:\\6f|\\4f|o)(?:\\72|\\52|r)(?:\\74|\\54|t)\b[^;]*(?:;|$)/gi, '')
+    .replace(/@import\b[^;]*(?:;|$)/gi, '')
+    .replace(/url\(\s*(?:(['"])\s*(?!#)[\s\S]*?\1|(?!\s*['"]?\s*#)[^)]*)\)/gi, 'none');
+}
 
 export function isSafeHttpUrl(url: string | undefined | null): boolean {
   if (!url) return false;
@@ -43,24 +54,72 @@ export function sanitizeMarkdownHtml(markdown: string): string {
 }
 
 export function sanitizeMermaidSvg(svg: string): string {
-  return DOMPurify.sanitize(svg || '', {
-    USE_PROFILES: { svg: true, svgFilters: true, html: true },
-    ADD_TAGS: ['foreignObject'],
-    HTML_INTEGRATION_POINTS: { foreignobject: true },
-    FORBID_TAGS: ['script', 'iframe', 'object', 'embed'],
-    FORBID_ATTR: [
-      'onload',
-      'onerror',
-      'onclick',
-      'onmouseover',
-      'onfocus',
-      'onblur',
-      'onmouseenter',
-    ],
-    // Allow https?:// URIs and non-scheme SVG attribute values (viewBox, transform, d, url(#id), etc.)
-    // while strictly rejecting javascript:, data:, vbscript:, file:, etc.
-    ALLOWED_URI_REGEXP: /^(?:https?:\/\/|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
-  });
+  const attrHook = (
+    node: Element,
+    data: { attrName: string; attrValue: string; keepAttr: boolean },
+  ) => {
+    const attrName = data.attrName.toLowerCase();
+    const val = (data.attrValue ?? '').trim();
+    if (
+      (attrName === 'href' ||
+        attrName === 'xlink:href' ||
+        attrName === 'src' ||
+        attrName === 'action' ||
+        attrName === 'formaction') &&
+      val.startsWith('//')
+    ) {
+      data.keepAttr = false;
+      return;
+    }
+    if (node.tagName.toLowerCase() === 'use' && (attrName === 'href' || attrName === 'xlink:href')) {
+      if (!/^#[A-Za-z0-9_.:-]+$/.test(val)) {
+        data.keepAttr = false;
+      }
+    }
+  };
+
+  const elemHook = (node: Node) => {
+    if (node.nodeType === 1) {
+      const el = node as Element;
+      if (el.tagName.toLowerCase() === 'style' && el.textContent) {
+        el.textContent = sanitizeSvgStyleText(el.textContent);
+      }
+    }
+  };
+
+  DOMPurify.addHook('uponSanitizeAttribute', attrHook);
+  DOMPurify.addHook('afterSanitizeElements', elemHook);
+  try {
+    return DOMPurify.sanitize(svg || '', {
+      USE_PROFILES: { svg: true, svgFilters: true, html: true },
+      ADD_TAGS: ['foreignObject', 'use'],
+      HTML_INTEGRATION_POINTS: { foreignobject: true },
+      FORBID_TAGS: [
+        'script',
+        'iframe',
+        'object',
+        'embed',
+        'form',
+        'input',
+        'textarea',
+        'button',
+        'image',
+      ],
+      FORBID_ATTR: [
+        'onload',
+        'onerror',
+        'onclick',
+        'onmouseover',
+        'onfocus',
+        'onblur',
+        'onmouseenter',
+      ],
+      ALLOWED_URI_REGEXP: SAFE_SVG_URI_REGEX,
+    });
+  } finally {
+    DOMPurify.removeHook('uponSanitizeAttribute');
+    DOMPurify.removeHook('afterSanitizeElements');
+  }
 }
 
 export function wrapHtmlArtifactSrcDoc(html: string): string {

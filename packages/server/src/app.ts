@@ -11,6 +11,7 @@ import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/
 import { z } from 'zod';
 import {
   AckReaderCursorInputSchema,
+  ActorSchema,
   ClaimJobInputSchema,
   CompleteJobInputSchema,
   ContextDeckError,
@@ -790,6 +791,7 @@ export function createApp(options: AppOptions): {
       let jobId: string | undefined;
       let leaseToken: string | undefined;
       let note: string | undefined;
+      let bodyActor: Actor | undefined;
       try {
         title = parsed.fields.title?.trim() ? parsed.fields.title.trim().slice(0, 300) : undefined;
         transcript = parsed.fields.transcript !== undefined ? parsed.fields.transcript : undefined;
@@ -813,12 +815,29 @@ export function createApp(options: AppOptions): {
           ? parsed.fields.leaseToken.trim().slice(0, 128)
           : undefined;
         note = parsed.fields.note?.trim() ? parsed.fields.note.trim().slice(0, 500) : undefined;
+        if (parsed.fields.actor?.trim()) {
+          let rawActor: unknown;
+          try {
+            rawActor = JSON.parse(parsed.fields.actor);
+          } catch {
+            throw new ValidationError('Invalid actor JSON field.');
+          }
+          bodyActor = parseBodyStrict(ActorSchema, rawActor);
+        }
       } catch (err) {
         if (parsed.file?.tmpPath) {
           await fsp.rm(parsed.file.tmpPath, { force: true }).catch(() => {});
         }
         throw err;
       }
+
+      // H19 / Claude N3: Cookie auth (browser) records human actor; bearer auth defaults to agent actor.
+      const auth = c.get('auth');
+      const defaultHumanLabel = resolveDefaultReaderLabel({ projectRoot: store.projectRoot });
+      const actor: Actor =
+        auth?.kind === 'cookie'
+          ? { type: 'human', label: bodyActor?.label || defaultHumanLabel }
+          : bodyActor ?? { type: 'agent', label: 'api-bearer' };
 
       const media = await store.updateMedia(
         slug,
@@ -840,7 +859,7 @@ export function createApp(options: AppOptions): {
             : {}),
           maxBytes: maxMediaBytes,
         },
-        { type: 'human', label: 'web-ui' },
+        actor,
       );
       broadcast('board.changed', slug);
       return c.json(media);

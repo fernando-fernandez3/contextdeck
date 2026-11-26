@@ -2,18 +2,28 @@ import { useEffect, useId, useState } from 'react';
 import mermaid from 'mermaid';
 import { MERMAID_CONFIG, sanitizeMermaidSvg } from '../security';
 
-let initialized = false;
-
 export default function MermaidDiagram({ code }: { code: string }) {
   const reactId = useId().replace(/:/g, '');
   const [svg, setSvg] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
+  const [isLight, setIsLight] = useState<boolean>(() =>
+    typeof document !== 'undefined' ? document.documentElement.classList.contains('light') : false,
+  );
 
   useEffect(() => {
-    if (!initialized) {
-      mermaid.initialize(MERMAID_CONFIG);
-      initialized = true;
-    }
+    if (typeof document === 'undefined') return;
+    const syncTheme = () => setIsLight(document.documentElement.classList.contains('light'));
+    syncTheme();
+    const observer = new MutationObserver(syncTheme);
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    mermaid.initialize({
+      ...MERMAID_CONFIG,
+      theme: isLight ? 'default' : 'dark',
+    });
     let active = true;
     mermaid
       .render(`mmd_${reactId}_${Date.now()}`, code || 'flowchart LR\n  A[Empty Diagram]')
@@ -29,7 +39,7 @@ export default function MermaidDiagram({ code }: { code: string }) {
     return () => {
       active = false;
     };
-  }, [code, reactId]);
+  }, [code, reactId, isLight]);
 
   if (error) {
     return (
