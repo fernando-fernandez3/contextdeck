@@ -2,9 +2,13 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import {
+  BoardSlugSchema,
+  ConflictError,
   ContextDeckStore,
   DecisionStatusSchema,
   DiagramKindSchema,
+  EntityIdSchema,
+  HttpUrlSchema,
   MediaKindSchema,
   QuizQuestionSchema,
   SessionStatusSchema,
@@ -12,19 +16,39 @@ import {
   TaskPrioritySchema,
   generateContextPack,
 } from '@contextdeck/core';
+import { validateMcpMediaSourcePath } from './security.js';
+
+const MCP_MAX_BRIEF_CHARS = 200 * 1024; // 200 KB (E2 amended)
+const MCP_MAX_TEXT_CHARS = 20 * 1024; // 20 KB (E2 amended)
+
+export interface CreateMcpServerOptions {
+  defaultBoard?: string;
+  onMutate?: (boardSlug: string) => void;
+  env?: NodeJS.ProcessEnv;
+  homeDir?: string;
+  maxMediaBytes?: number;
+}
 
 export function createContextDeckMcpServer(
   store: ContextDeckStore,
-  defaultBoard?: string,
-  onMutate?: (boardSlug: string) => void,
+  defaultBoardOrOptions?: string | CreateMcpServerOptions,
+  onMutateLegacy?: (boardSlug: string) => void,
 ): McpServer {
+  const options: CreateMcpServerOptions =
+    typeof defaultBoardOrOptions === 'string' || defaultBoardOrOptions === undefined
+      ? { defaultBoard: defaultBoardOrOptions, onMutate: onMutateLegacy }
+      : defaultBoardOrOptions;
+
+  const { defaultBoard, onMutate, env, homeDir } = options;
+  const maxMediaBytes = options.maxMediaBytes ?? store.maxMediaBytes;
+
   const server = new McpServer({
     name: 'contextdeck',
-    version: '0.1.0',
+    version: '0.2.0',
   });
 
+  // D4 / D9: Never auto-initialize a workspace or call ensureDefaultBoard()!
   const resolveSlug = async (board?: string) => {
-    await store.ensureDefaultBoard();
     return store.resolveBoardSlug(board ?? defaultBoard);
   };
 
@@ -36,9 +60,8 @@ export function createContextDeckMcpServer(
       inputSchema: {},
     },
     async () => {
-      await store.ensureDefaultBoard();
       const boards = await store.listBoards();
-      const def = await store.getDefaultBoardSlug();
+      const def = boards.length > 0 ? await store.getDefaultBoardSlug() : null;
       return {
         content: [
           {
@@ -55,33 +78,37 @@ export function createContextDeckMcpServer(
     {
       title: 'Get Shared Context Brief',
       description:
-        'Retrieve the compact, up-to-date shared mental model (brief, active decisions, open tasks, linked sessions, and stale artifact warnings). Pass sessionId to automatically mark your session synced to the latest revision.',
+        'Retrieve the compact, up-to-date shared mental model (brief, active decisions, open tasks, linked sessions, and stale artifact warnings). Pass sessionId to mark your session synced to the exact revision returned.',
       inputSchema: {
-        board: z.string().optional().describe('Optional board slug; defaults to active board'),
-        sessionId: z
-          .string()
-          .optional()
-          .describe('Optional session ID to mark synced to the latest revision'),
+        board: BoardSlugSchema.optional().describe('Optional board slug; defaults to active board'),
+        sessionId: EntityIdSchema.optional().describe(
+          'Optional session ID to mark synced to the revision returned',
+        ),
+        maxChars: z.number().int().min(500).max(100_000).optional(),
       },
     },
-    async ({ board, sessionId }) => {
+    async ({ board, sessionId, maxChars }) => {
       const slug = await resolveSlug(board);
+      // D7: Read snapshot FIRST, then acknowledge exact snapshot.config.revision!
+      const snapshot = await store.getSnapshot(slug);
       let missedSummary = '';
       if (sessionId) {
         try {
-          const synced = await store.syncSession(slug, sessionId);
-          if (synced.missedEvents.length > 0) {
-            missedSummary = `\n\n### Missed Updates Synced for ${sessionId}\n${synced.missedEvents
-              .map((e) => `- rev ${e.revision} (${e.kind}): ${e.summary}`)
-              .join('\n')}\n`;
+          const synced = await store.syncSession(slug, sessionId, {
+            ackRevision: snapshot.config.revision,
+          });
+          if (synced.digest.length > 0 && synced.digestText) {
+            missedSummary = `\n\n### Missed Updates Synced for ${sessionId}\n${synced.digestText}\n`;
           }
           onMutate?.(slug);
         } catch {
-          // session may not exist yet; proceed with brief
+          // session may not exist yet; still return the brief
         }
       }
-      const snapshot = await store.getSnapshot(slug);
-      const pack = generateContextPack(snapshot, { includeUpdateProtocol: false });
+      const pack = generateContextPack(snapshot, {
+        includeUpdateProtocol: false,
+        maxChars,
+      });
       return {
         content: [{ type: 'text', text: pack + missedSummary }],
       };
@@ -92,25 +119,59 @@ export function createContextDeckMcpServer(
     'board_update_brief',
     {
       title: 'Update Living Brief',
-      description: 'Update the shared Markdown mental-model brief for the board.',
+      description:
+        'Update the shared Markdown mental-model brief for the board. REQUIRES `baseRevision` taken from your most recent `board_get_brief` response so concurrent edits are never silently overwritten.',
       inputSchema: {
-        board: z.string().optional(),
-        brief: z.string().min(1).describe('Full updated Markdown brief'),
-        harness: z.string().optional(),
-        sessionId: z.string().optional(),
+        board: BoardSlugSchema.optional(),
+        brief: z.string().min(1).max(MCP_MAX_BRIEF_CHARS).describe('Full updated Markdown brief'),
+        baseRevision: z
+          .number()
+          .int()
+          .min(1)
+          .describe('Board revision from your latest board_get_brief call (required for optimistic concurrency)'),
+        harness: z.string().max(100).optional(),
+        sessionId: EntityIdSchema.optional(),
       },
     },
-    async ({ board, brief, harness, sessionId }) => {
+    async ({ board, brief, baseRevision, harness, sessionId }) => {
       const slug = await resolveSlug(board);
-      const res = await store.updateBrief(slug, brief, {
-        type: 'agent',
-        harness: harness ?? 'mcp',
-        sessionId,
-      });
-      onMutate?.(slug);
-      return {
-        content: [{ type: 'text', text: JSON.stringify(res, null, 2) }],
-      };
+      try {
+        const res = await store.updateBrief(
+          slug,
+          brief,
+          {
+            type: 'agent',
+            harness: harness ?? 'mcp',
+            sessionId,
+          },
+          { baseRevision },
+        );
+        onMutate?.(slug);
+        return {
+          content: [{ type: 'text', text: JSON.stringify(res, null, 2) }],
+        };
+      } catch (err) {
+        if (err instanceof ConflictError) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(
+                  {
+                    error: err.message,
+                    code: err.code,
+                    ...err.details,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+        throw err;
+      }
     },
   );
 
@@ -119,9 +180,9 @@ export function createContextDeckMcpServer(
     {
       title: 'Check Session Drift & Stale Artifacts',
       description:
-        'Check which artifacts (diagrams, videos, quizzes, tasks) are stale due to superseded decisions, and which agent sessions are behind the latest board revision.',
+        'Check which artifacts (diagrams, videos, quizzes, tasks) are stale due to superseded decisions, and which active agent sessions are behind the latest board revision.',
       inputSchema: {
-        board: z.string().optional(),
+        board: BoardSlugSchema.optional(),
       },
     },
     async ({ board }) => {
@@ -140,15 +201,15 @@ export function createContextDeckMcpServer(
       description:
         'Register this agent session on the shared board, optionally linking it under a parentSessionId to form a hierarchical session tree across harnesses.',
       inputSchema: {
-        board: z.string().optional(),
-        id: z.string().optional(),
-        title: z.string().min(1),
-        harness: z.string().default('mcp'),
-        parentSessionId: z.string().nullable().optional(),
-        relatedSessionIds: z.array(z.string()).optional(),
-        externalRef: z.string().optional(),
-        summary: z.string().optional(),
-        focusFiles: z.array(z.string()).optional(),
+        board: BoardSlugSchema.optional(),
+        id: EntityIdSchema.optional(),
+        title: z.string().min(1).max(300),
+        harness: z.string().max(100).default('mcp'),
+        parentSessionId: EntityIdSchema.nullable().optional(),
+        relatedSessionIds: z.array(EntityIdSchema).max(100).optional(),
+        externalRef: z.string().max(500).optional(),
+        summary: z.string().max(MCP_MAX_TEXT_CHARS).optional(),
+        focusFiles: z.array(z.string().max(500)).max(200).optional(),
       },
     },
     async ({ board, ...input }) => {
@@ -170,14 +231,14 @@ export function createContextDeckMcpServer(
       title: 'Update Agent Session',
       description: 'Update summary, status, focus files, or parent/sibling links for a session.',
       inputSchema: {
-        board: z.string().optional(),
-        sessionId: z.string().min(1),
-        title: z.string().optional(),
+        board: BoardSlugSchema.optional(),
+        sessionId: EntityIdSchema,
+        title: z.string().min(1).max(300).optional(),
         status: SessionStatusSchema.optional(),
-        summary: z.string().optional(),
-        parentSessionId: z.string().nullable().optional(),
-        relatedSessionIds: z.array(z.string()).optional(),
-        focusFiles: z.array(z.string()).optional(),
+        summary: z.string().max(MCP_MAX_TEXT_CHARS).optional(),
+        parentSessionId: EntityIdSchema.nullable().optional(),
+        relatedSessionIds: z.array(EntityIdSchema).max(100).optional(),
+        focusFiles: z.array(z.string().max(500)).max(200).optional(),
       },
     },
     async ({ board, sessionId, ...patch }) => {
@@ -200,15 +261,15 @@ export function createContextDeckMcpServer(
       description:
         'Record a new decision on the board. If `supersedes` is provided, the older decision is marked superseded and all dependent diagrams/videos/quizzes are automatically flagged stale.',
       inputSchema: {
-        board: z.string().optional(),
-        title: z.string().min(1),
-        summary: z.string().optional(),
-        rationale: z.string().optional(),
+        board: BoardSlugSchema.optional(),
+        title: z.string().min(1).max(300),
+        summary: z.string().max(MCP_MAX_TEXT_CHARS).optional(),
+        rationale: z.string().max(MCP_MAX_TEXT_CHARS).optional(),
         status: DecisionStatusSchema.optional(),
-        supersedes: z.string().nullable().optional(),
-        sessionId: z.string().nullable().optional(),
-        harness: z.string().optional(),
-        tags: z.array(z.string()).optional(),
+        supersedes: EntityIdSchema.nullable().optional(),
+        sessionId: EntityIdSchema.nullable().optional(),
+        harness: z.string().max(100).optional(),
+        tags: z.array(z.string().max(100)).max(50).optional(),
       },
     },
     async ({ board, harness, ...input }) => {
@@ -231,18 +292,18 @@ export function createContextDeckMcpServer(
       title: 'Create or Update Kanban Task',
       description: 'Add a new task or update an existing task column, priority, or decision links.',
       inputSchema: {
-        board: z.string().optional(),
-        id: z.string().optional(),
-        title: z.string().min(1),
+        board: BoardSlugSchema.optional(),
+        id: EntityIdSchema.optional(),
+        title: z.string().min(1).max(300),
         column: TaskColumnSchema.optional(),
         priority: TaskPrioritySchema.optional(),
-        assignee: z.string().optional(),
-        description: z.string().optional(),
-        linkedSessionIds: z.array(z.string()).optional(),
-        linkedDecisionIds: z.array(z.string()).optional(),
-        tags: z.array(z.string()).optional(),
-        harness: z.string().optional(),
-        sessionId: z.string().optional(),
+        assignee: z.string().max(120).optional(),
+        description: z.string().max(MCP_MAX_TEXT_CHARS).optional(),
+        linkedSessionIds: z.array(EntityIdSchema).max(100).optional(),
+        linkedDecisionIds: z.array(EntityIdSchema).max(100).optional(),
+        tags: z.array(z.string().max(100)).max(50).optional(),
+        harness: z.string().max(100).optional(),
+        sessionId: EntityIdSchema.optional(),
       },
     },
     async ({ board, harness, sessionId, ...input }) => {
@@ -266,15 +327,15 @@ export function createContextDeckMcpServer(
       description:
         'Create or update a Mermaid or Excalidraw diagram on the Architecture & Canvas lens.',
       inputSchema: {
-        board: z.string().optional(),
-        id: z.string().optional(),
-        title: z.string().min(1),
+        board: BoardSlugSchema.optional(),
+        id: EntityIdSchema.optional(),
+        title: z.string().min(1).max(300),
         kind: DiagramKindSchema.default('mermaid'),
-        content: z.string().min(1),
-        description: z.string().optional(),
-        basedOnDecisions: z.array(z.string()).optional(),
-        sessionId: z.string().nullable().optional(),
-        harness: z.string().optional(),
+        content: z.string().min(1).max(MCP_MAX_TEXT_CHARS),
+        description: z.string().max(MCP_MAX_TEXT_CHARS).optional(),
+        basedOnDecisions: z.array(EntityIdSchema).max(100).optional(),
+        sessionId: EntityIdSchema.nullable().optional(),
+        harness: z.string().max(100).optional(),
       },
     },
     async ({ board, harness, ...input }) => {
@@ -296,35 +357,55 @@ export function createContextDeckMcpServer(
     {
       title: 'Attach Media, Video, or Reference Doc',
       description:
-        'Attach an explainer video (.mp4/.webm), audio clip, Markdown doc, URL, HTML widget, or custom JSON artifact to the Media & Mastery lens.',
+        'Attach an explainer video (.mp4/.webm), audio clip, Markdown doc, URL, HTML widget, or custom JSON artifact to the Media & Mastery lens. Local sourceFilePath imports are restricted to regular non-hidden, non-secret files inside the project root or user-local ~/.contextdeck/config.yaml mediaRoots.',
       inputSchema: {
-        board: z.string().optional(),
-        title: z.string().min(1),
+        board: BoardSlugSchema.optional(),
+        title: z.string().min(1).max(300),
         kind: MediaKindSchema,
         sourceFilePath: z
           .string()
+          .max(1024)
           .optional()
-          .describe('Local file path to copy into board media storage'),
-        externalUrl: z.string().optional(),
-        content: z.string().optional(),
-        transcript: z.string().optional(),
+          .describe('Local file path inside projectRoot or user-local mediaRoots'),
+        externalUrl: HttpUrlSchema.optional(),
+        content: z.string().max(MCP_MAX_TEXT_CHARS).optional(),
+        transcript: z.string().max(MCP_MAX_TEXT_CHARS).optional(),
         chapters: z
-          .array(z.object({ timeSec: z.number().nonnegative(), title: z.string() }))
+          .array(z.object({ timeSec: z.number().nonnegative(), title: z.string().min(1).max(300) }))
+          .max(200)
           .optional(),
         durationSec: z.number().nonnegative().optional(),
-        tags: z.array(z.string()).optional(),
-        basedOnDecisions: z.array(z.string()).optional(),
-        sessionId: z.string().nullable().optional(),
-        harness: z.string().optional(),
+        tags: z.array(z.string().max(100)).max(50).optional(),
+        basedOnDecisions: z.array(EntityIdSchema).max(100).optional(),
+        sessionId: EntityIdSchema.nullable().optional(),
+        harness: z.string().max(100).optional(),
       },
     },
-    async ({ board, harness, ...input }) => {
+    async ({ board, harness, sourceFilePath, ...input }) => {
       const slug = await resolveSlug(board);
-      const media = await store.addMedia(slug, input, {
-        type: 'agent',
-        harness: harness ?? 'mcp',
-        sessionId: input.sessionId ?? undefined,
-      });
+      let safeSourcePath: string | undefined;
+      if (sourceFilePath !== undefined) {
+        safeSourcePath = await validateMcpMediaSourcePath(sourceFilePath, {
+          projectRoot: store.projectRoot,
+          deckDir: store.deckDir,
+          maxMediaBytes,
+          env,
+          homeDir,
+        });
+      }
+      const media = await store.addMedia(
+        slug,
+        {
+          ...input,
+          sourceFilePath: safeSourcePath,
+          maxBytes: maxMediaBytes,
+        },
+        {
+          type: 'agent',
+          harness: harness ?? 'mcp',
+          sessionId: input.sessionId ?? undefined,
+        },
+      );
       onMutate?.(slug);
       return {
         content: [{ type: 'text', text: JSON.stringify(media, null, 2) }],
@@ -339,14 +420,14 @@ export function createContextDeckMcpServer(
       description:
         'Publish an interactive quiz onto the Media & Mastery lens so the human can test their mental model and track mastery.',
       inputSchema: {
-        board: z.string().optional(),
-        title: z.string().min(1),
-        topic: z.string().optional(),
-        description: z.string().optional(),
-        questions: z.array(QuizQuestionSchema).min(1),
-        basedOnDecisions: z.array(z.string()).optional(),
-        sessionId: z.string().nullable().optional(),
-        harness: z.string().optional(),
+        board: BoardSlugSchema.optional(),
+        title: z.string().min(1).max(300),
+        topic: z.string().max(300).optional(),
+        description: z.string().max(MCP_MAX_TEXT_CHARS).optional(),
+        questions: z.array(QuizQuestionSchema).min(1).max(100),
+        basedOnDecisions: z.array(EntityIdSchema).max(100).optional(),
+        sessionId: EntityIdSchema.nullable().optional(),
+        harness: z.string().max(100).optional(),
       },
     },
     async ({ board, harness, ...input }) => {
@@ -370,11 +451,11 @@ export function createContextDeckMcpServer(
       description:
         'After updating a stale diagram, video, quiz, or task to reflect newer decisions, call this to realign its decision references and clear staleness alerts.',
       inputSchema: {
-        board: z.string().optional(),
+        board: BoardSlugSchema.optional(),
         artifactType: z.enum(['diagram', 'media', 'quiz', 'task']),
-        artifactId: z.string().min(1),
-        harness: z.string().optional(),
-        sessionId: z.string().optional(),
+        artifactId: EntityIdSchema,
+        harness: z.string().max(100).optional(),
+        sessionId: EntityIdSchema.optional(),
       },
     },
     async ({ board, artifactType, artifactId, harness, sessionId }) => {
@@ -449,7 +530,26 @@ export async function startStdioMcpServer(
   store: ContextDeckStore,
   defaultBoard?: string,
 ): Promise<void> {
-  const server = createContextDeckMcpServer(store, defaultBoard);
+  const server = createContextDeckMcpServer(store, { defaultBoard });
   const transport = new StdioServerTransport();
+
+  // D10: MCP stdio watches only boards/*/board.yaml (depth 2)
+  const watcher = store.isInitialized()
+    ? store.watch(
+        () => {
+          void server.server
+            .sendResourceUpdated({ uri: 'contextdeck://brief' })
+            .catch(() => {});
+        },
+        { scope: 'board-configs' },
+      )
+    : null;
+
+  transport.onclose = () => {
+    if (watcher) {
+      void watcher.close();
+    }
+  };
+
   await server.connect(transport);
 }
