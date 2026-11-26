@@ -565,7 +565,9 @@ describe('AC5.1-AC5.4 + AC5.9 + D11/D12/D14 cdeck hook contract fixtures and cro
     expect(hugeRes.stdout).toBe('');
     expect(hugeRes.elapsedMs).toBeLessThan(2000);
 
-    // Corrupt workspace -> empty stdout, exit 0, logged to .runtime/hooks.log
+    // H14: Corrupt workspace -> truncate hooks.log first so assertion proves this step wrote CorruptDataError / board.yaml
+    const hooksLogPath = path.join(store.runtimeDir, 'hooks.log');
+    await fs.rm(hooksLogPath, { force: true });
     await fs.writeFile(path.join(store.boardPath('main'), 'board.yaml'), ':::not valid yaml[[[', 'utf8');
     const corruptRes = await runCliWithStdin(['hook', 'claude-code', 'SessionStart'], {
       cwd: repo,
@@ -578,8 +580,9 @@ describe('AC5.1-AC5.4 + AC5.9 + D11/D12/D14 cdeck hook contract fixtures and cro
     });
     expect(corruptRes.code).toBe(0);
     expect(corruptRes.stdout).toBe('');
-    const hooksLog = await fs.readFile(path.join(store.runtimeDir, 'hooks.log'), 'utf8');
-    expect(hooksLog.length).toBeGreaterThan(0);
+    const hooksLog = await fs.readFile(hooksLogPath, 'utf8');
+    expect(hooksLog).toMatch(/CorruptDataError/);
+    expect(hooksLog).toMatch(/board\.yaml/);
   });
 
   it('AC6.2 + AC6.4: routes hook session via board paths globs and rebinds via cdeck board use', async () => {

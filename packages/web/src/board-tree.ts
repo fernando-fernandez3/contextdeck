@@ -15,7 +15,7 @@ export function buildBoardTreeOptions(boards: BoardConfig[]): BoardTreeOption[] 
   const childrenByParent = new Map<string, BoardConfig[]>();
   const roots: BoardConfig[] = [];
 
-  const sorted = [...boards].sort((a, b) => a.slug.localeCompare(b.slug));
+  const sorted = [...boards].sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
 
   for (const board of sorted) {
     const parent = board.parentBoard;

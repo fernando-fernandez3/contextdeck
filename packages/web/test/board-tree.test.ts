@@ -49,4 +49,10 @@ describe('AC6.3 UI board switcher tree hierarchy', () => {
     const opts = buildBoardTreeOptions(boards);
     expect(opts.map((o) => o.board.slug).sort()).toEqual(['a', 'b', 'orphan']);
   });
+
+  it('N1: orders sibling slugs by deterministic ASCII code-unit comparison', () => {
+    const boards = [mkBoard('a_1', 'Underscore'), mkBoard('a-1', 'Hyphen')];
+    const opts = buildBoardTreeOptions(boards);
+    expect(opts.map((o) => o.board.slug)).toEqual(['a-1', 'a_1']);
+  });
 });

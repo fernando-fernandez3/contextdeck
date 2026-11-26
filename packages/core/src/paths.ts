@@ -124,7 +124,7 @@ export function canonicalizePathSync(targetPath: string): string {
 export function isPathInside(baseDir: string, candidate: string, allowEqual = false): boolean {
   const rel = path.relative(baseDir, candidate);
   if (rel === '') return allowEqual;
-  return !rel.startsWith('..') && !path.isAbsolute(rel);
+  return rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
 }
 
 /**

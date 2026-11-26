@@ -70,12 +70,14 @@ Then open **http://127.0.0.1:4310** in your browser!
 
 All generated project configs (`cdeck setup <target>`) merge idempotently into existing files, never write absolute machine paths (the workspace resolver automatically locates `.contextdeck/`, `.contextdeck.yaml`, and linked git worktrees), and support `--uninstall` to remove only ContextDeck-managed entries.
 
+> **Team prerequisite:** Committed project hook configs (`.claude/settings.json`, `.codex/hooks.json`, `.cursor/hooks.json`) invoke `cdeck` directly, so `cdeck` must be available on every teammate's `PATH` (a missing binary will surface a hook error in the host harness).
+
 ### Harness Capabilities at a Glance
 
 | Harness | Setup Command | Automatic | Manual / Not Supported |
 | :--- | :--- | :--- | :--- |
-| **Claude Code** | `cdeck setup claude-code` | Stdio MCP (`.mcp.json`), startup Context Pack (`SessionStart`), per-prompt drift digest (`UserPromptSubmit`), auto-idle (`SessionEnd`) | — |
-| **Codex CLI** | `cdeck setup codex` (+ `agents-md`) | Project MCP (`.codex/config.toml`), startup Context Pack (`SessionStart`), per-prompt drift digest (`UserPromptSubmit`), auto-idle (`SessionEnd`) respecting `additionalContextLimit` | — |
+| **Claude Code** | `cdeck setup claude-code` | Stdio MCP (`.mcp.json`), startup Context Pack (`SessionStart`), per-prompt drift digest (`UserPromptSubmit`), auto-idle (`SessionEnd`) | Requires `cdeck` on `PATH` |
+| **Codex CLI** | `cdeck setup codex` (+ `agents-md`) | Project MCP (`.codex/config.toml`), startup Context Pack (`SessionStart`), per-prompt drift digest (`UserPromptSubmit`), auto-idle (`SessionEnd`) respecting `additionalContextLimit` | Requires `cdeck` on `PATH`; Codex executes project `.codex/hooks.json` hooks only in a trusted project |
 | **Cursor** | `cdeck setup cursor` | Stdio MCP (`.cursor/mcp.json`), startup Context Pack (`sessionStart`), throttled post-tool drift digest (`postToolUse`, max once per 60s), auto-idle (`sessionEnd`), always-apply rule | **No prompt-submit injection** — Cursor's `beforeSubmitPrompt` hook cannot inject additional context (as of Cursor docs fetched 2026-11-25); mid-session push happens via `postToolUse` |
 | **Grok Bot** | `cdeck setup grok` | Project MCP (`.grok/config.toml`) + `AGENTS.md` protocol | **No lifecycle hooks** — syncs via MCP tools (`board_get_brief`, `decision_record`, etc.) guided by `AGENTS.md` |
 | **Gemini / Antigravity** | `cdeck setup antigravity [--apply]` | Stdio MCP (`agy mcp add contextdeck cdeck mcp`) + `AGENTS.md` protocol | **No lifecycle hooks** — syncs via MCP tools guided by `AGENTS.md` |
@@ -96,7 +98,7 @@ cdeck setup agents-md
 # Remove only ContextDeck entries:
 cdeck setup codex --uninstall
 ```
-Merges `[mcp_servers.contextdeck]` inside `# contextdeck:start` / `# contextdeck:end` markers in `.codex/config.toml` and adds `SessionStart`, `UserPromptSubmit`, and `SessionEnd` hooks into `.codex/hooks.json` (with `additionalContextLimit` on context-emitting events; Codex enables hooks by default).
+Merges `[mcp_servers.contextdeck]` inside `# contextdeck:start` / `# contextdeck:end` markers in `.codex/config.toml` and adds `SessionStart`, `UserPromptSubmit`, and `SessionEnd` hooks into `.codex/hooks.json` (with `additionalContextLimit` on context-emitting events and `timeout: 3` on `SessionEnd`; Codex enables hooks by default, but only runs project `.codex/hooks.json` hooks in a trusted project and requires `cdeck` on every teammate's `PATH`).
 
 ### Cursor
 ```bash

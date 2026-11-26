@@ -78,7 +78,7 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function isOwnedMcpEntry(entry: unknown): boolean {
+function isCompatibleMcpEntry(entry: unknown): entry is Record<string, unknown> {
   if (!isPlainObject(entry)) return false;
   return (
     entry.command === 'cdeck' &&
@@ -88,8 +88,24 @@ function isOwnedMcpEntry(entry: unknown): boolean {
   );
 }
 
+function isExactInstallerMcpEntry(entry: unknown): boolean {
+  if (!isPlainObject(entry)) return false;
+  const keys = Object.keys(entry);
+  return (
+    keys.length === 2 &&
+    entry.command === 'cdeck' &&
+    Array.isArray(entry.args) &&
+    entry.args.length === 1 &&
+    entry.args[0] === 'mcp'
+  );
+}
+
 function isOwnedHookCommand(cmd: unknown): boolean {
   return typeof cmd === 'string' && cmd.startsWith(HOOK_CMD_PREFIX);
+}
+
+function isLegacyBriefHookCommand(cmd: unknown): boolean {
+  return typeof cmd === 'string' && cmd.includes(' status --brief-hook');
 }
 
 async function readTextIfExists(filePath: string): Promise<string | null> {
@@ -132,8 +148,8 @@ function planMcpJson(
       throw new Error(`Invalid "mcpServers" field in "${filePath}": expected an object.`);
     }
     const servers = { ...existing.mcpServers };
-    if (servers.contextdeck === undefined || !isOwnedMcpEntry(servers.contextdeck)) {
-      // D13: Never delete an unowned `contextdeck` entry
+    if (servers.contextdeck === undefined || !isExactInstallerMcpEntry(servers.contextdeck)) {
+      // D13 / H15: Never delete an unowned or user-customized pre-existing `contextdeck` entry
       return { kind: 'noop', filePath };
     }
     delete servers.contextdeck;
@@ -157,10 +173,16 @@ function planMcpJson(
     ? { ...base.mcpServers }
     : {};
 
-  if (servers.contextdeck !== undefined && !isOwnedMcpEntry(servers.contextdeck)) {
-    throw new Error(
-      `Refusing to overwrite unowned "mcpServers.contextdeck" collision in "${filePath}". Remove or rename the existing entry first.`,
-    );
+  if (servers.contextdeck !== undefined) {
+    if (!isCompatibleMcpEntry(servers.contextdeck)) {
+      throw new Error(
+        `Refusing to overwrite unowned "mcpServers.contextdeck" collision in "${filePath}". Remove or rename the existing entry first.`,
+      );
+    }
+    if (!isExactInstallerMcpEntry(servers.contextdeck)) {
+      // H15: Compatible user-customized entry (e.g. extra env/timeout/args) -> preserve untouched
+      return { kind: 'noop', filePath };
+    }
   }
 
   servers.contextdeck = MCP_STDIO_ENTRY;
@@ -174,7 +196,81 @@ interface MatcherGroupSpec {
     type: 'command';
     command: string;
     additionalContextLimit?: number;
+    timeout?: number;
   }>;
+}
+
+/**
+ * H16: Remove legacy v0.1 `status --brief-hook` entries from `.claude/settings.local.json`
+ * on both install and uninstall while preserving all other user settings/hooks byte-for-byte
+ * when untouched and deleting the file only if it becomes completely empty.
+ */
+function planLegacyClaudeLocalCleanup(
+  filePath: string,
+  existing: Record<string, unknown> | null,
+): FileAction {
+  if (!existing || existing.hooks === undefined) {
+    return { kind: 'noop', filePath };
+  }
+  if (!isPlainObject(existing.hooks)) {
+    throw new Error(`Invalid "hooks" field in "${filePath}": expected an object.`);
+  }
+
+  const hooksObj: Record<string, unknown> = { ...existing.hooks };
+  let changed = false;
+
+  for (const [eventName, rawGroups] of Object.entries(hooksObj)) {
+    if (!Array.isArray(rawGroups)) continue;
+    const keptGroups: unknown[] = [];
+    let eventChanged = false;
+
+    for (const group of rawGroups) {
+      if (isPlainObject(group) && Array.isArray(group.hooks)) {
+        const remainingHandlers = group.hooks.filter((h) => {
+          if (isPlainObject(h) && isLegacyBriefHookCommand(h.command)) {
+            eventChanged = true;
+            return false;
+          }
+          return true;
+        });
+        if (remainingHandlers.length > 0) {
+          keptGroups.push(
+            remainingHandlers.length === group.hooks.length
+              ? group
+              : { ...group, hooks: remainingHandlers },
+          );
+        }
+      } else if (isPlainObject(group) && isLegacyBriefHookCommand(group.command)) {
+        eventChanged = true;
+      } else {
+        keptGroups.push(group);
+      }
+    }
+
+    if (eventChanged) {
+      changed = true;
+      if (keptGroups.length === 0) {
+        delete hooksObj[eventName];
+      } else {
+        hooksObj[eventName] = keptGroups;
+      }
+    }
+  }
+
+  if (!changed) {
+    return { kind: 'noop', filePath };
+  }
+
+  const next: Record<string, unknown> = { ...existing };
+  if (Object.keys(hooksObj).length === 0) {
+    delete next.hooks;
+  } else {
+    next.hooks = hooksObj;
+  }
+  if (Object.keys(next).length === 0) {
+    return { kind: 'remove', filePath };
+  }
+  return { kind: 'write', filePath, content: `${JSON.stringify(next, null, 2)}\n` };
 }
 
 function stripOwnedFromMatcherGroups(
@@ -627,9 +723,11 @@ export async function setupHarness(
   if (target === 'claude-code') {
     const mcpPath = path.join(rootDir, '.mcp.json');
     const settingsPath = path.join(rootDir, '.claude', 'settings.json');
-    const [existingMcp, existingSettings] = await Promise.all([
+    const localSettingsPath = path.join(rootDir, '.claude', 'settings.local.json');
+    const [existingMcp, existingSettings, existingLocalSettings] = await Promise.all([
       readJsonObjectStrict(mcpPath),
       readJsonObjectStrict(settingsPath),
+      readJsonObjectStrict(localSettingsPath),
     ]);
 
     actions.push(planMcpJson(mcpPath, existingMcp, uninstall));
@@ -652,6 +750,8 @@ export async function setupHarness(
         uninstall,
       ),
     );
+    // H16: Clean up legacy v0.1 `status --brief-hook` from `.claude/settings.local.json`
+    actions.push(planLegacyClaudeLocalCleanup(localSettingsPath, existingLocalSettings));
     notes.push(
       uninstall
         ? 'Removed ContextDeck stdio MCP server from .mcp.json and lifecycle hooks from .claude/settings.json.'
@@ -691,7 +791,7 @@ export async function setupHarness(
             ],
           },
           SessionEnd: {
-            hooks: [{ type: 'command', command: 'cdeck hook codex SessionEnd' }],
+            hooks: [{ type: 'command', command: 'cdeck hook codex SessionEnd', timeout: 3 }],
           },
         },
         uninstall,

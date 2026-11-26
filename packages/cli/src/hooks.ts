@@ -17,8 +17,11 @@ export type HookHarness = 'claude-code' | 'codex' | 'cursor';
 
 const HOOK_MAX_STDIN_BYTES = 256 * 1024; // D12: 256 KB
 const HOOK_DEADLINE_MS = 1_750; // C5 / D12: strict internal timeout well under 2 s
+const HOOK_END_DEADLINE_MS = 800; // N2: tighter deadline for SessionEnd (Codex defaults to 1s, Claude to 1.5s)
 const HOOK_STDIN_TIMEOUT_MS = 900;
+const HOOK_END_STDIN_TIMEOUT_MS = 350;
 const HOOK_LOCK_WAIT_MS = 800; // D12: lock wait <= 800 ms
+const HOOK_END_LOCK_WAIT_MS = 350;
 const CURSOR_THROTTLE_MS = 60_000; // AC5.4 / D12: at most once per 60 s per session
 const HOOK_PACK_MAX_CHARS = 6_000; // ~1,500 tokens (well under Codex 2,500 token additionalContextLimit)
 const HOOK_DIGEST_MAX_CHARS = 4_000;
@@ -341,7 +344,8 @@ export async function runHookCli(
     return;
   }
 
-  const deadlineAt = Date.now() + HOOK_DEADLINE_MS;
+  const effectiveDeadlineMs = eventAction === 'end' ? HOOK_END_DEADLINE_MS : HOOK_DEADLINE_MS;
+  const deadlineAt = Date.now() + effectiveDeadlineMs;
   let resolvedDeckDir: string | undefined;
   let deadlineTriggered = false;
 
@@ -351,9 +355,9 @@ export async function runHookCli(
       resolvedDeckDir,
       rawHarness,
       rawEvent,
-      `Hook aborted at internal deadline (${HOOK_DEADLINE_MS}ms)`,
+      `Hook aborted at internal deadline (${effectiveDeadlineMs}ms)`,
     );
-  }, HOOK_DEADLINE_MS);
+  }, effectiveDeadlineMs);
   softTimer.unref();
 
   let killTimer: ReturnType<typeof setTimeout> | undefined;
@@ -361,7 +365,7 @@ export async function runHookCli(
     // Last-resort safety kill slightly after the soft deadline (still < 2s) if a handle hangs.
     killTimer = setTimeout(() => {
       process.exit(0);
-    }, HOOK_DEADLINE_MS + 150);
+    }, effectiveDeadlineMs + 150);
     killTimer.unref();
   }
 
@@ -377,7 +381,13 @@ export async function runHookCli(
       // ignore
     }
 
-    const stdinTimeout = Math.min(HOOK_STDIN_TIMEOUT_MS, Math.max(100, deadlineAt - Date.now() - 400));
+    const maxStdinTimeout =
+      eventAction === 'end' ? HOOK_END_STDIN_TIMEOUT_MS : HOOK_STDIN_TIMEOUT_MS;
+    const stdinMargin = eventAction === 'end' ? 200 : 400;
+    const stdinTimeout = Math.min(
+      maxStdinTimeout,
+      Math.max(100, deadlineAt - Date.now() - stdinMargin),
+    );
     const rawStdin = await readBoundedStdin(HOOK_MAX_STDIN_BYTES, stdinTimeout);
     if (deadlineTriggered || !rawStdin.trim()) {
       return;
@@ -433,9 +443,11 @@ export async function runHookCli(
     const externalRef = `${rawHarness}:${externalSessionId}`;
     const now = new Date();
     const defaultTitle = formatDefaultHookSessionTitle(rawHarness, now);
+    const maxLockWait = eventAction === 'end' ? HOOK_END_LOCK_WAIT_MS : HOOK_LOCK_WAIT_MS;
+    const lockMargin = eventAction === 'end' ? 120 : 250;
     const remainingForLock = Math.max(
       50,
-      Math.min(HOOK_LOCK_WAIT_MS, deadlineAt - Date.now() - 250),
+      Math.min(maxLockWait, deadlineAt - Date.now() - lockMargin),
     );
 
     const onCorruptSession = (filePath: string, message: string) => {

@@ -6,6 +6,7 @@ import type { BoardConfig } from './schemas.js';
 export interface GlobSpecificity {
   literalPrefixLen: number;
   segmentCount: number;
+  exactSegmentCount: number;
 }
 
 const GLOB_META_REGEX = /[*?[]/;
@@ -159,21 +160,24 @@ export function matchBoardPathGlob(rawGlob: string, rawRelPath: string): boolean
  * Compute deterministic D15 specificity tuple for a board path glob:
  * 1. Longest leading literal prefix (chars before first wildcard, stripping trailing `/`).
  * 2. Segment count (count of non-globstar segments, so `packages/web/*` beats `packages/web/**`).
+ * 3. Exact (non-wildcard) segment count so exact segments beat wildcarded segments on ties (N1).
  */
 export function computeGlobSpecificity(rawGlob: string): GlobSpecificity {
   const norm = normalizeBoardGlob(rawGlob);
   if (!norm || norm === '.' || norm === '**') {
-    return { literalPrefixLen: 0, segmentCount: 0 };
+    return { literalPrefixLen: 0, segmentCount: 0, exactSegmentCount: 0 };
   }
 
   const metaIdx = norm.search(GLOB_META_REGEX);
   const literalPrefix =
     metaIdx === -1 ? norm : norm.slice(0, metaIdx).replace(/\/+$/, '');
   const segments = norm.split('/').filter((seg) => seg !== '' && seg !== '**');
+  const exactSegmentCount = segments.filter((seg) => !GLOB_META_REGEX.test(seg)).length;
 
   return {
     literalPrefixLen: literalPrefix.length,
     segmentCount: segments.length,
+    exactSegmentCount,
   };
 }
 
@@ -181,7 +185,10 @@ function compareSpecificity(a: GlobSpecificity, b: GlobSpecificity): number {
   if (a.literalPrefixLen !== b.literalPrefixLen) {
     return a.literalPrefixLen - b.literalPrefixLen;
   }
-  return a.segmentCount - b.segmentCount;
+  if (a.segmentCount !== b.segmentCount) {
+    return a.segmentCount - b.segmentCount;
+  }
+  return a.exactSegmentCount - b.exactSegmentCount;
 }
 
 /**
@@ -189,7 +196,8 @@ function compareSpecificity(a: GlobSpecificity, b: GlobSpecificity): number {
  * Deterministic tie-breaking:
  *   1. Longest literal prefix
  *   2. Higher segment count (excluding `**`)
- *   3. Alphabetically smaller board slug
+ *   3. Higher exact (non-wildcard) segment count (N1)
+ *   4. Lexicographically smaller board slug (deterministic ASCII code-unit order)
  * Falls back to `defaultBoard` if no board matches or `cwd` is outside `projectRoot`.
  */
 export function routeBoardForCwd(
@@ -207,7 +215,7 @@ export function routeBoardForCwd(
     const realRoot = canonicalizePathSync(path.resolve(projectRoot));
     const realCwd = canonicalizePathSync(path.resolve(cwd));
     const rel = path.relative(realRoot, realCwd);
-    if (rel.startsWith('..') || path.isAbsolute(rel)) {
+    if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
       return defaultBoard;
     }
     relPosix = rel.split(path.sep).join('/');
@@ -235,7 +243,7 @@ export function routeBoardForCwd(
       winner = { slug: board.slug, spec: bestForBoard };
     } else {
       const cmp = compareSpecificity(bestForBoard, winner.spec);
-      if (cmp > 0 || (cmp === 0 && board.slug.localeCompare(winner.slug) < 0)) {
+      if (cmp > 0 || (cmp === 0 && board.slug < winner.slug)) {
         winner = { slug: board.slug, spec: bestForBoard };
       }
     }

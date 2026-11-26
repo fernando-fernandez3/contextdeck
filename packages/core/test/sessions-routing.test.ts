@@ -477,6 +477,36 @@ describe('E6 + D15 board path routing and parentBoard hierarchy', () => {
     expect(
       core.routeBoardForCwd([mkBoard('only-api', ['packages/api/**'])], '/repo/docs', projectRoot, 'main'),
     ).toBe('main');
+
+    // N1: exact segments beat wildcard segments on ties (`packages/web/**` beats `packages/web*` even when wildcard slug sorts earlier)
+    expect(
+      core.routeBoardForCwd(
+        [mkBoard('a-wild', ['packages/web*']), mkBoard('z-exact', ['packages/web/**'])],
+        '/repo/packages/web',
+        projectRoot,
+        'main',
+      ),
+    ).toBe('z-exact');
+
+    // N1: directory starting with `..` (e.g. `..foo`) inside projectRoot is NOT treated as parent traversal
+    expect(
+      core.routeBoardForCwd(
+        [mkBoard('dotdot', ['..foo/**'])],
+        '/repo/..foo/bar',
+        projectRoot,
+        'main',
+      ),
+    ).toBe('dotdot');
+
+    // N1: deterministic ASCII code-unit slug tie-breaking (e.g. `a-1` vs `a_1`: '-' (45) < '_' (95))
+    expect(
+      core.routeBoardForCwd(
+        [mkBoard('a_1', ['shared/**']), mkBoard('a-1', ['shared/**'])],
+        '/repo/shared/dir',
+        projectRoot,
+        'main',
+      ),
+    ).toBe('a-1');
   });
 
   it('persists parentBoard and paths and rejects self-parent and multi-hop parentBoard cycles (D15)', async () => {

@@ -177,6 +177,8 @@ describe('AC5.5-AC5.7 + C3/C4 + D13 cdeck setup and --uninstall', () => {
     // SessionEnd must NOT set additionalContextLimit (Codex warns on events without additionalContext)
     expect(hooksObj.hooks.SessionEnd[0].hooks[0].command).toBe('cdeck hook codex SessionEnd');
     expect(hooksObj.hooks.SessionEnd[0].hooks[0].additionalContextLimit).toBeUndefined();
+    // N2: Codex SessionEnd sets timeout: 3 (Codex defaults SessionEnd to 1s)
+    expect((hooksObj.hooks.SessionEnd[0].hooks[0] as { timeout?: number }).timeout).toBe(3);
 
     // Idempotent
     await setupHarness(repo, 'codex');
@@ -401,5 +403,99 @@ describe('AC5.5-AC5.7 + C3/C4 + D13 cdeck setup and --uninstall', () => {
     const agyRes = await runCli(['setup', 'antigravity', '--dir', repo], repo);
     expect(agyRes.code).toBe(0);
     expect(agyRes.stdout).toContain('agy mcp add contextdeck cdeck mcp');
+  });
+
+  it('H15: setup preserves extra user fields on a compatible contextdeck MCP entry and uninstall leaves the pre-existing entry intact', async () => {
+    const repo = await makeTempDir('cdeck-h15-');
+    const preExistingMcp = {
+      mcpServers: {
+        contextdeck: {
+          command: 'cdeck',
+          args: ['mcp'],
+          env: { CONTEXTDECK_HOME: 'team-store' },
+          timeout: 90,
+        },
+      },
+    };
+    const mcpPath = path.join(repo, '.mcp.json');
+    await fs.writeFile(mcpPath, `${JSON.stringify(preExistingMcp, null, 2)}\n`, 'utf8');
+
+    // Install must preserve env and timeout
+    await setupHarness(repo, 'claude-code');
+    const afterInstall = JSON.parse(await fs.readFile(mcpPath, 'utf8')) as typeof preExistingMcp;
+    expect(afterInstall.mcpServers.contextdeck).toEqual(preExistingMcp.mcpServers.contextdeck);
+
+    // Uninstall must leave the pre-existing user-customized entry intact while removing hooks
+    await setupHarness(repo, 'claude-code', { uninstall: true });
+    const afterUninstall = JSON.parse(await fs.readFile(mcpPath, 'utf8')) as typeof preExistingMcp;
+    expect(afterUninstall.mcpServers.contextdeck).toEqual(preExistingMcp.mcpServers.contextdeck);
+    await expect(fs.stat(path.join(repo, '.claude', 'settings.json'))).rejects.toThrow();
+
+    // Same for Cursor `.cursor/mcp.json`
+    const cursorRepo = await makeTempDir('cdeck-h15-cursor-');
+    const cursorMcpPath = path.join(cursorRepo, '.cursor', 'mcp.json');
+    await fs.mkdir(path.dirname(cursorMcpPath), { recursive: true });
+    await fs.writeFile(cursorMcpPath, `${JSON.stringify(preExistingMcp, null, 2)}\n`, 'utf8');
+
+    await setupHarness(cursorRepo, 'cursor');
+    expect(JSON.parse(await fs.readFile(cursorMcpPath, 'utf8'))).toEqual(preExistingMcp);
+    await setupHarness(cursorRepo, 'cursor', { uninstall: true });
+    expect(JSON.parse(await fs.readFile(cursorMcpPath, 'utf8'))).toEqual(preExistingMcp);
+  });
+
+  it('H16: setup claude-code (install and uninstall) removes legacy v0.1 .claude/settings.local.json brief-hook while preserving user hooks', async () => {
+    // 1. v0.1 settings.local.json with BOTH legacy brief-hook and a user hook -> brief-hook removed, user hook kept
+    const repo1 = await makeTempDir('cdeck-h16-keep-');
+    const localPath1 = path.join(repo1, '.claude', 'settings.local.json');
+    await fs.mkdir(path.dirname(localPath1), { recursive: true });
+    const v01WithUser = {
+      permissions: { allow: ['Bash(pnpm test)'] },
+      hooks: {
+        SessionStart: [
+          {
+            matcher: 'startup|resume',
+            hooks: [
+              { type: 'command', command: './scripts/user-startup.sh' },
+              {
+                type: 'command',
+                command: 'node /old/path/index.js status --brief-hook --dir "/old/repo"',
+              },
+            ],
+          },
+        ],
+      },
+    };
+    await fs.writeFile(localPath1, `${JSON.stringify(v01WithUser, null, 2)}\n`, 'utf8');
+
+    await setupHarness(repo1, 'claude-code');
+    const afterInstall1 = JSON.parse(await fs.readFile(localPath1, 'utf8')) as {
+      permissions: unknown;
+      hooks: { SessionStart: Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }> };
+    };
+    expect(afterInstall1.permissions).toEqual(v01WithUser.permissions);
+    expect(afterInstall1.hooks.SessionStart).toEqual([
+      {
+        matcher: 'startup|resume',
+        hooks: [{ type: 'command', command: './scripts/user-startup.sh' }],
+      },
+    ]);
+
+    // 2. v0.1 settings.local.json containing ONLY the legacy brief-hook -> file deleted on uninstall (and install)
+    const repo2 = await makeTempDir('cdeck-h16-delete-');
+    const localPath2 = path.join(repo2, '.claude', 'settings.local.json');
+    await fs.mkdir(path.dirname(localPath2), { recursive: true });
+    const v01Only = {
+      hooks: {
+        SessionStart: [
+          {
+            hooks: [{ type: 'command', command: 'cdeck status --brief-hook --dir "/old/repo"' }],
+          },
+        ],
+      },
+    };
+    await fs.writeFile(localPath2, `${JSON.stringify(v01Only, null, 2)}\n`, 'utf8');
+
+    await setupHarness(repo2, 'claude-code', { uninstall: true });
+    await expect(fs.stat(localPath2)).rejects.toThrow();
   });
 });
