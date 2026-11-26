@@ -1,8 +1,8 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
-import { PassThrough } from 'node:stream';
+import { spawn, spawnSync } from 'node:child_process';
+import { PassThrough, Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -1198,4 +1198,208 @@ describe('AC5.1-AC5.4 + AC5.9 + D11/D12/D14 cdeck hook contract fixtures and cro
       expect(parsed.hookSpecificOutput.additionalContext).toContain('Scale Decision');
     }
   });
+
+  it('R2-1 (unit): blocked stdout keeps hard deadline kill timer armed (<2000ms) and leaves cursor unchanged', async () => {
+    const repo = await makeTempDir('cdeck-r2-1-unit-');
+    const store = new ContextDeckStore(repo);
+    await store.createBoard({ title: 'Blocked Stdout Unit', slug: 'main' });
+
+    const origStdinDesc = Object.getOwnPropertyDescriptor(process, 'stdin');
+    const fakeStdin = new PassThrough();
+    Object.defineProperty(fakeStdin, 'isTTY', { value: false });
+    Object.defineProperty(process, 'stdin', {
+      value: fakeStdin,
+      configurable: true,
+      writable: true,
+    });
+
+    // Injectable Writable whose write callback never fires (simulates wedged stdout pipe)
+    let writeCalls = 0;
+    const blockedStdout = new Writable({
+      write(_chunk, _enc, _cb) {
+        writeCalls += 1;
+        // Intentionally never invoke _cb
+      },
+    });
+    blockedStdout.on('error', () => {});
+
+    let exitCode: number | null = null;
+    let exitElapsedMs: number | null = null;
+    let resolveExit!: () => void;
+    const exitPromise = new Promise<void>((resolve) => {
+      resolveExit = resolve;
+    });
+
+    const started = Date.now();
+    queueMicrotask(() => {
+      fakeStdin.end(
+        JSON.stringify({
+          session_id: 'r2-1-blocked-unit',
+          cwd: repo,
+          hook_event_name: 'SessionStart',
+          source: 'startup',
+        }),
+      );
+    });
+
+    try {
+      await runHookCli(
+        'claude-code',
+        'SessionStart',
+        { ...process.env, CONTEXTDECK_DIR: undefined, CLAUDE_PROJECT_DIR: undefined },
+        {
+          exitOnHardDeadline: true,
+          stdout: blockedStdout,
+          exit: (code: number) => {
+            exitCode = code;
+            exitElapsedMs = Date.now() - started;
+            resolveExit();
+          },
+        },
+      );
+
+      // Wait briefly past the 2000ms deadline to observe whether hard kill fires
+      await Promise.race([
+        exitPromise,
+        new Promise<void>((r) => setTimeout(r, 600)),
+      ]);
+
+      expect(writeCalls).toBe(1);
+      expect(exitCode).toBe(0);
+      expect(exitElapsedMs).not.toBeNull();
+      expect(exitElapsedMs!).toBeLessThan(2_000);
+
+      // Cursor must stay unacknowledged on a timed-out write (H1 semantics)
+      const sess = await store.findSessionByExternalRef('claude-code:r2-1-blocked-unit');
+      expect(sess).not.toBeNull();
+      const cursor = await store.readSessionCursor(sess!.id);
+      expect(cursor?.syncedRevisions.main ?? 0).toBe(0);
+
+      // Also verify a clean drained stdout clears the kill timer and does NOT call exit
+      const cleanStdin = new PassThrough();
+      Object.defineProperty(cleanStdin, 'isTTY', { value: false });
+      Object.defineProperty(process, 'stdin', {
+        value: cleanStdin,
+        configurable: true,
+        writable: true,
+      });
+      const chunks: string[] = [];
+      const cleanStdout = new Writable({
+        write(chunk, _enc, cb) {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk));
+          cb();
+        },
+      });
+      let cleanExitCalled = false;
+      queueMicrotask(() => {
+        cleanStdin.end(
+          JSON.stringify({
+            session_id: 'r2-1-clean-unit',
+            cwd: repo,
+            hook_event_name: 'SessionStart',
+            source: 'startup',
+          }),
+        );
+      });
+      const cleanStart = Date.now();
+      await runHookCli(
+        'claude-code',
+        'SessionStart',
+        { ...process.env, CONTEXTDECK_DIR: undefined, CLAUDE_PROJECT_DIR: undefined },
+        {
+          exitOnHardDeadline: true,
+          stdout: cleanStdout,
+          exit: () => {
+            cleanExitCalled = true;
+          },
+        },
+      );
+      expect(Date.now() - cleanStart).toBeLessThan(1_000);
+      expect(cleanExitCalled).toBe(false);
+      expect(chunks.join('')).toContain('SessionStart');
+    } finally {
+      blockedStdout.destroy();
+      if (origStdinDesc) {
+        Object.defineProperty(process, 'stdin', origStdinDesc);
+      }
+    }
+  });
+
+  it.skipIf(process.platform !== 'linux')(
+    'R2-1 (subprocess): real 4 KiB pipe backpressure exits within 2.5s and leaves cursor unchanged',
+    async (ctx) => {
+      // Check python3 + Linux F_SETPIPE_SZ support
+      const probe = spawnSync(
+        'python3',
+        ['-c', 'import os, fcntl; r, w = os.pipe(); fcntl.fcntl(w, 1031, 4096); os.close(r); os.close(w)'],
+        { encoding: 'utf8' },
+      );
+      if (probe.status !== 0) {
+        ctx.skip();
+        return;
+      }
+
+      const repo = await makeTempDir('cdeck-r2-1-subproc-');
+      const store = new ContextDeckStore(repo);
+      await store.createBoard({ title: 'Blocked Pipe Subprocess', slug: 'main' });
+      // Seed ~45 decisions so SessionStart JSON pack exceeds a 4,096-byte pipe buffer
+      for (let i = 1; i <= 45; i += 1) {
+        await store.recordDecision('main', {
+          title: `Pipe Backpressure Decision ${i}`,
+          summary: `Detailed rationale padding for decision ${i} to exceed 4 KiB pipe buffer cleanly`,
+        });
+      }
+
+      const cleanEnv: NodeJS.ProcessEnv = { ...process.env };
+      delete cleanEnv.CONTEXTDECK_DIR;
+      delete cleanEnv.CLAUDE_PROJECT_DIR;
+      delete cleanEnv.CONTEXTDECK_HOME;
+      delete cleanEnv.CURSOR_PROJECT_DIR;
+
+      const pyScript = [
+        'import fcntl, json, os, subprocess, sys, time',
+        'node_bin, cli_bin, repo_dir = sys.argv[1], sys.argv[2], sys.argv[3]',
+        'r_fd, w_fd = os.pipe()',
+        'pipe_sz = fcntl.fcntl(w_fd, 1031, 4096)',
+        'payload = json.dumps({"session_id": "r2-1-pipe-subproc", "cwd": repo_dir, "hook_event_name": "SessionStart", "source": "startup"}).encode("utf-8")',
+        't0 = time.monotonic()',
+        'proc = subprocess.Popen([node_bin, cli_bin, "hook", "claude-code", "SessionStart"], cwd=repo_dir, stdin=subprocess.PIPE, stdout=w_fd, stderr=subprocess.PIPE)',
+        'os.close(w_fd)',
+        'try:',
+        '    proc.stdin.write(payload)',
+        '    proc.stdin.close()',
+        '    code = proc.wait(timeout=3.0)',
+        '    elapsed_ms = int((time.monotonic() - t0) * 1000)',
+        '    print(json.dumps({"timedOut": False, "code": code, "elapsedMs": elapsed_ms, "pipeSz": pipe_sz}))',
+        'except subprocess.TimeoutExpired:',
+        '    elapsed_ms = int((time.monotonic() - t0) * 1000)',
+        '    proc.kill()',
+        '    proc.wait()',
+        '    print(json.dumps({"timedOut": True, "code": None, "elapsedMs": elapsed_ms, "pipeSz": pipe_sz}))',
+        'finally:',
+        '    os.close(r_fd)',
+      ].join('\n');
+
+      const pyRes = spawnSync('python3', ['-c', pyScript, process.execPath, CLI_BIN, repo], {
+        env: cleanEnv,
+        encoding: 'utf8',
+        timeout: 10_000,
+      });
+      expect(pyRes.status).toBe(0);
+      const parsed = JSON.parse(pyRes.stdout.trim()) as {
+        timedOut: boolean;
+        code: number | null;
+        elapsedMs: number;
+        pipeSz: number;
+      };
+      expect(parsed.timedOut).toBe(false);
+      expect(parsed.code).toBe(0);
+      expect(parsed.elapsedMs).toBeLessThan(2_500);
+
+      const sess = await store.findSessionByExternalRef('claude-code:r2-1-pipe-subproc');
+      expect(sess).not.toBeNull();
+      const cursor = await store.readSessionCursor(sess!.id);
+      expect(cursor?.syncedRevisions.main ?? 0).toBe(0);
+    },
+  );
 });

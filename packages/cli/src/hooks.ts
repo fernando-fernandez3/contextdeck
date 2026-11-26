@@ -290,29 +290,38 @@ function capBoundedDigest(text: string, maxChars: number): string {
   return `${text.slice(0, sliceLen).trimEnd()}${suffix}`;
 }
 
-function writeStdoutBounded(text: string, remainingMs: number): Promise<boolean> {
+function writeStdoutBounded(
+  stdout: NodeJS.WritableStream,
+  text: string,
+  remainingMs: number,
+  onLateDrain?: () => void,
+): Promise<{ ok: boolean; pending: boolean }> {
   if (remainingMs <= 0) {
-    return Promise.resolve(false);
+    return Promise.resolve({ ok: false, pending: false });
   }
-  return new Promise<boolean>((resolve) => {
+  return new Promise<{ ok: boolean; pending: boolean }>((resolve) => {
     let settled = false;
-    const finish = (ok: boolean) => {
+    const finish = (ok: boolean, pending: boolean) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      process.stdout.removeListener('error', onError);
-      resolve(ok);
+      stdout.removeListener('error', onError);
+      resolve({ ok, pending });
     };
-    const onError = () => finish(false);
-    const timer = setTimeout(() => finish(false), Math.max(10, remainingMs));
+    const onError = () => finish(false, false);
+    const timer = setTimeout(() => finish(false, true), Math.max(10, remainingMs));
     timer.unref();
-    process.stdout.once('error', onError);
+    stdout.once('error', onError);
     try {
-      process.stdout.write(text, 'utf8', (err?: Error | null) => {
-        finish(!err);
+      stdout.write(text, 'utf8', (err?: Error | null) => {
+        if (settled) {
+          onLateDrain?.();
+          return;
+        }
+        finish(!err, false);
       });
     } catch {
-      finish(false);
+      finish(false, false);
     }
   });
 }
@@ -320,6 +329,10 @@ function writeStdoutBounded(text: string, remainingMs: number): Promise<boolean>
 export interface RunHookCliOptions {
   /** Only enabled by the CLI entrypoint (`cdeck hook`) as a last-resort safeguard after deadline. */
   exitOnHardDeadline?: boolean;
+  /** Injectable stdout stream for testing (defaults to `process.stdout`). */
+  stdout?: NodeJS.WritableStream;
+  /** Injectable exit handler for hard-deadline termination (defaults to `process.exit`). */
+  exit?: (code: number) => void;
 }
 
 /**
@@ -346,8 +359,11 @@ export async function runHookCli(
 
   const effectiveDeadlineMs = eventAction === 'end' ? HOOK_END_DEADLINE_MS : HOOK_DEADLINE_MS;
   const deadlineAt = Date.now() + effectiveDeadlineMs;
+  const stdoutStream = options.stdout ?? process.stdout;
+  const exitFn = options.exit ?? ((code: number) => process.exit(code));
   let resolvedDeckDir: string | undefined;
   let deadlineTriggered = false;
+  let stdoutWritePending = false;
 
   const softTimer = setTimeout(() => {
     deadlineTriggered = true;
@@ -364,8 +380,16 @@ export async function runHookCli(
   if (options.exitOnHardDeadline) {
     // Last-resort safety kill slightly after the soft deadline (still < 2s) if a handle hangs.
     killTimer = setTimeout(() => {
-      process.exit(0);
-    }, effectiveDeadlineMs + 150);
+      if (stdoutWritePending) {
+        try {
+          stdoutStream.on('error', () => {});
+          (stdoutStream as { destroy?: () => void }).destroy?.();
+        } catch {
+          // ignore
+        }
+      }
+      exitFn(0);
+    }, effectiveDeadlineMs + 100);
     killTimer.unref();
   }
 
@@ -481,8 +505,25 @@ export async function runHookCli(
       const additionalContext = `${pack}\n\n${sessionLine}`;
       const output = formatHookOutput(rawHarness, rawEvent, additionalContext);
       if (output && !deadlineTriggered) {
-        const flushed = await writeStdoutBounded(`${output}\n`, deadlineAt - Date.now());
-        if (flushed && !deadlineTriggered) {
+        const writeRes = await writeStdoutBounded(
+          stdoutStream,
+          `${output}\n`,
+          deadlineAt - Date.now(),
+          () => {
+            stdoutWritePending = false;
+            if (killTimer) clearTimeout(killTimer);
+          },
+        );
+        if (writeRes.pending) {
+          stdoutWritePending = true;
+          appendHookLogSync(
+            resolvedDeckDir,
+            rawHarness,
+            rawEvent,
+            'Hook stdout write timed out; keeping hard deadline timer armed',
+          );
+        }
+        if (writeRes.ok && !deadlineTriggered) {
           await store.commitHookDelivery(pendingAck);
         }
       }
@@ -528,8 +569,25 @@ export async function runHookCli(
       );
       const output = formatHookOutput(rawHarness, rawEvent, additionalContext);
       if (output && !deadlineTriggered) {
-        const flushed = await writeStdoutBounded(`${output}\n`, deadlineAt - Date.now());
-        if (flushed && !deadlineTriggered && result.pendingAck) {
+        const writeRes = await writeStdoutBounded(
+          stdoutStream,
+          `${output}\n`,
+          deadlineAt - Date.now(),
+          () => {
+            stdoutWritePending = false;
+            if (killTimer) clearTimeout(killTimer);
+          },
+        );
+        if (writeRes.pending) {
+          stdoutWritePending = true;
+          appendHookLogSync(
+            resolvedDeckDir,
+            rawHarness,
+            rawEvent,
+            'Hook stdout write timed out; keeping hard deadline timer armed',
+          );
+        }
+        if (writeRes.ok && !deadlineTriggered && result.pendingAck) {
           await store.commitHookDelivery(result.pendingAck);
         }
       }
@@ -553,6 +611,8 @@ export async function runHookCli(
     );
   } finally {
     clearTimeout(softTimer);
-    if (killTimer) clearTimeout(killTimer);
+    if (killTimer && !stdoutWritePending) {
+      clearTimeout(killTimer);
+    }
   }
 }
