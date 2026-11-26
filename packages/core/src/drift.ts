@@ -372,7 +372,7 @@ export function computeDriftReport(params: {
     ) {
       continue;
     }
-    const updatedMs = Date.parse(session.updatedAt);
+    const updatedMs = Date.parse(session.lastActiveAt ?? session.updatedAt);
     if (Number.isFinite(updatedMs) && nowMs - updatedMs > SESSION_INACTIVE_CUTOFF_MS) {
       continue;
     }

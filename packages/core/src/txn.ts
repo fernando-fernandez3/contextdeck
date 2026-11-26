@@ -5,7 +5,12 @@ import path from 'node:path';
 import yaml from 'js-yaml';
 import lockfile from 'proper-lockfile';
 import { z } from 'zod';
-import { CorruptDataError, LockCompromisedError, PayloadTooLargeError } from './errors.js';
+import {
+  CorruptDataError,
+  LockCompromisedError,
+  LockTimeoutError,
+  PayloadTooLargeError,
+} from './errors.js';
 import { BOARD_SLUG_REGEX, ENTITY_ID_REGEX } from './ids.js';
 import { assertContainedPath, canonicalizePath, canonicalizePathSync } from './paths.js';
 
@@ -340,10 +345,22 @@ function validateEntitySegments(
   segments: string[],
   kind: 'rename' | 'link_create' | 'unlink',
   expectedBoardSlug?: string,
-): { isMediaBlob: boolean; mediaId?: string; boardSlug: string } {
+): { isMediaBlob: boolean; mediaId?: string; boardSlug?: string; isWorkspaceSession?: boolean } {
+  // D11: Workspace-scoped session metadata files live at `<deck>/sessions/<id>.yaml`.
+  if (segments.length === 2 && segments[0] === 'sessions') {
+    const file = segments[1];
+    const id = file.endsWith('.yaml') ? file.slice(0, -'.yaml'.length) : null;
+    if (id && ENTITY_ID_REGEX.test(id)) {
+      return { isMediaBlob: false, isWorkspaceSession: true };
+    }
+    throw new CorruptDataError(
+      `Invalid transaction journal ${kind} target "${segments.join('/')}": invalid workspace session filename.`,
+    );
+  }
+
   if (segments.length < 3 || segments[0] !== 'boards') {
     throw new CorruptDataError(
-      `Invalid transaction journal path "${segments.join('/')}": must reside under boards/<slug>/.`,
+      `Invalid transaction journal path "${segments.join('/')}": must reside under boards/<slug>/ or sessions/.`,
     );
   }
   const slug = segments[1];
@@ -445,6 +462,29 @@ async function validateAndResolveTxnJournal(
     );
   }
   const canonicalBoardsDir = path.join(canonicalDeckDir, 'boards');
+  const canonicalSessionsDir = path.join(canonicalDeckDir, 'sessions');
+  let checkedSessionsDir = false;
+
+  const assertSessionsDirSafe = async (label: string): Promise<void> => {
+    if (checkedSessionsDir) return;
+    let realSessionsDir: string;
+    try {
+      realSessionsDir = await assertContainedPath(canonicalDeckDir, canonicalSessionsDir, {
+        allowEqual: false,
+        label: `${label} sessions directory`,
+      });
+    } catch (err) {
+      throw new CorruptDataError(
+        `Invalid transaction journal ${label} sessions directory: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (realSessionsDir !== canonicalSessionsDir) {
+      throw new CorruptDataError(
+        `Invalid transaction journal ${label}: sessions directory is a symlink alias.`,
+      );
+    }
+    checkedSessionsDir = true;
+  };
 
   const checkedBoardSlugs = new Set<string>();
   const assertBoardDirSafe = async (slug: string, label: string): Promise<void> => {
@@ -518,7 +558,11 @@ async function validateAndResolveTxnJournal(
     const op = txn.ops[i];
     const finalInfo = await resolveContained(op.finalPath, `ops[${i}].finalPath`);
     const lexicalInfo = validateEntitySegments(finalInfo.segments, op.kind, txn.boardSlug);
-    await assertBoardDirSafe(lexicalInfo.boardSlug, `ops[${i}].finalPath`);
+    if (lexicalInfo.isWorkspaceSession) {
+      await assertSessionsDirSafe(`ops[${i}].finalPath`);
+    } else if (lexicalInfo.boardSlug) {
+      await assertBoardDirSafe(lexicalInfo.boardSlug, `ops[${i}].finalPath`);
+    }
     const canonicalInfo = validateEntitySegments(
       finalInfo.canonicalSegments,
       op.kind,
@@ -526,6 +570,7 @@ async function validateAndResolveTxnJournal(
     );
     if (
       canonicalInfo.boardSlug !== lexicalInfo.boardSlug ||
+      canonicalInfo.isWorkspaceSession !== lexicalInfo.isWorkspaceSession ||
       canonicalInfo.isMediaBlob !== lexicalInfo.isMediaBlob ||
       canonicalInfo.mediaId !== lexicalInfo.mediaId
     ) {
@@ -889,6 +934,10 @@ function getLockTimings(): { stale: number; update: number } {
   return { stale, update };
 }
 
+export interface WorkspaceLockOptions {
+  maxWaitMs?: number;
+}
+
 /**
  * Acquire cross-process workspace lock via proper-lockfile on `<runtimeDir>/lock`,
  * roll forward any pending `txn.json`, and abort immediately if the lock is compromised.
@@ -897,6 +946,7 @@ export async function withWorkspaceLock<T>(
   runtimeDir: string,
   fn: (assertActive: () => void) => Promise<T>,
   deckDir?: string,
+  options?: WorkspaceLockOptions,
 ): Promise<T> {
   const sentinelPath = path.join(runtimeDir, LOCK_SENTINEL_NAME);
   if (!existsSync(sentinelPath)) {
@@ -909,21 +959,47 @@ export async function withWorkspaceLock<T>(
   let compromised = false;
   let compromisedError: Error | null = null;
 
-  const release = await lockfile.lock(sentinelPath, {
-    stale,
-    update,
-    retries: {
-      retries: 150,
-      factor: 1.12,
-      minTimeout: 10,
-      maxTimeout: 200,
-      randomize: true,
-    },
-    onCompromised: (err: Error) => {
-      compromised = true;
-      compromisedError = err;
-    },
-  });
+  const maxWaitMs = options?.maxWaitMs;
+  const retriesConfig =
+    maxWaitMs !== undefined
+      ? {
+          retries: 100,
+          factor: 1.1,
+          minTimeout: 10,
+          maxTimeout: Math.min(40, Math.max(10, Math.floor(maxWaitMs / 4))),
+          randomize: true,
+          maxRetryTime: Math.max(10, maxWaitMs),
+        }
+      : {
+          retries: 150,
+          factor: 1.12,
+          minTimeout: 10,
+          maxTimeout: 200,
+          randomize: true,
+        };
+
+  let release: () => Promise<void>;
+  try {
+    release = await lockfile.lock(sentinelPath, {
+      stale,
+      update,
+      retries: retriesConfig,
+      onCompromised: (err: Error) => {
+        compromised = true;
+        compromisedError = err;
+      },
+    });
+  } catch (err) {
+    if (
+      maxWaitMs !== undefined &&
+      (err as NodeJS.ErrnoException | undefined)?.code === 'ELOCKED'
+    ) {
+      throw new LockTimeoutError(
+        `Timed out waiting ${maxWaitMs}ms for workspace lock at ${sentinelPath}.`,
+      );
+    }
+    throw err;
+  }
 
   const lockDirPath = `${sentinelPath}.lock`;
   let initialLockIno: number | undefined;

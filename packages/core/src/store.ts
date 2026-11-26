@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, type Dirent } from 'node:fs';
 import yaml from 'js-yaml';
 import chokidar, { type FSWatcher } from 'chokidar';
 import type { ZodType, ZodTypeDef } from 'zod';
@@ -15,16 +15,20 @@ import {
   DEFAULT_LENSES,
   DecisionSchema,
   DiagramSchema,
+  LegacySessionFileSchema,
   MediaArtifactSchema,
   PatchTaskInputSchema,
   QuizAttemptSchema,
   QuizSchema,
   RecordDecisionInputSchema,
   RegisterSessionInputSchema,
+  SessionCursorSchema,
+  SessionMetadataSchema,
   SessionSchema,
   SubmitQuizAttemptInputSchema,
   SyncSessionInputSchema,
   TaskSchema,
+  UpdateBoardInputSchema,
   UpdateBriefInputSchema,
   UpdateDecisionPatchSchema,
   UpdateMediaPatchSchema,
@@ -40,6 +44,7 @@ import {
   type DecisionStatus,
   type Diagram,
   type DiagramKind,
+  type LegacySessionFile,
   type LensConfig,
   type MediaArtifact,
   type MediaKind,
@@ -47,6 +52,8 @@ import {
   type QuizAttempt,
   type QuizQuestion,
   type Session,
+  type SessionCursor,
+  type SessionMetadata,
   type SessionStatus,
   type Task,
   type TaskColumn,
@@ -76,6 +83,7 @@ import {
   canonicalizePathSync,
 } from './paths.js';
 import { CONTEXTDECK_DIR_NAME } from './workspace.js';
+import { routeBoardForCwd, validateBoardParentHierarchy } from './routing.js';
 import { parseFrontmatter, stringifyFrontmatter } from './markdown.js';
 import {
   buildSessionDriftDigest,
@@ -94,6 +102,7 @@ import {
   type TxnEventEntry,
   type TxnJournal,
   type TxnOp,
+  type WorkspaceLockOptions,
 } from './txn.js';
 
 export const DEFAULT_MAX_MEDIA_BYTES = 500 * 1024 * 1024; // 500 MB
@@ -227,6 +236,10 @@ export interface MutationContext {
     actor?: Actor;
   }): BoardEvent;
   markConfigDirty(): void;
+  setConfigPatch(
+    patch: Partial<Pick<BoardConfig, 'title' | 'description' | 'lenses' | 'parentBoard' | 'paths'>>,
+  ): void;
+  onAfterCommit(fn: () => Promise<void>): void;
 }
 
 /**
@@ -268,6 +281,8 @@ export class ContextDeckStore {
   public readonly deckDir: string;
   public readonly runtimeDir: string;
   public readonly boardsDir: string;
+  public readonly sessionsDir: string;
+  public readonly cursorsDir: string;
   public readonly defaultBoardHint?: string;
   public readonly maxMediaBytes: number;
 
@@ -291,6 +306,8 @@ export class ContextDeckStore {
     }
     this.runtimeDir = path.join(this.deckDir, '.runtime');
     this.boardsDir = path.join(this.deckDir, 'boards');
+    this.sessionsDir = path.join(this.deckDir, 'sessions');
+    this.cursorsDir = path.join(this.runtimeDir, 'cursors');
   }
 
   public isInitialized(): boolean {
@@ -343,11 +360,167 @@ export class ContextDeckStore {
     });
   }
 
+  private async assertSessionsDirSafe(): Promise<string> {
+    const [canonicalDeckDir, canonicalSessionsDir] = await Promise.all([
+      canonicalizePath(this.deckDir),
+      canonicalizePath(this.sessionsDir),
+    ]);
+    const expectedSessionsDir = path.join(canonicalDeckDir, 'sessions');
+    if (canonicalSessionsDir !== expectedSessionsDir) {
+      throw new SecurityError(
+        `Access denied: sessions directory "${this.sessionsDir}" resolves outside workspace deck.`,
+      );
+    }
+    return canonicalSessionsDir;
+  }
+
+  private async safeSessionFilePath(sessionId: string): Promise<string> {
+    const validId = validateEntityId(sessionId, 'sessionId');
+    const canonicalSessionsDir = await this.assertSessionsDirSafe();
+    const candidate = path.join(canonicalSessionsDir, `${validId}.yaml`);
+    const resolved = await assertContainedPath(canonicalSessionsDir, candidate, {
+      label: `session "${validId}"`,
+    });
+    if (resolved !== candidate) {
+      throw new SecurityError(`Access denied: session "${validId}" resolves to an aliased file.`);
+    }
+    return resolved;
+  }
+
+  private async safeCursorFilePath(sessionId: string): Promise<string> {
+    const validId = validateEntityId(sessionId, 'sessionId');
+    const canonicalRuntime = await canonicalizePath(this.runtimeDir);
+    const cursorsRoot = path.join(canonicalRuntime, 'cursors');
+    const candidate = path.join(cursorsRoot, `${validId}.json`);
+    return assertContainedPath(cursorsRoot, candidate, {
+      label: `cursor "${validId}"`,
+    });
+  }
+
+  public async readSessionCursor(sessionId: string): Promise<SessionCursor | null> {
+    const cursorPath = await this.safeCursorFilePath(sessionId);
+    const raw = await readFileStrict(cursorPath);
+    if (raw === null) return null;
+    let parsedJson: unknown;
+    try {
+      parsedJson = JSON.parse(raw);
+    } catch (err) {
+      throw new CorruptDataError(
+        `Corrupt cursor JSON at ${cursorPath}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    const parsed = SessionCursorSchema.safeParse(parsedJson);
+    if (!parsed.success) {
+      throw new CorruptDataError(
+        `Invalid cursor schema at ${cursorPath}: ${formatZodError(parsed.error)}`,
+      );
+    }
+    return parsed.data;
+  }
+
+  public async writeSessionCursor(cursor: SessionCursor): Promise<void> {
+    const validated = SessionCursorSchema.parse(cursor);
+    const cursorPath = await this.safeCursorFilePath(validated.sessionId);
+    await ensureDir(path.dirname(cursorPath));
+    await atomicWriteFile(cursorPath, `${JSON.stringify(validated, null, 2)}\n`);
+  }
+
+  private async deleteSessionCursor(sessionId: string): Promise<void> {
+    const cursorPath = await this.safeCursorFilePath(sessionId);
+    await fs.rm(cursorPath, { force: true });
+  }
+
+  /**
+   * Migrate pre-B2 board-scoped session files (`boards/<slug>/sessions/<id>.yaml`)
+   * to workspace-scoped `<deck>/sessions/<id>.yaml` (metadata only) +
+   * `<deck>/.runtime/cursors/<id>.json` (volatile sync state) on first write (D11).
+   * Must be called while holding the workspace lock. Does not bump board revisions.
+   */
+  private async migrateLegacySessionsUnlocked(assertActive: () => void): Promise<void> {
+    let boardEntries;
+    try {
+      boardEntries = await fs.readdir(this.boardsDir, { withFileTypes: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw err;
+    }
+
+    const legacyDirs: Array<{ slug: string; dir: string }> = [];
+    for (const entry of boardEntries) {
+      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+      const legacySessionDir = path.join(this.boardsDir, entry.name, 'sessions');
+      if (existsSync(legacySessionDir)) {
+        legacyDirs.push({ slug: entry.name, dir: legacySessionDir });
+      }
+    }
+    if (legacyDirs.length === 0) return;
+
+    for (const { slug, dir } of legacyDirs) {
+      assertActive();
+      const files = await listFilesStrict(dir, '.yaml');
+      if (files.length === 0) continue;
+
+      validateBoardSlug(slug);
+      const safeDir = await this.safeBoardFilePath(slug, 'sessions');
+      await ensureDir(this.sessionsDir);
+      await this.assertSessionsDirSafe();
+
+      for (const file of files) {
+        assertActive();
+        const legacyPath = await assertContainedPath(safeDir, path.join(safeDir, file), {
+          label: `legacy session ${file}`,
+        });
+        const parsed = await readYamlStrict(legacyPath, LegacySessionFileSchema);
+        if (!parsed) continue;
+
+        const targetSessionPath = await this.safeSessionFilePath(parsed.id);
+        const boundBoard = parsed.board ?? slug;
+
+        if (!existsSync(targetSessionPath)) {
+          const meta: SessionMetadata = SessionMetadataSchema.parse({
+            id: parsed.id,
+            title: parsed.title,
+            harness: parsed.harness,
+            ...(parsed.externalRef !== undefined ? { externalRef: parsed.externalRef } : {}),
+            board: boundBoard,
+            parentSessionId: parsed.parentSessionId,
+            relatedSessionIds: parsed.relatedSessionIds,
+            status: parsed.status,
+            summary: parsed.summary,
+            focusFiles: parsed.focusFiles,
+            createdAt: parsed.createdAt,
+            updatedAt: parsed.updatedAt,
+          });
+          await atomicWriteFile(targetSessionPath, dumpYaml(meta));
+        }
+
+        const existingCursor = await this.readSessionCursor(parsed.id);
+        const nextSynced: Record<string, number> = {
+          ...(existingCursor?.syncedRevisions ?? {}),
+        };
+        if (nextSynced[slug] === undefined) {
+          nextSynced[slug] = parsed.lastSyncedRevision ?? 0;
+        }
+        await this.writeSessionCursor({
+          sessionId: parsed.id,
+          syncedRevisions: nextSynced,
+          lastActiveAt: existingCursor?.lastActiveAt ?? parsed.updatedAt,
+          ...(existingCursor?.lastCursorInjectAt
+            ? { lastCursorInjectAt: existingCursor.lastCursorInjectAt }
+            : {}),
+        });
+
+        assertActive();
+        await fs.rm(legacyPath, { force: true });
+      }
+    }
+  }
+
   private async ensureBoardDirs(slug: string): Promise<string> {
     const dir = this.boardPath(slug);
     await Promise.all([
       ensureDir(dir),
-      ensureDir(path.join(dir, 'sessions')),
+      ensureDir(this.sessionsDir),
       ensureDir(path.join(dir, 'decisions')),
       ensureDir(path.join(dir, 'tasks')),
       ensureDir(path.join(dir, 'diagrams')),
@@ -445,6 +618,8 @@ export class ContextDeckStore {
       description?: string;
       brief?: string;
       lenses?: LensConfig[];
+      parentBoard?: string | null;
+      paths?: string[];
       setAsDefault?: boolean;
     },
     actor: Actor = DEFAULT_ACTOR,
@@ -464,6 +639,10 @@ export class ContextDeckStore {
         throw new ConflictError(`Board "${slug}" already exists.`);
       }
 
+      const existingBoards = await this.listBoards();
+      // D15: Reject self-parent, missing parent, and hierarchy cycles
+      validateBoardParentHierarchy(existingBoards, slug, input.parentBoard);
+
       const now = nowIso();
       const config: BoardConfig = BoardConfigSchema.parse({
         id: shortId('brd'),
@@ -472,6 +651,8 @@ export class ContextDeckStore {
         description: input.description ?? '',
         revision: 1,
         lenses: input.lenses ?? DEFAULT_LENSES,
+        ...(input.parentBoard !== undefined ? { parentBoard: input.parentBoard } : {}),
+        ...(input.paths !== undefined ? { paths: input.paths } : {}),
         createdAt: now,
         updatedAt: now,
       });
@@ -570,6 +751,49 @@ export class ContextDeckStore {
     }, this.deckDir);
   }
 
+  public async updateBoard(
+    boardSlug: string,
+    rawPatch: {
+      title?: string;
+      description?: string;
+      lenses?: LensConfig[];
+      parentBoard?: string | null;
+      paths?: string[];
+    },
+    actor: Actor = DEFAULT_ACTOR,
+  ): Promise<BoardConfig> {
+    const slug = validateBoardSlug(boardSlug);
+    const patch = parseStrict(UpdateBoardInputSchema.omit({ actor: true }), rawPatch, 'board update');
+
+    return this.mutate(slug, actor, async (tx) => {
+      if (patch.parentBoard !== undefined) {
+        const allBoards = await this.listBoards();
+        validateBoardParentHierarchy(allBoards, slug, patch.parentBoard);
+      }
+
+      const nextPatch: Partial<Pick<BoardConfig, 'title' | 'description' | 'lenses' | 'parentBoard' | 'paths'>> = {};
+      if (patch.title !== undefined) nextPatch.title = patch.title;
+      if (patch.description !== undefined) nextPatch.description = patch.description;
+      if (patch.lenses !== undefined) nextPatch.lenses = patch.lenses;
+      if (patch.parentBoard !== undefined) nextPatch.parentBoard = patch.parentBoard;
+      if (patch.paths !== undefined) nextPatch.paths = patch.paths;
+
+      tx.setConfigPatch(nextPatch);
+      const ev = tx.addEvent({
+        kind: 'board.updated',
+        entityId: tx.initialConfig.id,
+        summary: `Updated board "${patch.title ?? tx.initialConfig.title}" (${slug})`,
+      });
+
+      return BoardConfigSchema.parse({
+        ...tx.initialConfig,
+        ...nextPatch,
+        revision: ev.revision,
+        updatedAt: ev.timestamp,
+      });
+    });
+  }
+
   public async ensureDefaultBoard(title = 'Project Context'): Promise<BoardConfig> {
     const boards = await this.listBoards();
     if (boards.length > 0) {
@@ -588,189 +812,220 @@ export class ContextDeckStore {
     boardSlug: string | undefined,
     actor: Actor,
     fn: (tx: MutationContext) => Promise<T>,
+    lockOptions?: WorkspaceLockOptions,
   ): Promise<T> {
     const validActor = parseStrict(ActorSchema, actor, 'actor');
 
-    return withWorkspaceLock(this.runtimeDir, async (assertActive) => {
-      const slug = await this.resolveBoardSlug(boardSlug);
-      const boardDir = this.boardPath(slug);
-      const initialConfig = await this.readBoardConfig(slug);
-      const eventsPath = await this.safeBoardFilePath(slug, 'events.jsonl');
-      const boardYamlPath = await this.safeBoardFilePath(slug, 'board.yaml');
+    return withWorkspaceLock(
+      this.runtimeDir,
+      async (assertActive) => {
+        await this.migrateLegacySessionsUnlocked(assertActive);
+        const slug = await this.resolveBoardSlug(boardSlug);
+        const boardDir = this.boardPath(slug);
+        const initialConfig = await this.readBoardConfig(slug);
+        const eventsPath = await this.safeBoardFilePath(slug, 'events.jsonl');
+        const boardYamlPath = await this.safeBoardFilePath(slug, 'board.yaml');
 
-      let currentRevision = initialConfig.revision;
-      let configDirty = false;
-      const stagedWrites: StagedWrite[] = [];
-      const eventsToAppend: TxnEventEntry[] = [];
+        let currentRevision = initialConfig.revision;
+        let configDirty = false;
+        let configPatch: Partial<
+          Pick<BoardConfig, 'title' | 'description' | 'lenses' | 'parentBoard' | 'paths'>
+        > = {};
+        const stagedWrites: StagedWrite[] = [];
+        const eventsToAppend: TxnEventEntry[] = [];
+        const afterCommitHooks: Array<() => Promise<void>> = [];
 
-      const tx: MutationContext = {
-        slug,
-        boardDir,
-        actor: validActor,
-        initialConfig,
-        getCurrentRevision: () => currentRevision,
-        stageFile: (finalPath, content, options) => {
-          stagedWrites.push({
-            kind: 'write',
-            finalPath,
-            content,
-            noClobber: options?.noClobber,
-          });
-        },
-        stagePreStagedFile: (tmpPath, finalPath, options) => {
-          stagedWrites.push({
-            kind: 'pre_staged',
-            tmpPath,
-            finalPath,
-            noClobber: options?.noClobber,
-          });
-        },
-        stageDelete: (finalPath) => {
-          stagedWrites.push({ kind: 'unlink', finalPath });
-        },
-        addEvent: (evInput) => {
-          currentRevision += 1;
-          configDirty = true;
-          const ev = BoardEventSchema.parse({
-            id: shortId('evt'),
-            revision: currentRevision,
-            timestamp: nowIso(),
-            actor: evInput.actor ?? validActor,
-            kind: evInput.kind,
-            entityId: evInput.entityId,
-            summary: evInput.summary,
-            details: evInput.details,
-          });
-          eventsToAppend.push({
-            eventsPath: toDeckRelativePath(this.deckDir, eventsPath),
-            eventId: ev.id,
-            line: `${JSON.stringify(ev)}\n`,
-          });
-          return ev;
-        },
-        markConfigDirty: () => {
-          configDirty = true;
-        },
-      };
-
-      const result = await fn(tx);
-      assertActive();
-
-      if (stagedWrites.length === 0 && eventsToAppend.length === 0 && !configDirty) {
-        return result;
-      }
-
-      // Stage all temp files (fsynced) concurrently BEFORE writing txn.json so the OS/filesystem
-      // can coalesce journal flushes while preserving the strict D1 commit barrier.
-      const createdTmpFiles: string[] = [];
-      const ops: TxnOp[] = [];
-      let boardCommit: TxnJournal['boardCommit'];
-
-      try {
-        assertActive();
-        const pendingTempWrites: Array<{
-          slot: number | 'board';
-          promise: Promise<string>;
-        }> = [];
-
-        for (let i = 0; i < stagedWrites.length; i += 1) {
-          const item = stagedWrites[i];
-          if (item.kind === 'write') {
-            pendingTempWrites.push({
-              slot: i,
-              promise: writeTempFileFsync(path.dirname(item.finalPath), item.content!),
+        const tx: MutationContext = {
+          slug,
+          boardDir,
+          actor: validActor,
+          initialConfig,
+          getCurrentRevision: () => currentRevision,
+          stageFile: (finalPath, content, options) => {
+            stagedWrites.push({
+              kind: 'write',
+              finalPath,
+              content,
+              noClobber: options?.noClobber,
             });
-          }
-        }
-
-        if (configDirty) {
-          const nextConfig: BoardConfig = {
-            ...initialConfig,
-            revision: currentRevision,
-            updatedAt: nowIso(),
-          };
-          pendingTempWrites.push({
-            slot: 'board',
-            promise: writeTempFileFsync(boardDir, dumpYaml(nextConfig)),
-          });
-        }
-
-        const settled = await Promise.allSettled(pendingTempWrites.map((w) => w.promise));
-        const stagedTmpBySlot = new Map<number | 'board', string>();
-        let firstError: unknown;
-        for (let i = 0; i < settled.length; i += 1) {
-          const res = settled[i];
-          if (res.status === 'fulfilled') {
-            createdTmpFiles.push(res.value);
-            stagedTmpBySlot.set(pendingTempWrites[i].slot, res.value);
-          } else if (firstError === undefined) {
-            firstError = res.reason;
-          }
-        }
-        if (firstError !== undefined) {
-          throw firstError;
-        }
-
-        for (let i = 0; i < stagedWrites.length; i += 1) {
-          const item = stagedWrites[i];
-          if (item.kind === 'unlink') {
-            ops.push({ kind: 'unlink', finalPath: toDeckRelativePath(this.deckDir, item.finalPath) });
-          } else if (item.kind === 'write') {
-            ops.push({
-              kind: item.noClobber ? 'link_create' : 'rename',
-              tmpPath: toDeckRelativePath(this.deckDir, stagedTmpBySlot.get(i)!),
-              finalPath: toDeckRelativePath(this.deckDir, item.finalPath),
+          },
+          stagePreStagedFile: (tmpPath, finalPath, options) => {
+            stagedWrites.push({
+              kind: 'pre_staged',
+              tmpPath,
+              finalPath,
+              noClobber: options?.noClobber,
             });
-          } else if (item.kind === 'pre_staged') {
-            ops.push({
-              kind: item.noClobber ? 'link_create' : 'rename',
-              tmpPath: toDeckRelativePath(this.deckDir, item.tmpPath!),
-              finalPath: toDeckRelativePath(this.deckDir, item.finalPath),
+          },
+          stageDelete: (finalPath) => {
+            stagedWrites.push({ kind: 'unlink', finalPath });
+          },
+          addEvent: (evInput) => {
+            currentRevision += 1;
+            configDirty = true;
+            const ev = BoardEventSchema.parse({
+              id: shortId('evt'),
+              revision: currentRevision,
+              timestamp: nowIso(),
+              actor: evInput.actor ?? validActor,
+              kind: evInput.kind,
+              entityId: evInput.entityId,
+              summary: evInput.summary,
+              details: evInput.details,
             });
-          }
-        }
-
-        if (configDirty) {
-          boardCommit = {
-            tmpPath: toDeckRelativePath(this.deckDir, stagedTmpBySlot.get('board')!),
-            finalPath: toDeckRelativePath(this.deckDir, boardYamlPath),
-          };
-        }
-
-        const txn: TxnJournal = {
-          id: shortId('txn'),
-          boardSlug: slug,
-          ops,
-          events: eventsToAppend,
-          boardCommit,
+            eventsToAppend.push({
+              eventsPath: toDeckRelativePath(this.deckDir, eventsPath),
+              eventId: ev.id,
+              line: `${JSON.stringify(ev)}\n`,
+            });
+            return ev;
+          },
+          markConfigDirty: () => {
+            configDirty = true;
+          },
+          setConfigPatch: (patch) => {
+            configPatch = { ...configPatch, ...patch };
+            configDirty = true;
+          },
+          onAfterCommit: (hook) => {
+            afterCommitHooks.push(hook);
+          },
         };
 
-        const txnPath = path.join(this.runtimeDir, TXN_FILENAME);
+        const result = await fn(tx);
         assertActive();
-        await atomicWriteFile(txnPath, `${JSON.stringify(txn, null, 2)}\n`);
-        maybeInjectFault('after-txn-write');
 
-        await executeTxnJournal(txnPath, txn, {
-          deckDir: this.deckDir,
-          assertActive,
-          allowFaultInjection: true,
-          checkEventDedupe: false,
-        });
-        return result;
-      } catch (err) {
-        // Skip all filesystem cleanup if the lock was compromised (R5-5), and never
-        // remove temp files once txn.json exists (roll-forward recovery needs them!).
-        // R6-1: revalidate current lock ownership too, since a lost lock can surface as an unrelated I/O error.
         if (
-          !(err instanceof LockCompromisedError) &&
-          lockStillOwned(assertActive) &&
-          !existsSync(path.join(this.runtimeDir, TXN_FILENAME))
+          stagedWrites.length === 0 &&
+          eventsToAppend.length === 0 &&
+          !configDirty &&
+          afterCommitHooks.length === 0
         ) {
-          await Promise.all(createdTmpFiles.map((p) => fs.rm(p, { force: true }).catch(() => {})));
+          return result;
         }
-        throw err;
-      }
-    }, this.deckDir);
+
+        if (stagedWrites.length > 0 || eventsToAppend.length > 0 || configDirty) {
+          // Stage all temp files (fsynced) concurrently BEFORE writing txn.json so the OS/filesystem
+          // can coalesce journal flushes while preserving the strict D1 commit barrier.
+          const createdTmpFiles: string[] = [];
+          const ops: TxnOp[] = [];
+          let boardCommit: TxnJournal['boardCommit'];
+
+          try {
+            assertActive();
+            const pendingTempWrites: Array<{
+              slot: number | 'board';
+              promise: Promise<string>;
+            }> = [];
+
+            for (let i = 0; i < stagedWrites.length; i += 1) {
+              const item = stagedWrites[i];
+              if (item.kind === 'write') {
+                pendingTempWrites.push({
+                  slot: i,
+                  promise: writeTempFileFsync(path.dirname(item.finalPath), item.content!),
+                });
+              }
+            }
+
+            if (configDirty) {
+              const nextConfig: BoardConfig = BoardConfigSchema.parse({
+                ...initialConfig,
+                ...configPatch,
+                revision: currentRevision,
+                updatedAt: nowIso(),
+              });
+              pendingTempWrites.push({
+                slot: 'board',
+                promise: writeTempFileFsync(boardDir, dumpYaml(nextConfig)),
+              });
+            }
+
+            const settled = await Promise.allSettled(pendingTempWrites.map((w) => w.promise));
+            const stagedTmpBySlot = new Map<number | 'board', string>();
+            let firstError: unknown;
+            for (let i = 0; i < settled.length; i += 1) {
+              const res = settled[i];
+              if (res.status === 'fulfilled') {
+                createdTmpFiles.push(res.value);
+                stagedTmpBySlot.set(pendingTempWrites[i].slot, res.value);
+              } else if (firstError === undefined) {
+                firstError = res.reason;
+              }
+            }
+            if (firstError !== undefined) {
+              throw firstError;
+            }
+
+            for (let i = 0; i < stagedWrites.length; i += 1) {
+              const item = stagedWrites[i];
+              if (item.kind === 'unlink') {
+                ops.push({ kind: 'unlink', finalPath: toDeckRelativePath(this.deckDir, item.finalPath) });
+              } else if (item.kind === 'write') {
+                ops.push({
+                  kind: item.noClobber ? 'link_create' : 'rename',
+                  tmpPath: toDeckRelativePath(this.deckDir, stagedTmpBySlot.get(i)!),
+                  finalPath: toDeckRelativePath(this.deckDir, item.finalPath),
+                });
+              } else if (item.kind === 'pre_staged') {
+                ops.push({
+                  kind: item.noClobber ? 'link_create' : 'rename',
+                  tmpPath: toDeckRelativePath(this.deckDir, item.tmpPath!),
+                  finalPath: toDeckRelativePath(this.deckDir, item.finalPath),
+                });
+              }
+            }
+
+            if (configDirty) {
+              boardCommit = {
+                tmpPath: toDeckRelativePath(this.deckDir, stagedTmpBySlot.get('board')!),
+                finalPath: toDeckRelativePath(this.deckDir, boardYamlPath),
+              };
+            }
+
+            const txn: TxnJournal = {
+              id: shortId('txn'),
+              boardSlug: slug,
+              ops,
+              events: eventsToAppend,
+              boardCommit,
+            };
+
+            const txnPath = path.join(this.runtimeDir, TXN_FILENAME);
+            assertActive();
+            await atomicWriteFile(txnPath, `${JSON.stringify(txn, null, 2)}\n`);
+            maybeInjectFault('after-txn-write');
+
+            await executeTxnJournal(txnPath, txn, {
+              deckDir: this.deckDir,
+              assertActive,
+              allowFaultInjection: true,
+              checkEventDedupe: false,
+            });
+          } catch (err) {
+            // Skip all filesystem cleanup if the lock was compromised (R5-5), and never
+            // remove temp files once txn.json exists (roll-forward recovery needs them!).
+            // R6-1: revalidate current lock ownership too, since a lost lock can surface as an unrelated I/O error.
+            if (
+              !(err instanceof LockCompromisedError) &&
+              lockStillOwned(assertActive) &&
+              !existsSync(path.join(this.runtimeDir, TXN_FILENAME))
+            ) {
+              await Promise.all(createdTmpFiles.map((p) => fs.rm(p, { force: true }).catch(() => {})));
+            }
+            throw err;
+          }
+        }
+
+        for (const hook of afterCommitHooks) {
+          assertActive();
+          await hook();
+        }
+        return result;
+      },
+      this.deckDir,
+      lockOptions,
+    );
   }
 
   public async readBoardConfig(slug: string): Promise<BoardConfig> {
@@ -922,10 +1177,148 @@ export class ContextDeckStore {
     return collected;
   }
 
+  private hydrateSession(
+    raw: LegacySessionFile & { board: string },
+    targetBoard: string,
+    cursor: SessionCursor | null,
+  ): Session {
+    const syncedForBoard = cursor?.syncedRevisions[targetBoard];
+    const fallbackSynced =
+      targetBoard === raw.board ? (raw.lastSyncedRevision ?? 0) : 0;
+    return SessionSchema.parse({
+      id: raw.id,
+      title: raw.title,
+      harness: raw.harness,
+      ...(raw.externalRef !== undefined ? { externalRef: raw.externalRef } : {}),
+      board: raw.board,
+      parentSessionId: raw.parentSessionId,
+      relatedSessionIds: raw.relatedSessionIds,
+      status: raw.status,
+      summary: raw.summary,
+      focusFiles: raw.focusFiles,
+      lastSyncedRevision: syncedForBoard !== undefined ? syncedForBoard : fallbackSynced,
+      ...(cursor?.lastActiveAt !== undefined ? { lastActiveAt: cursor.lastActiveAt } : {}),
+      createdAt: raw.createdAt,
+      updatedAt: raw.updatedAt,
+    });
+  }
+
+  private async readWorkspaceSessionRaw(
+    sessionId: string,
+  ): Promise<(LegacySessionFile & { board: string }) | null> {
+    const validId = validateEntityId(sessionId, 'sessionId');
+    const filePath = await this.safeSessionFilePath(validId);
+    const parsed = await readYamlStrict(filePath, LegacySessionFileSchema);
+    if (!parsed) return null;
+    const board = parsed.board ?? (await this.getDefaultBoardSlug());
+    return { ...parsed, board };
+  }
+
+  private async listAllRawSessions(): Promise<Array<LegacySessionFile & { board: string }>> {
+    const byId = new Map<string, LegacySessionFile & { board: string }>();
+
+    // 1. Workspace-scoped sessions in `<deck>/sessions/*.yaml` (canonical D11 location)
+    const canonicalSessionsDir = await this.assertSessionsDirSafe();
+    const wsFiles = await listFilesStrict(canonicalSessionsDir, '.yaml');
+    for (const file of wsFiles) {
+      const filePath = await assertContainedPath(
+        canonicalSessionsDir,
+        path.join(canonicalSessionsDir, file),
+        { label: `session ${file}` },
+      );
+      const parsed = await readYamlStrict(filePath, LegacySessionFileSchema);
+      if (parsed) {
+        const board = parsed.board ?? (await this.getDefaultBoardSlug());
+        byId.set(parsed.id, { ...parsed, board });
+      }
+    }
+
+    // 2. Read-only fallback for unmigrated fabf58c board-scoped `boards/<slug>/sessions/*.yaml`
+    let boardEntries: Dirent[] = [];
+    try {
+      boardEntries = await fs.readdir(this.boardsDir, { withFileTypes: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw err;
+      }
+    }
+    for (const entry of boardEntries) {
+      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+      const legacyDir = path.join(this.boardsDir, entry.name, 'sessions');
+      if (!existsSync(legacyDir)) continue;
+      const safeDir = await this.safeBoardFilePath(entry.name, 'sessions');
+      const legacyFiles = await listFilesStrict(safeDir, '.yaml');
+      for (const file of legacyFiles) {
+        const filePath = await assertContainedPath(safeDir, path.join(safeDir, file), {
+          label: `legacy session ${file}`,
+        });
+        const parsed = await readYamlStrict(filePath, LegacySessionFileSchema);
+        if (parsed && !byId.has(parsed.id)) {
+          byId.set(parsed.id, { ...parsed, board: parsed.board ?? entry.name });
+        }
+      }
+    }
+
+    return Array.from(byId.values()).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  private async readSessionRawAcrossWorkspace(
+    sessionId: string,
+  ): Promise<(LegacySessionFile & { board: string }) | null> {
+    const direct = await this.readWorkspaceSessionRaw(sessionId);
+    if (direct) return direct;
+
+    const validId = validateEntityId(sessionId, 'sessionId');
+    let boardEntries;
+    try {
+      boardEntries = await fs.readdir(this.boardsDir, { withFileTypes: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw err;
+    }
+    for (const entry of boardEntries) {
+      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+      const legacyDir = path.join(this.boardsDir, entry.name, 'sessions');
+      if (!existsSync(legacyDir)) continue;
+      const legacyPath = await this.safeBoardFilePath(entry.name, 'sessions', `${validId}.yaml`);
+      const parsed = await readYamlStrict(legacyPath, LegacySessionFileSchema);
+      if (parsed) {
+        return { ...parsed, board: parsed.board ?? entry.name };
+      }
+    }
+    return null;
+  }
+
+  public async getSession(sessionId: string, boardForCursor?: string): Promise<Session | null> {
+    const raw = await this.readSessionRawAcrossWorkspace(sessionId);
+    if (!raw) return null;
+    const cursor = await this.readSessionCursor(raw.id);
+    return this.hydrateSession(raw, boardForCursor ?? raw.board, cursor);
+  }
+
+  public async findSessionByExternalRef(externalRef: string): Promise<Session | null> {
+    if (!externalRef) return null;
+    const all = await this.listAllRawSessions();
+    const match = all.find((s) => s.externalRef === externalRef);
+    if (!match) return null;
+    const cursor = await this.readSessionCursor(match.id);
+    return this.hydrateSession(match, match.board, cursor);
+  }
+
+  public async listAllSessions(): Promise<Session[]> {
+    const rawAll = await this.listAllRawSessions();
+    return Promise.all(
+      rawAll.map(async (raw) => {
+        const cursor = await this.readSessionCursor(raw.id);
+        return this.hydrateSession(raw, raw.board, cursor);
+      }),
+    );
+  }
+
   /**
-   * Lightweight session drift check (E3 amended):
-   * Reads ONLY board.yaml, the single session yaml, and the tail of events.jsonl.
-   * Never loads media, diagrams, quizzes, decisions, or tasks.
+   * Lightweight session drift check (E3 amended, D11, AC6.1):
+   * Reads ONLY board.yaml, the single session yaml, its runtime cursor, and the tail of events.jsonl.
+   * When `boardSlug` is omitted, defaults to the session's bound board (`session.board`).
    */
   public async getSessionDrift(
     boardSlug: string | undefined,
@@ -937,14 +1330,17 @@ export class ContextDeckStore {
       currentRevision: number;
     }
   > {
-    const slug = await this.resolveBoardSlug(boardSlug);
     validateEntityId(sessionId, 'sessionId');
-    const config = await this.readBoardConfig(slug);
-    const sessionPath = await this.safeBoardFilePath(slug, 'sessions', `${sessionId}.yaml`);
-    const session = await readYamlStrict(sessionPath, SessionSchema);
-    if (!session) {
-      throw new NotFoundError(`Session "${sessionId}" not found on board "${slug}".`);
+    const raw = await this.readSessionRawAcrossWorkspace(sessionId);
+    if (!raw) {
+      throw new NotFoundError(`Session "${sessionId}" not found.`);
     }
+    const slug = boardSlug ? validateBoardSlug(boardSlug) : validateBoardSlug(raw.board);
+    const [config, cursor] = await Promise.all([
+      this.readBoardConfig(slug),
+      this.readSessionCursor(raw.id),
+    ]);
+    const session = this.hydrateSession(raw, slug, cursor);
 
     if (session.lastSyncedRevision >= config.revision) {
       return {
@@ -979,15 +1375,15 @@ export class ContextDeckStore {
   }
 
   public async listSessions(slug: string): Promise<Session[]> {
-    const dir = await this.safeBoardFilePath(slug, 'sessions');
-    const files = await listFilesStrict(dir, '.yaml');
-    const out: Session[] = [];
-    for (const file of files) {
-      const filePath = await assertContainedPath(dir, path.join(dir, file), { label: `session ${file}` });
-      const parsed = await readYamlStrict(filePath, SessionSchema);
-      if (parsed) out.push(parsed);
-    }
-    return out.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    const validSlug = validateBoardSlug(slug);
+    const rawAll = await this.listAllRawSessions();
+    const matching = rawAll.filter((s) => s.board === validSlug);
+    return Promise.all(
+      matching.map(async (raw) => {
+        const cursor = await this.readSessionCursor(raw.id);
+        return this.hydrateSession(raw, validSlug, cursor);
+      }),
+    );
   }
 
   public async listDecisions(slug: string): Promise<Decision[]> {
@@ -1435,33 +1831,84 @@ export class ContextDeckStore {
     const input = parseStrict(RegisterSessionInputSchema.omit({ actor: true }), rawInput, 'session');
     const effActor = actorOverride ?? tx.actor;
     const now = nowIso();
-    const id = input.id ? validateEntityId(input.id, 'sessionId') : shortId('sess');
-    const filePath = await this.safeBoardFilePath(tx.slug, 'sessions', `${id}.yaml`);
+    await ensureDir(this.sessionsDir);
+
+    // D11: Dedupe by externalRef when provided so repeated calls / resumes reuse the same session record
+    let existing: (LegacySessionFile & { board: string }) | null = null;
+    if (input.externalRef) {
+      const all = await this.listAllRawSessions();
+      existing = all.find((s) => s.externalRef === input.externalRef) ?? null;
+    } else if (input.id) {
+      existing = await this.readWorkspaceSessionRaw(input.id);
+    }
+
+    const id = existing
+      ? existing.id
+      : input.id
+        ? validateEntityId(input.id, 'sessionId')
+        : shortId('sess');
+    const filePath = await this.safeSessionFilePath(id);
+    const harness = input.harness ?? existing?.harness ?? effActor.harness ?? 'custom';
 
     const ev = tx.addEvent({
-      kind: 'session.registered',
+      kind: existing ? 'session.updated' : 'session.registered',
       entityId: id,
-      summary: `Registered ${input.harness ?? effActor.harness ?? 'custom'} session "${input.title}"`,
-      actor: { ...effActor, harness: input.harness ?? effActor.harness ?? 'custom', sessionId: id },
+      summary: existing
+        ? `Resumed ${harness} session "${input.title}"`
+        : `Registered ${harness} session "${input.title}"`,
+      actor: { ...effActor, harness, sessionId: id },
     });
 
-    const session = SessionSchema.parse({
+    const meta = SessionMetadataSchema.parse({
       id,
       title: input.title,
-      harness: input.harness ?? effActor.harness ?? 'custom',
-      externalRef: input.externalRef,
-      parentSessionId: input.parentSessionId ?? null,
-      relatedSessionIds: input.relatedSessionIds ?? [],
+      harness,
+      ...(input.externalRef !== undefined
+        ? { externalRef: input.externalRef }
+        : existing?.externalRef !== undefined
+          ? { externalRef: existing.externalRef }
+          : {}),
+      board: tx.slug,
+      parentSessionId:
+        input.parentSessionId !== undefined
+          ? input.parentSessionId
+          : (existing?.parentSessionId ?? null),
+      relatedSessionIds: input.relatedSessionIds ?? existing?.relatedSessionIds ?? [],
       status: input.status ?? 'active',
-      summary: input.summary ?? '',
-      focusFiles: input.focusFiles ?? [],
-      lastSyncedRevision: input.lastSyncedRevision ?? ev.revision,
-      createdAt: now,
+      summary: input.summary !== undefined ? input.summary : (existing?.summary ?? ''),
+      focusFiles: input.focusFiles ?? existing?.focusFiles ?? [],
+      createdAt: existing?.createdAt ?? now,
       updatedAt: now,
     });
 
-    tx.stageFile(filePath, dumpYaml(session));
-    return session;
+    tx.stageFile(filePath, dumpYaml(meta));
+
+    const existingCursor = await this.readSessionCursor(id);
+    const existingRevForBoard = existingCursor?.syncedRevisions[tx.slug];
+    const targetSyncedRevision =
+      input.lastSyncedRevision !== undefined
+        ? input.lastSyncedRevision
+        : existingRevForBoard !== undefined
+          ? existingRevForBoard
+          : ev.revision;
+
+    const nextCursor: SessionCursor = {
+      sessionId: id,
+      syncedRevisions: {
+        ...(existingCursor?.syncedRevisions ?? {}),
+        [tx.slug]: targetSyncedRevision,
+      },
+      lastActiveAt: now,
+      ...(existingCursor?.lastCursorInjectAt
+        ? { lastCursorInjectAt: existingCursor.lastCursorInjectAt }
+        : {}),
+    };
+
+    tx.onAfterCommit(async () => {
+      await this.writeSessionCursor(nextCursor);
+    });
+
+    return this.hydrateSession(meta, tx.slug, nextCursor);
   }
 
   private async updateSessionUnlocked(
@@ -1473,35 +1920,53 @@ export class ContextDeckStore {
     validateEntityId(sessionId, 'sessionId');
     const patch = parseStrict(UpdateSessionPatchSchema.omit({ actor: true }), rawPatch, 'session patch');
     const effActor = actorOverride ?? tx.actor;
-    const filePath = await this.safeBoardFilePath(tx.slug, 'sessions', `${sessionId}.yaml`);
-    const existing = await readYamlStrict(filePath, SessionSchema);
+    const filePath = await this.safeSessionFilePath(sessionId);
+    const existing = await this.readWorkspaceSessionRaw(sessionId);
     if (!existing) {
-      throw new NotFoundError(`Session "${sessionId}" not found on board "${tx.slug}".`);
+      throw new NotFoundError(`Session "${sessionId}" not found.`);
     }
 
-    // D7 / E3: Metadata updates NEVER move lastSyncedRevision
-    const updated = SessionSchema.parse({
-      ...existing,
-      ...(patch.title !== undefined ? { title: patch.title } : {}),
-      ...(patch.harness !== undefined ? { harness: patch.harness } : {}),
-      ...(patch.externalRef !== undefined ? { externalRef: patch.externalRef } : {}),
-      ...(patch.parentSessionId !== undefined ? { parentSessionId: patch.parentSessionId } : {}),
-      ...(patch.relatedSessionIds !== undefined ? { relatedSessionIds: patch.relatedSessionIds } : {}),
-      ...(patch.status !== undefined ? { status: patch.status } : {}),
-      ...(patch.summary !== undefined ? { summary: patch.summary } : {}),
-      ...(patch.focusFiles !== undefined ? { focusFiles: patch.focusFiles } : {}),
-      lastSyncedRevision: existing.lastSyncedRevision,
+    if (patch.board !== undefined) {
+      // Verify target board exists
+      await this.readBoardConfig(patch.board);
+    }
+
+    const nextBoard = patch.board ?? existing.board;
+
+    // D7 / D11: Metadata updates NEVER move syncedRevisions cursor
+    const updatedMeta = SessionMetadataSchema.parse({
+      id: existing.id,
+      title: patch.title !== undefined ? patch.title : existing.title,
+      harness: patch.harness !== undefined ? patch.harness : existing.harness,
+      ...(patch.externalRef !== undefined
+        ? { externalRef: patch.externalRef }
+        : existing.externalRef !== undefined
+          ? { externalRef: existing.externalRef }
+          : {}),
+      board: nextBoard,
+      parentSessionId:
+        patch.parentSessionId !== undefined ? patch.parentSessionId : existing.parentSessionId,
+      relatedSessionIds:
+        patch.relatedSessionIds !== undefined
+          ? patch.relatedSessionIds
+          : existing.relatedSessionIds,
+      status: patch.status !== undefined ? patch.status : existing.status,
+      summary: patch.summary !== undefined ? patch.summary : existing.summary,
+      focusFiles: patch.focusFiles !== undefined ? patch.focusFiles : existing.focusFiles,
+      createdAt: existing.createdAt,
       updatedAt: nowIso(),
     });
 
-    tx.stageFile(filePath, dumpYaml(updated));
+    tx.stageFile(filePath, dumpYaml(updatedMeta));
     tx.addEvent({
       kind: 'session.updated',
-      entityId: updated.id,
-      summary: `Updated session "${updated.title}" (${updated.status})`,
-      actor: { ...effActor, harness: updated.harness, sessionId: updated.id },
+      entityId: updatedMeta.id,
+      summary: `Updated session "${updatedMeta.title}" (${updatedMeta.status})`,
+      actor: { ...effActor, harness: updatedMeta.harness, sessionId: updatedMeta.id },
     });
-    return updated;
+
+    const cursor = await this.readSessionCursor(updatedMeta.id);
+    return this.hydrateSession(updatedMeta, nextBoard, cursor);
   }
 
   private async applySupersessionUnlocked(
@@ -1969,6 +2434,7 @@ export class ContextDeckStore {
         | 'title'
         | 'harness'
         | 'externalRef'
+        | 'board'
         | 'parentSessionId'
         | 'relatedSessionIds'
         | 'status'
@@ -1978,15 +2444,45 @@ export class ContextDeckStore {
     >,
     actor: Actor = DEFAULT_ACTOR,
   ): Promise<Session> {
-    return this.mutate(boardSlug, actor, (tx) =>
+    let targetBoard = boardSlug;
+    if (!targetBoard) {
+      const existing = await this.readSessionRawAcrossWorkspace(sessionId);
+      if (existing) targetBoard = existing.board;
+    }
+    return this.mutate(targetBoard, actor, (tx) =>
       this.updateSessionUnlocked(tx, sessionId, patch as Record<string, unknown>),
     );
   }
 
+  /**
+   * Rebind a workspace session to a different board (AC6.4).
+   * Preserves per-board sync cursors in `.runtime/cursors/<id>.json`.
+   */
+  public async rebindSession(
+    sessionId: string,
+    targetBoardSlug: string,
+    actor: Actor = DEFAULT_ACTOR,
+  ): Promise<Session> {
+    validateEntityId(sessionId, 'sessionId');
+    const validBoard = validateBoardSlug(targetBoardSlug);
+    return this.mutate(validBoard, actor, (tx) =>
+      this.updateSessionUnlocked(tx, sessionId, { board: validBoard }),
+    );
+  }
+
+  /**
+   * Advance a session's sync cursor for a board (D7, D11).
+   * Writes ONLY `<deck>/.runtime/cursors/<id>.json` (never dirties git-tracked files).
+   */
   public async syncSession(
     boardSlug: string | undefined,
     sessionId: string,
-    options?: { ackRevision?: number; maxDigestLines?: number },
+    options?: {
+      ackRevision?: number;
+      maxDigestLines?: number;
+      stampCursorThrottle?: boolean;
+      maxWaitMs?: number;
+    },
   ): Promise<
     SessionDigestResult & {
       session: Session;
@@ -2000,45 +2496,69 @@ export class ContextDeckStore {
       options?.ackRevision !== undefined ? { ackRevision: options.ackRevision } : {},
       'syncSession options',
     );
-    return this.mutate(boardSlug, { type: 'system', sessionId, label: 'sync' }, async (tx) => {
-      const filePath = await this.safeBoardFilePath(tx.slug, 'sessions', `${sessionId}.yaml`);
-      const existing = await readYamlStrict(filePath, SessionSchema);
-      if (!existing) {
-        throw new NotFoundError(`Session "${sessionId}" not found on board "${tx.slug}".`);
-      }
+    return withWorkspaceLock(
+      this.runtimeDir,
+      async (assertActive) => {
+        await this.migrateLegacySessionsUnlocked(assertActive);
+        const existing = await this.readWorkspaceSessionRaw(sessionId);
+        if (!existing) {
+          throw new NotFoundError(`Session "${sessionId}" not found.`);
+        }
 
-      const currentRevision = tx.initialConfig.revision;
-      const requestedAck =
-        validatedOpts.ackRevision !== undefined
-          ? Math.min(validatedOpts.ackRevision, currentRevision)
-          : currentRevision;
-      const ackRevision = Math.max(existing.lastSyncedRevision, requestedAck);
+        const slug = boardSlug ? validateBoardSlug(boardSlug) : validateBoardSlug(existing.board);
+        const config = await this.readBoardConfig(slug);
+        const existingCursor = await this.readSessionCursor(existing.id);
 
-      const tailEvents =
-        ackRevision > existing.lastSyncedRevision
-          ? await this.readEventsSince(tx.slug, existing.lastSyncedRevision, ackRevision)
-          : [];
-      const digestResult = buildSessionDriftDigest({
-        sessionId: existing.id,
-        lastSyncedRevision: existing.lastSyncedRevision,
-        currentRevision: ackRevision,
-        events: tailEvents,
-        maxLines: options?.maxDigestLines,
-      });
+        const currentRevision = config.revision;
+        const prevSynced =
+          existingCursor?.syncedRevisions[slug] ??
+          (slug === existing.board ? (existing.lastSyncedRevision ?? 0) : 0);
+        const requestedAck =
+          validatedOpts.ackRevision !== undefined
+            ? Math.min(validatedOpts.ackRevision, currentRevision)
+            : currentRevision;
+        const ackRevision = Math.max(prevSynced, requestedAck);
 
-      const updated: Session = SessionSchema.parse({
-        ...existing,
-        lastSyncedRevision: ackRevision,
-        updatedAt: nowIso(),
-      });
-      tx.stageFile(filePath, dumpYaml(updated));
-      return {
-        session: updated,
-        currentRevision,
-        ackRevision,
-        ...digestResult,
-      };
-    });
+        const tailEvents =
+          ackRevision > prevSynced
+            ? await this.readEventsSince(slug, prevSynced, ackRevision)
+            : [];
+        const digestResult = buildSessionDriftDigest({
+          sessionId: existing.id,
+          lastSyncedRevision: prevSynced,
+          currentRevision: ackRevision,
+          events: tailEvents,
+          maxLines: options?.maxDigestLines,
+        });
+
+        const now = nowIso();
+        const nextCursor: SessionCursor = {
+          sessionId: existing.id,
+          syncedRevisions: {
+            ...(existingCursor?.syncedRevisions ?? {}),
+            [slug]: ackRevision,
+          },
+          lastActiveAt: now,
+          ...(options?.stampCursorThrottle
+            ? { lastCursorInjectAt: now }
+            : existingCursor?.lastCursorInjectAt
+              ? { lastCursorInjectAt: existingCursor.lastCursorInjectAt }
+              : {}),
+        };
+
+        assertActive();
+        await this.writeSessionCursor(nextCursor);
+
+        return {
+          session: this.hydrateSession(existing, slug, nextCursor),
+          currentRevision,
+          ackRevision,
+          ...digestResult,
+        };
+      },
+      this.deckDir,
+      options?.maxWaitMs !== undefined ? { maxWaitMs: options.maxWaitMs } : undefined,
+    );
   }
 
   public async deleteSession(
@@ -2047,15 +2567,384 @@ export class ContextDeckStore {
     actor: Actor = DEFAULT_ACTOR,
   ): Promise<void> {
     validateEntityId(sessionId, 'sessionId');
-    await this.mutate(boardSlug, actor, async (tx) => {
-      const filePath = await this.safeBoardFilePath(tx.slug, 'sessions', `${sessionId}.yaml`);
+    let targetBoard = boardSlug;
+    if (!targetBoard) {
+      const existing = await this.readSessionRawAcrossWorkspace(sessionId);
+      if (existing) targetBoard = existing.board;
+    }
+    await this.mutate(targetBoard, actor, async (tx) => {
+      const filePath = await this.safeSessionFilePath(sessionId);
       tx.stageDelete(filePath);
       tx.addEvent({
         kind: 'session.deleted',
         entityId: sessionId,
         summary: `Removed session ${sessionId}`,
       });
+      tx.onAfterCommit(async () => {
+        await this.deleteSessionCursor(sessionId);
+      });
     });
+  }
+
+  /**
+   * Hook helper for SessionStart / sessionStart (AC5.1-AC5.4, D11, D12, D15):
+   * - Runs under workspace lock bounded by `maxWaitMs` (default 800ms).
+   * - Deduplicates by `externalRef`; never stores raw prompt text; routes new sessions via board `paths` globs.
+   * - Does NOT bump `board.yaml` revision or churn `events.jsonl`.
+   * - Advances `.runtime/cursors/<id>.json` to the snapshot revision returned.
+   */
+  public async upsertHookSession(params: {
+    externalRef: string;
+    harness: string;
+    defaultTitle: string;
+    cwd?: string;
+    maxWaitMs?: number;
+  }): Promise<{
+    session: Session;
+    boardSlug: string;
+    snapshot: BoardSnapshot;
+    created: boolean;
+  }> {
+    const maxWaitMs = params.maxWaitMs ?? 800;
+    return withWorkspaceLock(
+      this.runtimeDir,
+      async (assertActive) => {
+        await this.migrateLegacySessionsUnlocked(assertActive);
+        const boards = await this.listBoards();
+        if (boards.length === 0) {
+          throw new NotFoundError('No ContextDeck boards exist in this workspace.');
+        }
+        const defaultBoard = await this.getDefaultBoardSlug();
+        const existingBoardsSet = new Set(boards.map((b) => b.slug));
+
+        const allRaw = await this.listAllRawSessions();
+        const existing = allRaw.find((s) => s.externalRef === params.externalRef);
+
+        const now = nowIso();
+        let meta: SessionMetadata;
+        let created = false;
+        let boardSlug: string;
+
+        if (existing) {
+          boardSlug = existingBoardsSet.has(existing.board)
+            ? existing.board
+            : routeBoardForCwd(boards, params.cwd, this.projectRoot, defaultBoard);
+          meta = SessionMetadataSchema.parse({
+            id: existing.id,
+            title: existing.title,
+            harness: existing.harness,
+            externalRef: existing.externalRef,
+            board: boardSlug,
+            parentSessionId: existing.parentSessionId,
+            relatedSessionIds: existing.relatedSessionIds,
+            status: existing.status === 'idle' || existing.status === 'paused' ? 'active' : existing.status,
+            summary: existing.summary,
+            focusFiles: existing.focusFiles,
+            createdAt: existing.createdAt,
+            updatedAt:
+              existing.status === 'idle' || existing.status === 'paused' || boardSlug !== existing.board
+                ? now
+                : existing.updatedAt,
+          });
+          // Only write metadata YAML if status or bound board actually changed (keeps git clean on resume)
+          if (meta.status !== existing.status || meta.board !== existing.board) {
+            await ensureDir(this.sessionsDir);
+            const filePath = await this.safeSessionFilePath(meta.id);
+            assertActive();
+            await atomicWriteFile(filePath, dumpYaml(meta));
+          }
+        } else {
+          created = true;
+          boardSlug = routeBoardForCwd(boards, params.cwd, this.projectRoot, defaultBoard);
+          meta = SessionMetadataSchema.parse({
+            id: shortId('sess'),
+            title: params.defaultTitle,
+            harness: params.harness,
+            externalRef: params.externalRef,
+            board: boardSlug,
+            parentSessionId: null,
+            relatedSessionIds: [],
+            status: 'active',
+            summary: '',
+            focusFiles: [],
+            createdAt: now,
+            updatedAt: now,
+          });
+          await ensureDir(this.sessionsDir);
+          const filePath = await this.safeSessionFilePath(meta.id);
+          assertActive();
+          await atomicWriteFile(filePath, dumpYaml(meta));
+        }
+
+        const snapshot = await this.readSnapshotOnce(boardSlug);
+        const existingCursor = await this.readSessionCursor(meta.id);
+        const nextCursor: SessionCursor = {
+          sessionId: meta.id,
+          syncedRevisions: {
+            ...(existingCursor?.syncedRevisions ?? {}),
+            [boardSlug]: snapshot.config.revision,
+          },
+          lastActiveAt: now,
+          ...(existingCursor?.lastCursorInjectAt
+            ? { lastCursorInjectAt: existingCursor.lastCursorInjectAt }
+            : {}),
+        };
+        assertActive();
+        await this.writeSessionCursor(nextCursor);
+
+        return {
+          session: this.hydrateSession(meta, boardSlug, nextCursor),
+          boardSlug,
+          snapshot,
+          created,
+        };
+      },
+      this.deckDir,
+      { maxWaitMs },
+    );
+  }
+
+  /**
+   * Hook fast-path helper for UserPromptSubmit / postToolUse (AC5.2-AC5.4, D11, D12):
+   * 1. Lock-free read of session, board.yaml, cursor, and events tail; exits immediately with 'noop' if not behind.
+   * 2. Enforces optional throttleMs (Cursor 60s) without advancing cursor when throttled.
+   * 3. Acquires bounded workspace lock (`maxWaitMs`, default 800ms) only when registering or emitting a digest.
+   *    If the lock times out, throws LockTimeoutError and leaves the cursor unchanged.
+   */
+  public async checkAndSyncHookDrift(params: {
+    externalRef: string;
+    harness: string;
+    defaultTitle: string;
+    cwd?: string;
+    throttleMs?: number;
+    maxWaitMs?: number;
+    maxDigestLines?: number;
+    now?: Date;
+  }): Promise<{
+    action: 'noop' | 'throttled' | 'registered_silent' | 'digest';
+    session?: Session;
+    boardConfig?: BoardConfig;
+    digestResult?: SessionDigestResult;
+  }> {
+    const maxWaitMs = params.maxWaitMs ?? 800;
+    const nowDate = params.now ?? new Date();
+    const nowMs = nowDate.getTime();
+
+    // --- Lock-free fast path (D12) ---
+    const fastMatch = (await this.listAllRawSessions()).find(
+      (s) => s.externalRef === params.externalRef,
+    );
+    if (fastMatch) {
+      const boardSlug = fastMatch.board;
+      const [config, cursor] = await Promise.all([
+        this.readBoardConfig(boardSlug),
+        this.readSessionCursor(fastMatch.id),
+      ]);
+      const lastSynced =
+        cursor?.syncedRevisions[boardSlug] ?? fastMatch.lastSyncedRevision ?? 0;
+
+      if (lastSynced >= config.revision) {
+        return { action: 'noop' };
+      }
+
+      const tailEvents = await this.readEventsSince(boardSlug, lastSynced, config.revision);
+      const fastDigest = buildSessionDriftDigest({
+        sessionId: fastMatch.id,
+        lastSyncedRevision: lastSynced,
+        currentRevision: config.revision,
+        events: tailEvents,
+        maxLines: params.maxDigestLines,
+      });
+
+      if (fastDigest.behindBy === 0 || fastDigest.digest.length === 0) {
+        return { action: 'noop' };
+      }
+
+      if (params.throttleMs !== undefined && cursor?.lastCursorInjectAt) {
+        const lastInjectMs = Date.parse(cursor.lastCursorInjectAt);
+        if (Number.isFinite(lastInjectMs) && nowMs - lastInjectMs < params.throttleMs) {
+          // D12: Never advance cursor when throttled
+          return { action: 'throttled' };
+        }
+      }
+    }
+
+    // --- Locked commit path (only when registering a new session OR emitting a real digest) ---
+    return withWorkspaceLock(
+      this.runtimeDir,
+      async (assertActive) => {
+        await this.migrateLegacySessionsUnlocked(assertActive);
+        const boards = await this.listBoards();
+        if (boards.length === 0) {
+          throw new NotFoundError('No ContextDeck boards exist in this workspace.');
+        }
+        const defaultBoard = await this.getDefaultBoardSlug();
+        const existingBoardsSet = new Set(boards.map((b) => b.slug));
+
+        const allRaw = await this.listAllRawSessions();
+        const existing = allRaw.find((s) => s.externalRef === params.externalRef);
+        const nowStr = nowDate.toISOString();
+
+        if (!existing) {
+          const boardSlug = routeBoardForCwd(boards, params.cwd, this.projectRoot, defaultBoard);
+          const boardConfig = await this.readBoardConfig(boardSlug);
+          const meta = SessionMetadataSchema.parse({
+            id: shortId('sess'),
+            title: params.defaultTitle,
+            harness: params.harness,
+            externalRef: params.externalRef,
+            board: boardSlug,
+            parentSessionId: null,
+            relatedSessionIds: [],
+            status: 'active',
+            summary: '',
+            focusFiles: [],
+            createdAt: nowStr,
+            updatedAt: nowStr,
+          });
+          await ensureDir(this.sessionsDir);
+          const filePath = await this.safeSessionFilePath(meta.id);
+          assertActive();
+          await atomicWriteFile(filePath, dumpYaml(meta));
+
+          const cursor: SessionCursor = {
+            sessionId: meta.id,
+            syncedRevisions: { [boardSlug]: boardConfig.revision },
+            lastActiveAt: nowStr,
+          };
+          assertActive();
+          await this.writeSessionCursor(cursor);
+
+          return {
+            action: 'registered_silent' as const,
+            session: this.hydrateSession(meta, boardSlug, cursor),
+            boardConfig,
+          };
+        }
+
+        const boardSlug = existingBoardsSet.has(existing.board)
+          ? existing.board
+          : routeBoardForCwd(boards, params.cwd, this.projectRoot, defaultBoard);
+        const [boardConfig, existingCursor] = await Promise.all([
+          this.readBoardConfig(boardSlug),
+          this.readSessionCursor(existing.id),
+        ]);
+        const lastSynced =
+          existingCursor?.syncedRevisions[boardSlug] ??
+          (boardSlug === existing.board ? (existing.lastSyncedRevision ?? 0) : 0);
+
+        if (lastSynced >= boardConfig.revision) {
+          return { action: 'noop' as const };
+        }
+
+        const tailEvents = await this.readEventsSince(boardSlug, lastSynced, boardConfig.revision);
+        const digestResult = buildSessionDriftDigest({
+          sessionId: existing.id,
+          lastSyncedRevision: lastSynced,
+          currentRevision: boardConfig.revision,
+          events: tailEvents,
+          maxLines: params.maxDigestLines,
+        });
+
+        if (digestResult.behindBy === 0 || digestResult.digest.length === 0) {
+          return { action: 'noop' as const };
+        }
+
+        if (params.throttleMs !== undefined && existingCursor?.lastCursorInjectAt) {
+          const lastInjectMs = Date.parse(existingCursor.lastCursorInjectAt);
+          if (Number.isFinite(lastInjectMs) && nowMs - lastInjectMs < params.throttleMs) {
+            return { action: 'throttled' as const };
+          }
+        }
+
+        const nextCursor: SessionCursor = {
+          sessionId: existing.id,
+          syncedRevisions: {
+            ...(existingCursor?.syncedRevisions ?? {}),
+            [boardSlug]: boardConfig.revision,
+          },
+          lastActiveAt: nowStr,
+          // D12: Cursor throttle stamps ONLY when a digest is actually emitted
+          ...(params.throttleMs !== undefined
+            ? { lastCursorInjectAt: nowStr }
+            : existingCursor?.lastCursorInjectAt
+              ? { lastCursorInjectAt: existingCursor.lastCursorInjectAt }
+              : {}),
+        };
+        assertActive();
+        await this.writeSessionCursor(nextCursor);
+
+        return {
+          action: 'digest' as const,
+          session: this.hydrateSession(existing, boardSlug, nextCursor),
+          boardConfig,
+          digestResult,
+        };
+      },
+      this.deckDir,
+      { maxWaitMs },
+    );
+  }
+
+  /**
+   * Hook helper for SessionEnd / sessionEnd (AC5.2, D11, D12):
+   * Marks the matching session `idle` without bumping board.yaml.
+   */
+  public async markHookSessionIdle(params: {
+    externalRef: string;
+    maxWaitMs?: number;
+  }): Promise<boolean> {
+    const fastMatch = (await this.listAllRawSessions()).find(
+      (s) => s.externalRef === params.externalRef,
+    );
+    if (
+      !fastMatch ||
+      fastMatch.status === 'idle' ||
+      fastMatch.status === 'completed' ||
+      fastMatch.status === 'archived'
+    ) {
+      return false;
+    }
+
+    const maxWaitMs = params.maxWaitMs ?? 800;
+    return withWorkspaceLock(
+      this.runtimeDir,
+      async (assertActive) => {
+        await this.migrateLegacySessionsUnlocked(assertActive);
+        const current = (await this.listAllRawSessions()).find(
+          (s) => s.externalRef === params.externalRef,
+        );
+        if (
+          !current ||
+          current.status === 'idle' ||
+          current.status === 'completed' ||
+          current.status === 'archived'
+        ) {
+          return false;
+        }
+        const meta = SessionMetadataSchema.parse({
+          id: current.id,
+          title: current.title,
+          harness: current.harness,
+          ...(current.externalRef !== undefined ? { externalRef: current.externalRef } : {}),
+          board: current.board,
+          parentSessionId: current.parentSessionId,
+          relatedSessionIds: current.relatedSessionIds,
+          status: 'idle',
+          summary: current.summary,
+          focusFiles: current.focusFiles,
+          createdAt: current.createdAt,
+          updatedAt: nowIso(),
+        });
+        await ensureDir(this.sessionsDir);
+        const filePath = await this.safeSessionFilePath(meta.id);
+        assertActive();
+        await atomicWriteFile(filePath, dumpYaml(meta));
+        return true;
+      },
+      this.deckDir,
+      { maxWaitMs },
+    );
   }
 
   public async recordDecision(
