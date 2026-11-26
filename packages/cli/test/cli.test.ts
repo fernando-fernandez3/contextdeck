@@ -166,6 +166,38 @@ describe('@contextdeck/cli B1 commands', () => {
     expect(mediaRes.stdout).toContain('Outside Human Note');
   });
 
+  it('H6: CLI rejects non-integer --base-revision and --ack-revision flags without corrupting state', async () => {
+    const repo = await makeTempDir('cdeck-cli-h6-');
+    expect((await runCli(['init'], { cwd: repo })).code).toBe(0);
+    expect(
+      (await runCli(['brief', '--set', '# Keep This Brief\n', '--base-revision', '1'], { cwd: repo })).code,
+    ).toBe(0);
+
+    const badBrief = await runCli(['brief', '--set', '# Clobbered\n', '--base-revision', 'abc'], {
+      cwd: repo,
+    });
+    expect(badBrief.code).not.toBe(0);
+    expect(badBrief.stderr).toMatch(/base-revision|integer/i);
+
+    const briefAfter = await runCli(['brief'], { cwd: repo });
+    expect(briefAfter.code).toBe(0);
+    expect(briefAfter.stdout).toContain('# Keep This Brief');
+
+    const reg = await runCli(['session', 'register', 'S1', '--harness', 'codex'], { cwd: repo });
+    expect(reg.code).toBe(0);
+    const sess = JSON.parse(reg.stdout) as { id: string };
+
+    const badSync = await runCli(['session', 'sync', sess.id, '--ack-revision', 'abc'], {
+      cwd: repo,
+    });
+    expect(badSync.code).not.toBe(0);
+    expect(badSync.stderr).toMatch(/ack-revision|integer/i);
+
+    // Status (getSnapshot) must still succeed (no .nan written to session YAML)
+    const statusAfter = await runCli(['status'], { cwd: repo });
+    expect(statusAfter.code).toBe(0);
+  });
+
   it('cdeck serve guards non-loopback host and cdeck open mints a working single-use launch URL', async () => {
     const repo = await makeTempDir();
     expect((await runCli(['init'], { cwd: repo })).code).toBe(0);

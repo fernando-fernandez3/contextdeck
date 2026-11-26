@@ -594,6 +594,66 @@ describe('E2 Server & MCP security (reproducing Bugs 2, 3, 4, 7-media, 8 + D5/D6
         rationale: 'x'.repeat(25_000),
       });
       expect(hugeText.result?.isError || hugeText.error).toBeTruthy();
+
+      // H8: MCP tools must reject unknown/storage keys (.strict()) and enforce 20 KB caps on quiz questions
+      const mediaUnknownKeys = await callMcp('media_attach', {
+        board: 'demo',
+        title: 'Bad Media Keys',
+        kind: 'doc',
+        content: 'ok',
+        filePath: '../brief.md',
+        createdAt: '2020-01-01T00:00:00.000Z',
+        version: 99,
+      });
+      expect(mediaUnknownKeys.result?.isError || mediaUnknownKeys.error).toBeTruthy();
+
+      const decisionUnknownKeys = await callMcp('decision_record', {
+        board: 'demo',
+        title: 'Bad Decision Keys',
+        createdAt: '2020-01-01T00:00:00.000Z',
+        version: 2,
+      });
+      expect(decisionUnknownKeys.result?.isError || decisionUnknownKeys.error).toBeTruthy();
+
+      const quizHugePrompt = await callMcp('quiz_create', {
+        board: 'demo',
+        title: 'Huge Quiz Prompt',
+        questions: [
+          {
+            id: 'q1',
+            prompt: 'P'.repeat(30_000),
+            type: 'multiple_choice',
+            options: ['A', 'B'],
+            correctIndex: 0,
+          },
+        ],
+      });
+      expect(quizHugePrompt.result?.isError || quizHugePrompt.error).toBeTruthy();
+
+      const quizUnknownKeys = await callMcp('quiz_create', {
+        board: 'demo',
+        title: 'Unknown Quiz Keys',
+        version: 42,
+        questions: [
+          {
+            id: 'q1',
+            prompt: 'Valid?',
+            type: 'multiple_choice',
+            options: ['A', 'B'],
+            correctIndex: 0,
+            extraField: 'bad',
+          },
+        ],
+      });
+      expect(quizUnknownKeys.result?.isError || quizUnknownKeys.error).toBeTruthy();
+
+      const chapterUnknownKeys = await callMcp('media_attach', {
+        board: 'demo',
+        title: 'Bad Chapter',
+        kind: 'video',
+        chapters: [{ timeSec: 0, title: 'Intro', secret: true }],
+      });
+      expect(chapterUnknownKeys.result?.isError || chapterUnknownKeys.error).toBeTruthy();
     } finally {
       await close();
     }

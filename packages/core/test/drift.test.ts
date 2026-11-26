@@ -395,4 +395,44 @@ describe('E3 honest drift, bounded digest, fast tail reader, and context pack', 
     expect(found!.summary).toBe(targetSummary);
     expect(found!.summary).not.toContain('\uFFFD');
   });
+
+  it('H10: human edit of an agent session diagram is not attributed to that session and causes drift', async () => {
+    const dir = await makeTempDir('cdeck-h10-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Diagram Drift', slug: 'main' });
+
+    const sessA = await store.registerSession('main', { title: 'Agent A', harness: 'codex' });
+    const diag = await store.upsertDiagram(
+      'main',
+      {
+        title: 'System Flow',
+        kind: 'mermaid',
+        content: 'flowchart LR\nA-->B',
+        sessionId: sessA.id,
+      },
+      { type: 'agent', harness: 'codex', sessionId: sessA.id },
+    );
+
+    // Sync sessA after its own creation
+    expect((await store.getSessionDrift('main', sessA.id)).behindBy).toBe(0);
+
+    // Human edits the diagram (no sessionId in input or actor)
+    const edited = await store.upsertDiagram(
+      'main',
+      {
+        id: diag.id,
+        title: 'System Flow',
+        kind: 'mermaid',
+        content: 'flowchart LR\nA-->C',
+      },
+      { type: 'human', label: 'web-ui' },
+    );
+    // Original author metadata remains on diagram
+    expect(edited.sessionId).toBe(sessA.id);
+
+    // sessA must now see behindBy: 1 with the diagram in its digest
+    const drift = await store.getSessionDrift('main', sessA.id);
+    expect(drift.behindBy).toBe(1);
+    expect(drift.digest.some((d) => d.entityId === diag.id)).toBe(true);
+  });
 });

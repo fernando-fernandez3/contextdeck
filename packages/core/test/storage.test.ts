@@ -146,14 +146,18 @@ describe('E1 safe concurrent storage engine', () => {
     expect(snap.brief).toBe('# Safe Brief\n');
   }, FSYNC_TEST_TIMEOUT_MS);
 
-  it('guards submitQuizAttempt against zero-question quizzes (AC1.5)', async () => {
+  it('guards submitQuizAttempt against zero-question quizzes (AC1.5 / H11)', async () => {
     const dir = await makeTempDir();
     const store = new core.ContextDeckStore(dir);
     await store.createBoard({ title: 'Main', slug: 'main' });
 
     await expect(
       store.createQuiz('main', { title: 'Empty', questions: [] }),
-    ).rejects.toThrow();
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+
+    // Pure scoring helper must directly guard divide-by-zero
+    expect(() => core.scoreQuizAttempt([], {})).toThrow(core.ValidationError);
+    expect(() => core.scoreQuizAttempt([], {})).toThrow(/zero questions/i);
 
     // Manually write a zero-question quiz file on disk
     const quizPath = path.join(store.boardPath('main'), 'quizzes', 'quiz_zero.quiz.json');
@@ -176,7 +180,10 @@ describe('E1 safe concurrent storage engine', () => {
 
     await expect(
       store.submitQuizAttempt('main', 'quiz_zero', { answers: {} }),
-    ).rejects.toThrow();
+    ).rejects.toMatchObject({ code: 'CORRUPT_DATA' });
+    await expect(
+      store.submitQuizAttempt('main', 'quiz_zero', { answers: {} }),
+    ).rejects.toBeInstanceOf(core.CorruptDataError);
   }, FSYNC_TEST_TIMEOUT_MS);
 
   it('recovers cleanly via roll-forward journal when killed mid-commit (after-rename-1 and after-event)', async () => {
@@ -267,7 +274,9 @@ describe('E1 safe concurrent storage engine', () => {
       basedOnDecisions: [d1.id],
     });
 
+    const beforeApply = await store.getSnapshot('main');
     const res = await store.applyContextUpdate('main', {
+      baseRevision: beforeApply.config.revision,
       sessionTitle: 'Web Chat',
       harness: 'grok',
       brief: '# Updated via Context Update\n',
@@ -445,5 +454,122 @@ describe('E1 safe concurrent storage engine', () => {
     expect(snap.brief).toBe('# V2\n');
     const briefEvents = snap.events.filter((e) => e.id === txn.events[0].eventId);
     expect(briefEvents).toHaveLength(1);
+  }, FSYNC_TEST_TIMEOUT_MS);
+
+  it('H6: rejects NaN, float, and negative baseRevision / ackRevision without corrupting state', async () => {
+    const dir = await makeTempDir('cdeck-h6-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main', brief: '# Original\n' });
+    await store.updateBrief('main', '# Human Edit\n', undefined, { baseRevision: 1 });
+    const sess = await store.registerSession('main', { title: 'S1', harness: 'codex' });
+
+    for (const bad of [Number.NaN, 1.5, -1, 0, Number.POSITIVE_INFINITY]) {
+      await expect(
+        store.updateBrief('main', '# Overwrite\n', undefined, { baseRevision: bad }),
+      ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    }
+    expect((await store.getSnapshot('main')).brief).toBe('# Human Edit\n');
+
+    for (const bad of [Number.NaN, 1.5, -1, Number.POSITIVE_INFINITY]) {
+      await expect(
+        store.syncSession('main', sess.id, { ackRevision: bad }),
+      ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    }
+    // Session YAML must remain valid and loadable (no .nan written)
+    const snap = await store.getSnapshot('main');
+    const loadedSess = snap.sessions.find((s) => s.id === sess.id);
+    expect(loadedSess?.lastSyncedRevision).toBe(sess.lastSyncedRevision);
+  }, FSYNC_TEST_TIMEOUT_MS);
+
+  it('H7: applyContextUpdate requires baseRevision for brief updates, enforces brief conflicts, and pack protocol includes baseRevision', async () => {
+    const dir = await makeTempDir('cdeck-h7-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main', brief: '# Initial\n' });
+
+    const snapBefore = await store.getSnapshot('main');
+    const pack = core.generateContextPack(snapBefore, { includeUpdateProtocol: true });
+    expect(pack).toContain(`"baseRevision": ${snapBefore.config.revision}`);
+
+    // Brief update without baseRevision -> ValidationError naming baseRevision
+    await expect(
+      store.applyContextUpdate('main', { brief: 'NO BASE REVISION' }),
+    ).rejects.toThrow(/baseRevision/);
+    await expect(
+      store.applyContextUpdate('main', { brief: 'NO BASE REVISION' }),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+
+    // Human edits brief at rev 1 -> rev 2
+    await store.updateBrief('main', '# Human Newer Brief\n', { type: 'human', label: 'user' }, { baseRevision: 1 });
+
+    // Stale chat payload with baseRevision: 1 -> ConflictError with currentBrief, brief unchanged
+    let caught: unknown;
+    try {
+      await store.applyContextUpdate('main', {
+        brief: 'STALE CHAT COPY',
+        baseRevision: 1,
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(core.ConflictError);
+    expect((caught as core.ConflictError).details?.currentBrief).toBe('# Human Newer Brief\n');
+    expect((await store.getSnapshot('main')).brief).toBe('# Human Newer Brief\n');
+
+    // Fresh baseRevision: 2 succeeds (even combined with sessionTitle)
+    const ok = await store.applyContextUpdate('main', {
+      sessionTitle: 'Grok Sync',
+      baseRevision: 2,
+      brief: '# Merged Fresh Brief\n',
+    });
+    expect(ok.snapshot.brief).toBe('# Merged Fresh Brief\n');
+    expect(ok.appliedCount).toBe(2);
+
+    // Non-brief context updates still work without baseRevision
+    const nonBrief = await store.applyContextUpdate('main', {
+      tasks: [{ title: 'Follow-up without brief' }],
+    });
+    expect(nonBrief.appliedCount).toBe(1);
+  }, FSYNC_TEST_TIMEOUT_MS);
+
+  it('H9: updateDecision marks superseded target, emits supersession details, and rejects self-supersede and cycles', async () => {
+    const dir = await makeTempDir('cdeck-h9-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main' });
+
+    const d1 = await store.recordDecision('main', { title: 'Choice One', summary: 'First' });
+    const d2 = await store.recordDecision('main', { title: 'Choice Two', summary: 'Second' });
+    const d3 = await store.recordDecision('main', { title: 'Choice Three', summary: 'Third' });
+
+    // Self-supersede rejected on both recordDecision and updateDecision
+    await expect(
+      store.recordDecision('main', { id: 'dec_self', title: 'Self', supersedes: 'dec_self' }),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    await expect(
+      store.updateDecision('main', d1.id, { supersedes: d1.id }),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+
+    // updateDecision with supersedes marks d1 superseded and emits supersession event details
+    await store.updateDecision('main', d2.id, { supersedes: d1.id });
+    const snap = await store.getSnapshot('main');
+    const updatedD1 = snap.decisions.find((d) => d.id === d1.id)!;
+    expect(updatedD1.status).toBe('superseded');
+    expect(updatedD1.supersededBy).toBe(d2.id);
+
+    const supEvent = snap.events.find(
+      (e) => e.kind === 'decision.superseded' && e.entityId === d2.id,
+    );
+    expect(supEvent).toBeDefined();
+    expect(supEvent?.details?.supersedes).toBe(d1.id);
+    expect(supEvent?.details?.before).toMatchObject({ id: d1.id, status: 'accepted' });
+    expect(supEvent?.details?.after).toMatchObject({ id: d2.id, status: 'accepted' });
+
+    // Cycle detection: d2 -> d1 and d3 -> d2, so d1 -> d3 (and d1 -> d2) must be rejected
+    await store.updateDecision('main', d3.id, { supersedes: d2.id });
+    await expect(
+      store.updateDecision('main', d1.id, { supersedes: d2.id }),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    await expect(
+      store.updateDecision('main', d1.id, { supersedes: d3.id }),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
   }, FSYNC_TEST_TIMEOUT_MS);
 });

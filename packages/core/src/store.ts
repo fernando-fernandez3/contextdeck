@@ -23,7 +23,9 @@ import {
   RegisterSessionInputSchema,
   SessionSchema,
   SubmitQuizAttemptInputSchema,
+  SyncSessionInputSchema,
   TaskSchema,
+  UpdateBriefInputSchema,
   UpdateDecisionPatchSchema,
   UpdateMediaPatchSchema,
   UpdateSessionPatchSchema,
@@ -208,6 +210,39 @@ export interface MutationContext {
     actor?: Actor;
   }): BoardEvent;
   markConfigDirty(): void;
+}
+
+/**
+ * Pure quiz scoring helper with explicit AC1.5 divide-by-zero guard (H11).
+ */
+export function scoreQuizAttempt(
+  questions: QuizQuestion[],
+  answers: Record<string, number | string | boolean>,
+): { score: number; total: number; percentage: number } {
+  if (!Array.isArray(questions) || questions.length === 0) {
+    throw new ValidationError('Quiz has zero questions and cannot be scored.');
+  }
+
+  let score = 0;
+  for (const q of questions) {
+    const userAnswer = answers[q.id];
+    if (q.type === 'multiple_choice' && typeof q.correctIndex === 'number') {
+      if (Number(userAnswer) === q.correctIndex) score += 1;
+    } else if (q.type === 'true_false' && q.correctAnswer !== undefined) {
+      if (String(userAnswer).toLowerCase() === q.correctAnswer.toLowerCase()) score += 1;
+    } else if (q.type === 'short_answer' && q.correctAnswer) {
+      if (
+        typeof userAnswer === 'string' &&
+        userAnswer.trim().toLowerCase().includes(q.correctAnswer.trim().toLowerCase())
+      ) {
+        score += 1;
+      }
+    }
+  }
+
+  const total = questions.length;
+  const percentage = Math.round((score / total) * 100);
+  return { score, total, percentage };
 }
 
 export class ContextDeckStore {
@@ -1197,40 +1232,48 @@ export class ContextDeckStore {
     options?: { baseRevision?: number },
     actorOverride?: Actor,
   ): Promise<{ revision: number; brief: string }> {
+    const validated = parseStrict(
+      UpdateBriefInputSchema.omit({ actor: true }),
+      {
+        brief,
+        ...(options?.baseRevision !== undefined ? { baseRevision: options.baseRevision } : {}),
+      },
+      'brief update',
+    );
     const briefPath = await this.safeBoardFilePath(tx.slug, 'brief.md');
     const currentBrief = (await readFileStrict(briefPath)) ?? '';
-    const currentRev = tx.getCurrentRevision();
+    const committedRev = tx.initialConfig.revision;
 
-    if (options?.baseRevision !== undefined) {
-      const baseRev = options.baseRevision;
-      if (baseRev > currentRev) {
+    if (validated.baseRevision !== undefined) {
+      const baseRev = validated.baseRevision;
+      if (baseRev > committedRev) {
         throw new ConflictError(
-          `Invalid baseRevision ${baseRev} exceeds current revision ${currentRev}.`,
-          { currentRevision: currentRev, currentBrief, baseRevision: baseRev },
+          `Invalid baseRevision ${baseRev} exceeds current revision ${committedRev}.`,
+          { currentRevision: committedRev, currentBrief, baseRevision: baseRev },
         );
       }
-      if (baseRev < currentRev) {
-        const events = await this.readEventsSince(tx.slug, baseRev, currentRev);
+      if (baseRev < committedRev) {
+        const events = await this.readEventsSince(tx.slug, baseRev, committedRev);
         const briefChangedSince = events.some(
           (ev) => ev.revision > baseRev && ev.kind === 'brief.updated',
         );
         if (briefChangedSince) {
           throw new ConflictError(
-            `Brief conflict: brief was updated after revision ${baseRev} (current revision is ${currentRev}).`,
-            { currentRevision: currentRev, currentBrief, baseRevision: baseRev },
+            `Brief conflict: brief was updated after revision ${baseRev} (current revision is ${committedRev}).`,
+            { currentRevision: committedRev, currentBrief, baseRevision: baseRev },
           );
         }
       }
     }
 
-    tx.stageFile(briefPath, brief);
+    tx.stageFile(briefPath, validated.brief);
     const ev = tx.addEvent({
       kind: 'brief.updated',
       entityId: 'brief',
       summary: 'Updated living mental-model brief',
       actor: actorOverride,
     });
-    return { revision: ev.revision, brief };
+    return { revision: ev.revision, brief: validated.brief };
   }
 
   private async registerSessionUnlocked(
@@ -1321,6 +1364,58 @@ export class ContextDeckStore {
     return updated;
   }
 
+  private async applySupersessionUnlocked(
+    tx: MutationContext,
+    supersedingId: string,
+    targetId: string,
+    now: string,
+    inMemoryExisting?: Decision[],
+  ): Promise<Decision | undefined> {
+    validateEntityId(targetId, 'supersedes');
+    if (targetId === supersedingId) {
+      throw new ValidationError(`Decision "${supersedingId}" cannot supersede itself.`);
+    }
+
+    const loadDecision = async (id: string): Promise<Decision | undefined> =>
+      inMemoryExisting
+        ? inMemoryExisting.find((d) => d.id === id)
+        : ((await this.readDecisionById(tx.slug, id)) ?? undefined);
+
+    // Reject supersession cycles (e.g. A -> B -> A)
+    const visited = new Set<string>([supersedingId]);
+    let cursorId: string | null | undefined = targetId;
+    while (cursorId) {
+      if (visited.has(cursorId)) {
+        throw new ValidationError(
+          `Supersession cycle detected: decision "${supersedingId}" cannot supersede "${targetId}".`,
+        );
+      }
+      visited.add(cursorId);
+      const node = await loadDecision(cursorId);
+      cursorId = node?.supersedes ?? null;
+    }
+
+    const oldDecision = await loadDecision(targetId);
+    if (!oldDecision) {
+      return undefined;
+    }
+
+    const updatedOld: Decision = DecisionSchema.parse({
+      ...oldDecision,
+      status: 'superseded',
+      supersededBy: supersedingId,
+      updatedAt: now,
+    });
+    const oldPath = await this.safeBoardFilePath(tx.slug, 'decisions', `${updatedOld.id}.md`);
+    const { rationale: oldRat, ...oldFm } = updatedOld;
+    tx.stageFile(oldPath, stringifyFrontmatter(oldFm, oldRat));
+    if (inMemoryExisting) {
+      const idx = inMemoryExisting.findIndex((d) => d.id === updatedOld.id);
+      if (idx >= 0) inMemoryExisting[idx] = updatedOld;
+    }
+    return oldDecision;
+  }
+
   private async recordDecisionUnlocked(
     tx: MutationContext,
     rawInput: {
@@ -1374,33 +1469,22 @@ export class ContextDeckStore {
       updatedAt: now,
     });
 
+    let oldDecision: Decision | undefined;
+    if (decision.supersedes) {
+      oldDecision = await this.applySupersessionUnlocked(
+        tx,
+        decision.id,
+        decision.supersedes,
+        now,
+        inMemoryExisting,
+      );
+    }
+
     const decPath = await this.safeBoardFilePath(tx.slug, 'decisions', `${decision.id}.md`);
     const { rationale, ...frontmatter } = decision;
     tx.stageFile(decPath, stringifyFrontmatter(frontmatter, rationale), {
       noClobber: isNewSequential,
     });
-
-    let oldDecision: Decision | undefined;
-    if (decision.supersedes) {
-      oldDecision = inMemoryExisting
-        ? inMemoryExisting.find((d) => d.id === decision.supersedes)
-        : ((await this.readDecisionById(tx.slug, decision.supersedes)) ?? undefined);
-      if (oldDecision) {
-        const updatedOld: Decision = {
-          ...oldDecision,
-          status: 'superseded',
-          supersededBy: decision.id,
-          updatedAt: now,
-        };
-        const oldPath = await this.safeBoardFilePath(tx.slug, 'decisions', `${updatedOld.id}.md`);
-        const { rationale: oldRat, ...oldFm } = updatedOld;
-        tx.stageFile(oldPath, stringifyFrontmatter(oldFm, oldRat));
-        if (inMemoryExisting) {
-          const idx = inMemoryExisting.findIndex((d) => d.id === updatedOld.id);
-          if (idx >= 0) inMemoryExisting[idx] = updatedOld;
-        }
-      }
-    }
 
     if (inMemoryExisting) {
       inMemoryExisting.push(decision);
@@ -1549,8 +1633,12 @@ export class ContextDeckStore {
     const id = existing?.id ?? input.id ?? `diag_${slugify(input.title)}_${shortId('x').slice(2, 6)}`;
     validateEntityId(id, 'diagramId');
 
-    const sessionId = input.sessionId ?? effActor.sessionId ?? existing?.sessionId ?? null;
-    const eventActor: Actor = sessionId ? { ...effActor, sessionId } : effActor;
+    // H10: Attribute the event ONLY to the actual caller's sessionId (never existing.sessionId),
+    // while keeping existing.sessionId preserved as diagram metadata.
+    const actorSessionId = input.sessionId ?? effActor.sessionId ?? undefined;
+    const diagramSessionId =
+      input.sessionId !== undefined ? input.sessionId : (effActor.sessionId ?? existing?.sessionId ?? null);
+    const eventActor: Actor = actorSessionId ? { ...effActor, sessionId: actorSessionId } : effActor;
     const ev = tx.addEvent({
       kind: existing ? 'diagram.updated' : 'diagram.created',
       entityId: id,
@@ -1565,7 +1653,7 @@ export class ContextDeckStore {
       content: input.content,
       description: input.description ?? existing?.description ?? '',
       basedOnDecisions: input.basedOnDecisions ?? existing?.basedOnDecisions ?? [],
-      sessionId,
+      sessionId: diagramSessionId,
       boardRevisionAtUpdate: ev.revision,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
@@ -1755,6 +1843,11 @@ export class ContextDeckStore {
     }
   > {
     validateEntityId(sessionId, 'sessionId');
+    const validatedOpts = parseStrict(
+      SyncSessionInputSchema,
+      options?.ackRevision !== undefined ? { ackRevision: options.ackRevision } : {},
+      'syncSession options',
+    );
     return this.mutate(boardSlug, { type: 'system', sessionId, label: 'sync' }, async (tx) => {
       const filePath = await this.safeBoardFilePath(tx.slug, 'sessions', `${sessionId}.yaml`);
       const existing = await readYamlStrict(filePath, SessionSchema);
@@ -1764,8 +1857,8 @@ export class ContextDeckStore {
 
       const currentRevision = tx.initialConfig.revision;
       const requestedAck =
-        options?.ackRevision !== undefined
-          ? Math.min(options.ackRevision, currentRevision)
+        validatedOpts.ackRevision !== undefined
+          ? Math.min(validatedOpts.ackRevision, currentRevision)
           : currentRevision;
       const ackRevision = Math.max(existing.lastSyncedRevision, requestedAck);
 
@@ -1781,11 +1874,11 @@ export class ContextDeckStore {
         maxLines: options?.maxDigestLines,
       });
 
-      const updated: Session = {
+      const updated: Session = SessionSchema.parse({
         ...existing,
         lastSyncedRevision: ackRevision,
         updatedAt: nowIso(),
-      };
+      });
       tx.stageFile(filePath, dumpYaml(updated));
       return {
         session: updated,
@@ -1846,6 +1939,7 @@ export class ContextDeckStore {
       if (!existing) {
         throw new NotFoundError(`Decision "${decisionId}" not found on board "${tx.slug}".`);
       }
+      const now = nowIso();
       const updated = DecisionSchema.parse({
         ...existing,
         ...(patch.title !== undefined ? { title: patch.title } : {}),
@@ -1854,21 +1948,54 @@ export class ContextDeckStore {
         ...(patch.rationale !== undefined ? { rationale: patch.rationale } : {}),
         ...(patch.tags !== undefined ? { tags: patch.tags } : {}),
         ...(patch.supersedes !== undefined ? { supersedes: patch.supersedes } : {}),
-        updatedAt: nowIso(),
+        updatedAt: now,
       });
+
+      // H9: Keep supersession graph consistent using the shared helper (rejects self-supersede and cycles)
+      const supersedingTarget =
+        patch.supersedes !== undefined && patch.supersedes !== null ? patch.supersedes : null;
+      let oldDecision: Decision | undefined;
+      if (supersedingTarget) {
+        oldDecision = await this.applySupersessionUnlocked(tx, updated.id, supersedingTarget, now);
+      }
 
       const decPath = await this.safeBoardFilePath(tx.slug, 'decisions', `${updated.id}.md`);
       const { rationale, ...frontmatter } = updated;
       tx.stageFile(decPath, stringifyFrontmatter(frontmatter, rationale));
-      tx.addEvent({
-        kind: 'decision.updated',
-        entityId: updated.id,
-        summary: `Updated decision ${updated.id} ("${updated.title}") [${updated.status}]`,
-        details: {
-          before: { status: existing.status, title: existing.title, summary: existing.summary },
-          after: { status: updated.status, title: updated.title, summary: updated.summary },
-        },
-      });
+      if (supersedingTarget) {
+        tx.addEvent({
+          kind: 'decision.superseded',
+          entityId: updated.id,
+          summary: `Updated decision ${updated.id} ("${updated.title}"), superseding ${supersedingTarget}`,
+          details: {
+            supersedes: supersedingTarget,
+            before: oldDecision
+              ? {
+                  id: oldDecision.id,
+                  status: oldDecision.status,
+                  title: oldDecision.title,
+                  summary: oldDecision.summary,
+                }
+              : null,
+            after: {
+              id: updated.id,
+              status: updated.status,
+              title: updated.title,
+              summary: updated.summary,
+            },
+          },
+        });
+      } else {
+        tx.addEvent({
+          kind: 'decision.updated',
+          entityId: updated.id,
+          summary: `Updated decision ${updated.id} ("${updated.title}") [${updated.status}]`,
+          details: {
+            before: { status: existing.status, title: existing.title, summary: existing.summary },
+            after: { status: updated.status, title: updated.title, summary: updated.summary },
+          },
+        });
+      }
       return updated;
     });
   }
@@ -2307,31 +2434,7 @@ export class ContextDeckStore {
         );
       }
       const quiz = quizParsed.data;
-
-      // AC1.5 runtime guard against divide-by-zero
-      if (!Array.isArray(quiz.questions) || quiz.questions.length === 0) {
-        throw new ValidationError(`Quiz "${quizId}" has zero questions and cannot be attempted.`);
-      }
-
-      let score = 0;
-      for (const q of quiz.questions) {
-        const userAnswer = input.answers[q.id];
-        if (q.type === 'multiple_choice' && typeof q.correctIndex === 'number') {
-          if (Number(userAnswer) === q.correctIndex) score += 1;
-        } else if (q.type === 'true_false' && q.correctAnswer !== undefined) {
-          if (String(userAnswer).toLowerCase() === q.correctAnswer.toLowerCase()) score += 1;
-        } else if (q.type === 'short_answer' && q.correctAnswer) {
-          if (
-            typeof userAnswer === 'string' &&
-            userAnswer.trim().toLowerCase().includes(q.correctAnswer.trim().toLowerCase())
-          ) {
-            score += 1;
-          }
-        }
-      }
-
-      const total = quiz.questions.length;
-      const percentage = Math.round((score / total) * 100);
+      const { score, total, percentage } = scoreQuizAttempt(quiz.questions, input.answers);
       const attempt = QuizAttemptSchema.parse({
         id: shortId('att'),
         takenAt: nowIso(),
@@ -2490,8 +2593,19 @@ export class ContextDeckStore {
         ? { ...effectiveActor, sessionId: currentSessionId }
         : effectiveActor;
 
-      if (payload.brief) {
-        await this.updateBriefUnlocked(tx, payload.brief, undefined, withSessionActor);
+      if (payload.brief !== undefined) {
+        if (payload.baseRevision === undefined) {
+          throw new ValidationError(
+            'Context update payload includes "brief" and requires "baseRevision" to prevent overwriting newer brief edits.',
+            { field: 'baseRevision' },
+          );
+        }
+        await this.updateBriefUnlocked(
+          tx,
+          payload.brief,
+          { baseRevision: payload.baseRevision },
+          withSessionActor,
+        );
         count += 1;
       }
 

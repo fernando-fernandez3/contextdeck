@@ -145,16 +145,18 @@ export const DiagramSchema = z.object({
 
 export type Diagram = z.infer<typeof DiagramSchema>;
 
-export const QuizQuestionSchema = z.object({
-  id: EntityIdSchema,
-  prompt: z.string().min(1),
-  type: z.enum(['multiple_choice', 'true_false', 'short_answer']).default('multiple_choice'),
-  options: z.array(z.string()).optional(),
-  correctIndex: z.number().int().nonnegative().optional(),
-  correctAnswer: z.string().optional(),
-  explanation: z.string().default(''),
-  relatedDecisionIds: z.array(EntityIdSchema).default([]),
-});
+export const QuizQuestionSchema = z
+  .object({
+    id: EntityIdSchema,
+    prompt: z.string().min(1).max(20 * 1024),
+    type: z.enum(['multiple_choice', 'true_false', 'short_answer']).default('multiple_choice'),
+    options: z.array(z.string().max(2 * 1024)).max(50).optional(),
+    correctIndex: z.number().int().nonnegative().optional(),
+    correctAnswer: z.string().max(20 * 1024).optional(),
+    explanation: z.string().max(20 * 1024).default(''),
+    relatedDecisionIds: z.array(EntityIdSchema).max(100).default([]),
+  })
+  .strict();
 
 export type QuizQuestion = z.infer<typeof QuizQuestionSchema>;
 
@@ -189,10 +191,12 @@ export type Quiz = z.infer<typeof QuizSchema>;
 export const MediaKindSchema = z.enum(['video', 'audio', 'doc', 'link', 'html', 'json', 'custom']);
 export type MediaKind = z.infer<typeof MediaKindSchema>;
 
-export const MediaChapterSchema = z.object({
-  timeSec: z.number().nonnegative(),
-  title: z.string().min(1),
-});
+export const MediaChapterSchema = z
+  .object({
+    timeSec: z.number().nonnegative(),
+    title: z.string().min(1).max(300),
+  })
+  .strict();
 
 export const MediaArtifactSchema = z.object({
   id: EntityIdSchema,
@@ -478,6 +482,7 @@ export interface BoardSnapshot {
 
 export const ContextUpdatePayloadSchema = z
   .object({
+    baseRevision: z.number().int().min(1).optional(),
     sessionId: EntityIdSchema.optional(),
     sessionTitle: z.string().min(1).max(300).optional(),
     harness: z.string().min(1).max(100).optional(),
@@ -541,6 +546,15 @@ export const ContextUpdatePayloadSchema = z
       )
       .optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((data, ctx) => {
+    if (data.brief !== undefined && data.baseRevision === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['baseRevision'],
+        message: 'baseRevision is required when payload includes "brief"',
+      });
+    }
+  });
 
 export type ContextUpdatePayload = z.infer<typeof ContextUpdatePayloadSchema>;

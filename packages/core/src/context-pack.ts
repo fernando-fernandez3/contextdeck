@@ -1,3 +1,4 @@
+import { ValidationError } from './errors.js';
 import {
   ContextUpdatePayloadSchema,
   type BoardSnapshot,
@@ -47,14 +48,15 @@ function appendSectionWithinBudget(
   return remainingChars;
 }
 
-function buildUpdateProtocolBlock(): string {
+function buildUpdateProtocolBlock(revision: number): string {
   const lines: string[] = [
     '---',
     '## How to Sync Back Updates (Web / Non-MCP Chats)',
-    'When we reach new decisions, finish tasks, or update diagrams in this chat, output a fenced `json` block matching this schema so I can paste it straight into ContextDeck:',
+    'When we reach new decisions, finish tasks, or update diagrams in this chat, output a fenced `json` block matching this schema so I can paste it straight into ContextDeck (include `"baseRevision"` if updating `"brief"`):',
     '```json',
     JSON.stringify(
       {
+        baseRevision: revision,
         sessionTitle: 'Short name for this chat',
         harness: 'grok',
         sessionSummary: 'What we concluded in this session',
@@ -102,7 +104,9 @@ export function generateContextPack(
     `> Board: \`${snapshot.config.slug}\` | Revision: \`rev ${snapshot.config.revision}\` | Updated: ${snapshot.config.updatedAt}`,
   ];
   const header = headerLines.join('\n');
-  const protocolBlock = includeUpdateProtocol ? `\n\n${buildUpdateProtocolBlock()}` : '';
+  const protocolBlock = includeUpdateProtocol
+    ? `\n\n${buildUpdateProtocolBlock(snapshot.config.revision)}`
+    : '';
 
   const wrapperOverhead =
     header.length +
@@ -265,5 +269,12 @@ export function parseContextUpdatePayload(rawText: string): ContextUpdatePayload
     );
   }
 
-  return ContextUpdatePayloadSchema.parse(parsed);
+  const validated = ContextUpdatePayloadSchema.safeParse(parsed);
+  if (!validated.success) {
+    const msg = validated.error.issues
+      .map((i) => `${i.path.join('.') || 'payload'}: ${i.message}`)
+      .join('; ');
+    throw new ValidationError(`Invalid context update payload: ${msg}`);
+  }
+  return validated.data;
 }

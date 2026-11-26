@@ -4,6 +4,7 @@ import path from 'node:path';
 import { Command } from 'commander';
 import {
   ContextDeckStore,
+  ValidationError,
   WorkspaceNotFoundError,
   ensureContextDeckGitignore,
   generateContextPack,
@@ -32,6 +33,22 @@ program
   .name('cdeck')
   .description('ContextDeck — Local-first, Git-backed shared context board for humans and AI agents')
   .version('0.2.0');
+
+function parseStrictIntFlag(raw: unknown, flagName: string, min: number, max?: number): number {
+  const str = String(raw).trim();
+  if (!/^-?\d+$/.test(str)) {
+    throw new ValidationError(
+      `Invalid value "${str}" for ${flagName}: expected an integer >= ${min}.`,
+    );
+  }
+  const value = Number(str);
+  if (!Number.isSafeInteger(value) || value < min || (max !== undefined && value > max)) {
+    throw new ValidationError(
+      `Invalid value "${str}" for ${flagName}: expected an integer >= ${min}${max !== undefined ? ` and <= ${max}` : ''}.`,
+    );
+  }
+  return value;
+}
 
 function resolveStore(dir?: string): { store: ContextDeckStore; defaultBoard?: string } {
   const resolved = resolveWorkspace({ dir });
@@ -275,7 +292,9 @@ program
       const nextBrief =
         opts.file !== undefined ? await fs.readFile(path.resolve(opts.file), 'utf8') : String(opts.set);
       const baseRevision =
-        opts.baseRevision !== undefined ? Number.parseInt(String(opts.baseRevision), 10) : undefined;
+        opts.baseRevision !== undefined
+          ? parseStrictIntFlag(opts.baseRevision, '--base-revision', 1)
+          : undefined;
       const actor: Actor = opts.session
         ? { type: 'agent', sessionId: String(opts.session), label: 'cli' }
         : { type: 'human', label: 'cli' };
@@ -344,7 +363,9 @@ sessionCmd
   .action(async (sessionId, opts) => {
     const { store, defaultBoard } = resolveStore(opts.dir);
     const ackRevision =
-      opts.ackRevision !== undefined ? Number.parseInt(String(opts.ackRevision), 10) : undefined;
+      opts.ackRevision !== undefined
+        ? parseStrictIntFlag(opts.ackRevision, '--ack-revision', 0)
+        : undefined;
     const res = await store.syncSession(opts.board ?? defaultBoard, sessionId, { ackRevision });
     console.log(JSON.stringify(res, null, 2));
   });
