@@ -290,38 +290,66 @@ function capBoundedDigest(text: string, maxChars: number): string {
   return `${text.slice(0, sliceLen).trimEnd()}${suffix}`;
 }
 
+const guardedStdoutStreams = new WeakMap<
+  NodeJS.WritableStream,
+  { onError?: (err: Error) => void }
+>();
+
+function ensureStdoutErrorGuard(
+  stdout: NodeJS.WritableStream,
+  onError?: (err: Error) => void,
+): void {
+  let state = guardedStdoutStreams.get(stdout);
+  if (!state) {
+    state = { onError };
+    guardedStdoutStreams.set(stdout, state);
+    // R3-1: Keep a persistent error listener on stdout for the remaining life of the hook
+    // process so next-tick EPIPE / destroyed-stream error events never crash the hook (C5).
+    stdout.on('error', (err: Error) => {
+      try {
+        state?.onError?.(err);
+      } catch {
+        // ignore
+      }
+    });
+  } else if (onError) {
+    state.onError = onError;
+  }
+}
+
 function writeStdoutBounded(
   stdout: NodeJS.WritableStream,
   text: string,
   remainingMs: number,
-  onLateDrain?: () => void,
-): Promise<{ ok: boolean; pending: boolean }> {
+  onLateComplete?: (err?: Error | null) => void,
+): Promise<{ ok: boolean; pending: boolean; error?: Error }> {
   if (remainingMs <= 0) {
     return Promise.resolve({ ok: false, pending: false });
   }
-  return new Promise<{ ok: boolean; pending: boolean }>((resolve) => {
+  ensureStdoutErrorGuard(stdout);
+  return new Promise<{ ok: boolean; pending: boolean; error?: Error }>((resolve) => {
     let settled = false;
-    const finish = (ok: boolean, pending: boolean) => {
+    const finish = (ok: boolean, pending: boolean, error?: Error) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       stdout.removeListener('error', onError);
-      resolve({ ok, pending });
+      resolve({ ok, pending, ...(error ? { error } : {}) });
     };
-    const onError = () => finish(false, false);
+    const onError = (err: Error) => finish(false, false, err);
     const timer = setTimeout(() => finish(false, true), Math.max(10, remainingMs));
     timer.unref();
     stdout.once('error', onError);
     try {
       stdout.write(text, 'utf8', (err?: Error | null) => {
         if (settled) {
-          onLateDrain?.();
+          onLateComplete?.(err);
           return;
         }
-        finish(!err, false);
+        finish(!err, false, err ?? undefined);
       });
-    } catch {
-      finish(false, false);
+    } catch (err) {
+      finish(false, false, err instanceof Error ? err : new Error(String(err)));
     }
   });
 }
@@ -364,6 +392,18 @@ export async function runHookCli(
   let resolvedDeckDir: string | undefined;
   let deadlineTriggered = false;
   let stdoutWritePending = false;
+  let stdoutErrorLogged = false;
+
+  const recordStdoutError = (err: Error) => {
+    if (stdoutErrorLogged) return;
+    stdoutErrorLogged = true;
+    appendHookLogSync(
+      resolvedDeckDir,
+      rawHarness,
+      rawEvent,
+      `Hook stdout write error: ${err.message}`,
+    );
+  };
 
   const softTimer = setTimeout(() => {
     deadlineTriggered = true;
@@ -382,7 +422,7 @@ export async function runHookCli(
     killTimer = setTimeout(() => {
       if (stdoutWritePending) {
         try {
-          stdoutStream.on('error', () => {});
+          ensureStdoutErrorGuard(stdoutStream, recordStdoutError);
           (stdoutStream as { destroy?: () => void }).destroy?.();
         } catch {
           // ignore
@@ -392,6 +432,40 @@ export async function runHookCli(
     }, effectiveDeadlineMs + 100);
     killTimer.unref();
   }
+
+  const writeHookPayload = async (output: string): Promise<boolean> => {
+    ensureStdoutErrorGuard(stdoutStream, recordStdoutError);
+    const writeRes = await writeStdoutBounded(
+      stdoutStream,
+      `${output}\n`,
+      deadlineAt - Date.now(),
+      (err) => {
+        stdoutWritePending = false;
+        if (err) {
+          recordStdoutError(err);
+          try {
+            (stdoutStream as { destroy?: () => void }).destroy?.();
+          } catch {
+            // ignore
+          }
+        }
+        if (killTimer) clearTimeout(killTimer);
+      },
+    );
+    if (writeRes.error) {
+      recordStdoutError(writeRes.error);
+    }
+    if (writeRes.pending) {
+      stdoutWritePending = true;
+      appendHookLogSync(
+        resolvedDeckDir,
+        rawHarness,
+        rawEvent,
+        'Hook stdout write timed out; keeping hard deadline timer armed',
+      );
+    }
+    return writeRes.ok && !deadlineTriggered;
+  };
 
   try {
     // Best-effort deckDir lookup for logging early stdin errors
@@ -506,25 +580,8 @@ export async function runHookCli(
       const additionalContext = `${pack}\n\n${sessionLine}`;
       const output = formatHookOutput(rawHarness, rawEvent, additionalContext);
       if (output && !deadlineTriggered) {
-        const writeRes = await writeStdoutBounded(
-          stdoutStream,
-          `${output}\n`,
-          deadlineAt - Date.now(),
-          () => {
-            stdoutWritePending = false;
-            if (killTimer) clearTimeout(killTimer);
-          },
-        );
-        if (writeRes.pending) {
-          stdoutWritePending = true;
-          appendHookLogSync(
-            resolvedDeckDir,
-            rawHarness,
-            rawEvent,
-            'Hook stdout write timed out; keeping hard deadline timer armed',
-          );
-        }
-        if (writeRes.ok && !deadlineTriggered) {
+        const delivered = await writeHookPayload(output);
+        if (delivered) {
           const ackWait = Math.max(50, Math.min(HOOK_LOCK_WAIT_MS, deadlineAt - Date.now()));
           await store.commitHookDelivery(pendingAck, { maxWaitMs: ackWait });
         }
@@ -571,25 +628,8 @@ export async function runHookCli(
       );
       const output = formatHookOutput(rawHarness, rawEvent, additionalContext);
       if (output && !deadlineTriggered) {
-        const writeRes = await writeStdoutBounded(
-          stdoutStream,
-          `${output}\n`,
-          deadlineAt - Date.now(),
-          () => {
-            stdoutWritePending = false;
-            if (killTimer) clearTimeout(killTimer);
-          },
-        );
-        if (writeRes.pending) {
-          stdoutWritePending = true;
-          appendHookLogSync(
-            resolvedDeckDir,
-            rawHarness,
-            rawEvent,
-            'Hook stdout write timed out; keeping hard deadline timer armed',
-          );
-        }
-        if (writeRes.ok && !deadlineTriggered && result.pendingAck) {
+        const delivered = await writeHookPayload(output);
+        if (delivered && result.pendingAck) {
           const ackWait = Math.max(50, Math.min(HOOK_LOCK_WAIT_MS, deadlineAt - Date.now()));
           await store.commitHookDelivery(result.pendingAck, { maxWaitMs: ackWait });
         }

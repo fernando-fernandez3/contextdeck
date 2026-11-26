@@ -1403,6 +1403,208 @@ describe('AC5.1-AC5.4 + AC5.9 + D11/D12/D14 cdeck hook contract fixtures and cro
     },
   );
 
+  it('R3-1 (unit): broken stdout emitting EPIPE on next tick (immediate and post-timeout) does not crash without a test-side error listener and leaves cursor unchanged', async () => {
+    const repo = await makeTempDir('cdeck-r3-1-unit-');
+    const store = new ContextDeckStore(repo);
+    await store.createBoard({ title: 'Broken Stdout Unit', slug: 'main' });
+
+    const origStdinDesc = Object.getOwnPropertyDescriptor(process, 'stdin');
+    const cleanEnv = {
+      ...process.env,
+      CONTEXTDECK_DIR: undefined,
+      CLAUDE_PROJECT_DIR: undefined,
+      CONTEXTDECK_HOME: undefined,
+      CURSOR_PROJECT_DIR: undefined,
+    };
+
+    try {
+      // (a) Immediate EPIPE from write callback; Node emits 'error' on next tick.
+      //     Intentionally attach NO error listener on the test side.
+      const fakeStdin1 = new PassThrough();
+      Object.defineProperty(fakeStdin1, 'isTTY', { value: false });
+      Object.defineProperty(process, 'stdin', {
+        value: fakeStdin1,
+        configurable: true,
+        writable: true,
+      });
+
+      const immediateErrStdout = new Writable({
+        write(_chunk, _enc, cb) {
+          const err = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+          cb(err);
+        },
+      });
+
+      queueMicrotask(() => {
+        fakeStdin1.end(
+          JSON.stringify({
+            session_id: 'r3-1-epipe-immediate',
+            cwd: repo,
+            hook_event_name: 'SessionStart',
+            source: 'startup',
+          }),
+        );
+      });
+
+      await runHookCli('claude-code', 'SessionStart', cleanEnv, {
+        exitOnHardDeadline: true,
+        stdout: immediateErrStdout,
+        exit: () => {},
+      });
+      // Allow next-tick emitErrorNT to fire
+      await new Promise((r) => setTimeout(r, 50));
+
+      const sess1 = await store.findSessionByExternalRef('claude-code:r3-1-epipe-immediate');
+      expect(sess1).not.toBeNull();
+      const cursor1 = await store.readSessionCursor(sess1!.id);
+      expect(cursor1?.syncedRevisions.main ?? 0).toBe(0);
+
+      // (b) Post-timeout EPIPE: write callback fires with EPIPE at ~1780ms (after 1750ms soft deadline,
+      //     before 1850ms killTimer). Intentionally attach NO error listener on the test side.
+      const fakeStdin2 = new PassThrough();
+      Object.defineProperty(fakeStdin2, 'isTTY', { value: false });
+      Object.defineProperty(process, 'stdin', {
+        value: fakeStdin2,
+        configurable: true,
+        writable: true,
+      });
+
+      let lateTimer: ReturnType<typeof setTimeout> | undefined;
+      const start2 = Date.now();
+      const postTimeoutErrStdout = new Writable({
+        write(_chunk, _enc, cb) {
+          const delayMs = Math.max(20, 1780 - (Date.now() - start2));
+          lateTimer = setTimeout(() => {
+            const err = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+            cb(err);
+          }, delayMs);
+        },
+      });
+
+      queueMicrotask(() => {
+        fakeStdin2.end(
+          JSON.stringify({
+            session_id: 'r3-1-epipe-post-timeout',
+            cwd: repo,
+            hook_event_name: 'SessionStart',
+            source: 'startup',
+          }),
+        );
+      });
+
+      await runHookCli('claude-code', 'SessionStart', cleanEnv, {
+        exitOnHardDeadline: true,
+        stdout: postTimeoutErrStdout,
+        exit: () => {},
+      });
+      // Wait for the late EPIPE at ~1780ms + next-tick emitErrorNT to settle
+      await new Promise((r) => setTimeout(r, 150));
+      if (lateTimer) clearTimeout(lateTimer);
+
+      const sess2 = await store.findSessionByExternalRef('claude-code:r3-1-epipe-post-timeout');
+      expect(sess2).not.toBeNull();
+      const cursor2 = await store.readSessionCursor(sess2!.id);
+      expect(cursor2?.syncedRevisions.main ?? 0).toBe(0);
+
+      const hooksLog = await fs.readFile(path.join(store.runtimeDir, 'hooks.log'), 'utf8');
+      expect(hooksLog).toContain('write EPIPE');
+    } finally {
+      if (origStdinDesc) {
+        Object.defineProperty(process, 'stdin', origStdinDesc);
+      }
+    }
+  });
+
+  it.skipIf(process.platform !== 'linux')(
+    'R3-1 (subprocess): closing stdout pipe immediately and post-timeout exits 0 with clean stderr and unchanged cursor',
+    async (ctx) => {
+      const probe = spawnSync(
+        'python3',
+        ['-c', 'import os, fcntl; r, w = os.pipe(); fcntl.fcntl(w, 1031, 4096); os.close(r); os.close(w)'],
+        { encoding: 'utf8' },
+      );
+      if (probe.status !== 0) {
+        ctx.skip();
+        return;
+      }
+
+      const repo = await makeTempDir('cdeck-r3-1-subproc-');
+      const store = new ContextDeckStore(repo);
+      await store.createBoard({ title: 'Broken Pipe Subprocess', slug: 'main' });
+      for (let i = 1; i <= 45; i += 1) {
+        await store.recordDecision('main', {
+          title: `Broken Pipe Decision ${i}`,
+          summary: `Detailed rationale padding for decision ${i} to exceed 4 KiB pipe buffer cleanly`,
+        });
+      }
+
+      const cleanEnv: NodeJS.ProcessEnv = { ...process.env };
+      delete cleanEnv.CONTEXTDECK_DIR;
+      delete cleanEnv.CLAUDE_PROJECT_DIR;
+      delete cleanEnv.CONTEXTDECK_HOME;
+      delete cleanEnv.CURSOR_PROJECT_DIR;
+
+      const pyScript = [
+        'import fcntl, json, os, subprocess, sys, time',
+        'node_bin, cli_bin, repo_dir = sys.argv[1], sys.argv[2], sys.argv[3]',
+        'results = []',
+        'for label, delay in [("immediate", 0.05), ("post-timeout", 1.78)]:',
+        '    r_fd, w_fd = os.pipe()',
+        '    fcntl.fcntl(w_fd, 1031, 4096)',
+        '    payload = json.dumps({"session_id": f"r3-1-{label}", "cwd": repo_dir, "hook_event_name": "SessionStart", "source": "startup"}).encode("utf-8")',
+        '    t0 = time.monotonic()',
+        '    proc = subprocess.Popen([node_bin, cli_bin, "hook", "claude-code", "SessionStart"], cwd=repo_dir, stdin=subprocess.PIPE, stdout=w_fd, stderr=subprocess.PIPE)',
+        '    os.close(w_fd)',
+        '    try:',
+        '        proc.stdin.write(payload)',
+        '        proc.stdin.close()',
+        '        time.sleep(delay)',
+        '        os.close(r_fd)',
+        '        r_fd = -1',
+        '        code = proc.wait(timeout=3.0)',
+        '        stderr = proc.stderr.read().decode("utf-8", errors="replace")',
+        '        elapsed_ms = int((time.monotonic() - t0) * 1000)',
+        '        results.append({"label": label, "timedOut": False, "code": code, "stderr": stderr, "elapsedMs": elapsed_ms})',
+        '    except subprocess.TimeoutExpired:',
+        '        proc.kill()',
+        '        proc.wait()',
+        '        stderr = proc.stderr.read().decode("utf-8", errors="replace")',
+        '        elapsed_ms = int((time.monotonic() - t0) * 1000)',
+        '        results.append({"label": label, "timedOut": True, "code": None, "stderr": stderr, "elapsedMs": elapsed_ms})',
+        '    finally:',
+        '        if r_fd >= 0:',
+        '            os.close(r_fd)',
+        'print(json.dumps(results))',
+      ].join('\n');
+
+      const pyRes = spawnSync('python3', ['-c', pyScript, process.execPath, CLI_BIN, repo], {
+        env: cleanEnv,
+        encoding: 'utf8',
+        timeout: 15_000,
+      });
+      expect(pyRes.status).toBe(0);
+      const results = JSON.parse(pyRes.stdout.trim()) as Array<{
+        label: string;
+        timedOut: boolean;
+        code: number | null;
+        stderr: string;
+        elapsedMs: number;
+      }>;
+
+      for (const item of results) {
+        expect(item.timedOut).toBe(false);
+        expect(item.code).toBe(0);
+        expect(item.stderr).not.toContain("Unhandled 'error'");
+        expect(item.stderr.trim()).toBe('');
+
+        const sess = await store.findSessionByExternalRef(`claude-code:r3-1-${item.label}`);
+        expect(sess).not.toBeNull();
+        const cursor = await store.readSessionCursor(sess!.id);
+        expect(cursor?.syncedRevisions.main ?? 0).toBe(0);
+      }
+    },
+  );
+
   it('R2-9: corrupt legacy session yaml is skipped and logged in hook-triggered migration while valid legacy session migrates and ordinary mutations stay strict', async () => {
     const repo = await makeTempDir('cdeck-r2-9-');
     const store = new ContextDeckStore(repo);
