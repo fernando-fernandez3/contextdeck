@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as core from '../src/index.js';
 
 const tmpDirs: string[] = [];
@@ -550,5 +550,117 @@ describe('E3 honest drift, bounded digest, fast tail reader, and context pack', 
     expect(pack.split(header).length - 1).toBe(1);
     expect(pack.split(footer).length - 1).toBe(1);
     expect(pack).toContain('Keep arrow → and ellipsis … intact.');
+  });
+
+  it('R2-3: readContextPackSnapshot never returns uncommitted content while a transaction journal is in flight', async () => {
+    const dir = await makeTempDir('cdeck-r2-3-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Txn Consistency', slug: 'main' });
+    await store.updateBrief('main', '# Committed Brief v1\n');
+    const committedRev = (await store.readBoardConfig('main')).revision;
+
+    // Simulate an in-flight brief transaction holding the workspace lock:
+    // txn.json exists, brief.md has been renamed to uncommitted content, board.yaml still at old revision.
+    let releaseWriter!: () => void;
+    const writerReady = new Promise<void>((resolve) => {
+      void core.withWorkspaceLock(
+        store.runtimeDir,
+        async () => {
+          const txnPath = path.join(store.runtimeDir, core.TXN_FILENAME);
+          await fs.writeFile(
+            txnPath,
+            JSON.stringify({ id: 'txn_in_flight', boardSlug: 'main', ops: [], events: [] }),
+            'utf8',
+          );
+          await fs.writeFile(
+            path.join(store.boardPath('main'), 'brief.md'),
+            'UNCOMMITTED_BRIEF_FROM_IN_FLIGHT_TXN',
+            'utf8',
+          );
+          resolve();
+          await new Promise<void>((r) => {
+            releaseWriter = r;
+          });
+          // Clean up simulated journal & restore committed brief before releasing lock
+          await fs.writeFile(
+            path.join(store.boardPath('main'), 'brief.md'),
+            '# Committed Brief v1\n',
+            'utf8',
+          );
+          await fs.rm(txnPath, { force: true });
+        },
+        store.deckDir,
+      );
+    });
+
+    await writerReady;
+    try {
+      // Bounded readContextPackSnapshot MUST NOT return the uncommitted brief under the old revision
+      await expect(
+        store.readContextPackSnapshot('main', { maxWaitMs: 120 }),
+      ).rejects.toThrow(core.LockTimeoutError);
+    } finally {
+      releaseWriter();
+    }
+
+    // Once the transaction is finished and journal removed, readContextPackSnapshot succeeds cleanly
+    const cleanSnap = await store.readContextPackSnapshot('main');
+    expect(cleanSnap.config.revision).toBe(committedRev);
+    expect(cleanSnap.brief).toContain('# Committed Brief v1');
+
+    // Also verify revision-change detection retries when board.yaml advances mid-read
+    const origReadConfig = store.readBoardConfig.bind(store);
+    let readConfigCalls = 0;
+    const origBrief = await fs.readFile(path.join(store.boardPath('main'), 'brief.md'), 'utf8');
+    const spy = vi.spyOn(store, 'readBoardConfig').mockImplementation(async (s) => {
+      readConfigCalls += 1;
+      const cfg = await origReadConfig(s);
+      if (readConfigCalls === 1) {
+        // First attempt sees stale revision; second call (verification) sees newer revision -> must retry!
+        return { ...cfg, revision: cfg.revision - 1 };
+      }
+      return cfg;
+    });
+    try {
+      const retriedSnap = await store.readContextPackSnapshot('main');
+      expect(readConfigCalls).toBeGreaterThanOrEqual(4);
+      expect(retriedSnap.config.revision).toBe(committedRev);
+      expect(retriedSnap.brief).toBe(origBrief);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('R2-5: lightweight startup pack omits "synced" claim for unmeasured behind sessions while full snapshot prints "behind by 9"', async () => {
+    const dir = await makeTempDir('cdeck-r2-5-');
+    const store = new core.ContextDeckStore(dir);
+    const demoSlug = await core.seedDemoBoard(store);
+
+    const fullSnap = await store.getSnapshot(demoSlug);
+    const archDrift = fullSnap.drift.driftedSessions.find((d) => d.sessionId === 'sess_arch_root');
+    const claudeDrift = fullSnap.drift.driftedSessions.find(
+      (d) => d.sessionId === 'sess_claude_storage',
+    );
+    expect(archDrift?.behindBy).toBeGreaterThan(0);
+    expect(claudeDrift?.behindBy).toBeGreaterThan(0);
+
+    const fullPack = core.generateContextPack(fullSnap, {
+      includeUpdateProtocol: false,
+      maxChars: 6_000,
+    });
+    expect(fullPack).toContain(`sess_arch_root`);
+    expect(fullPack).toContain(`behind by ${archDrift!.behindBy}`);
+    expect(fullPack).toContain(`behind by ${claudeDrift!.behindBy}`);
+
+    const lightSnap = await store.readContextPackSnapshot(demoSlug);
+    const lightPack = core.generateContextPack(lightSnap, {
+      includeUpdateProtocol: false,
+      maxChars: 6_000,
+    });
+    // Must list the active sessions without falsely claiming they are "synced"
+    expect(lightPack).toContain('sess_arch_root');
+    expect(lightPack).toContain('sess_claude_storage');
+    expect(lightPack).not.toMatch(/sess_arch_root[^\n]*synced/);
+    expect(lightPack).not.toMatch(/sess_claude_storage[^\n]*synced/);
   });
 });

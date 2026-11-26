@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import yaml from 'js-yaml';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as core from '../src/index.js';
 
 const tmpDirs: string[] = [];
@@ -599,6 +599,119 @@ describe('D12 bounded lock acquisition timeout', () => {
       expect(elapsed).toBeLessThan(1200);
     } finally {
       releaseHolder();
+    }
+  });
+
+  it('R2-2: commitHookDelivery serializes concurrent acks preserving higher revisions, other boards, and lastCursorInjectAt, and skips on lock timeout', async () => {
+    const dir = await makeTempDir('cdeck-r2-2-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main' });
+    await store.createBoard({ title: 'Web', slug: 'web' });
+    const sess = await store.registerSession('main', {
+      title: 'Concurrent Hook Session',
+      harness: 'cursor',
+    });
+
+    const origWrite = store.writeSessionCursor.bind(store);
+    let pauseFirstWrite = true;
+    let signalFirstPaused!: () => void;
+    const firstPaused = new Promise<void>((resolve) => {
+      signalFirstPaused = resolve;
+    });
+    let releaseFirstWrite!: () => void;
+    const firstRelease = new Promise<void>((resolve) => {
+      releaseFirstWrite = resolve;
+    });
+
+    const writeSpy = vi
+      .spyOn(store, 'writeSessionCursor')
+      .mockImplementation(async (cursor) => {
+        if (pauseFirstWrite && cursor.syncedRevisions.main === 2) {
+          pauseFirstWrite = false;
+          signalFirstPaused();
+          await firstRelease;
+        }
+        return origWrite(cursor);
+      });
+
+    try {
+      const p1 = store.commitHookDelivery(
+        { sessionId: sess.id, boardSlug: 'main', revision: 2 },
+        { maxWaitMs: 5_000 },
+      );
+
+      await firstPaused;
+
+      // Launch newer updates on main (with throttle stamp) and web while p1 is paused between read and write
+      const p2 = store.commitHookDelivery(
+        {
+          sessionId: sess.id,
+          boardSlug: 'main',
+          revision: 5,
+          stampCursorThrottle: true,
+          now: '2026-11-26T10:00:00.000Z',
+        },
+        { maxWaitMs: 5_000 },
+      );
+      const p3 = store.commitHookDelivery(
+        {
+          sessionId: sess.id,
+          boardSlug: 'web',
+          revision: 3,
+          now: '2026-11-26T10:01:00.000Z',
+        },
+        { maxWaitMs: 5_000 },
+      );
+
+      // Give p2/p3 time to complete if unlocked (RED); when locked (GREEN) they block on workspace lock
+      await new Promise((r) => setTimeout(r, 150));
+      releaseFirstWrite();
+      await Promise.all([p1, p2, p3]);
+    } finally {
+      writeSpy.mockRestore();
+    }
+
+    const finalCursor = await store.readSessionCursor(sess.id);
+    expect(finalCursor?.syncedRevisions).toEqual({ main: 5, web: 3 });
+    expect(finalCursor?.lastCursorInjectAt).toBe('2026-11-26T10:00:00.000Z');
+
+    // A stale delayed ack arriving afterward must also keep main:5, web:3, and newer lastCursorInjectAt
+    await store.commitHookDelivery({
+      sessionId: sess.id,
+      boardSlug: 'main',
+      revision: 2,
+      stampCursorThrottle: true,
+      now: '2026-11-26T09:00:00.000Z',
+    });
+    const afterStale = await store.readSessionCursor(sess.id);
+    expect(afterStale?.syncedRevisions).toEqual({ main: 5, web: 3 });
+    expect(afterStale?.lastCursorInjectAt).toBe('2026-11-26T10:00:00.000Z');
+
+    // When workspace lock is held past maxWaitMs, commitHookDelivery skips ack cleanly (returns null, no throw)
+    let releaseLock!: () => void;
+    const lockHeld = new Promise<void>((resolve) => {
+      void core.withWorkspaceLock(
+        store.runtimeDir,
+        async () => {
+          resolve();
+          await new Promise<void>((r) => {
+            releaseLock = r;
+          });
+        },
+        store.deckDir,
+      );
+    });
+    await lockHeld;
+    try {
+      const skipped = await store.commitHookDelivery(
+        { sessionId: sess.id, boardSlug: 'main', revision: 9 },
+        { maxWaitMs: 120 },
+      );
+      expect(skipped).toBeNull();
+      const afterSkipped = await store.readSessionCursor(sess.id);
+      expect(afterSkipped?.syncedRevisions.main).toBe(5);
+    } finally {
+      releaseLock();
     }
   });
 });

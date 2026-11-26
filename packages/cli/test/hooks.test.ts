@@ -1402,4 +1402,73 @@ describe('AC5.1-AC5.4 + AC5.9 + D11/D12/D14 cdeck hook contract fixtures and cro
       expect(cursor?.syncedRevisions.main ?? 0).toBe(0);
     },
   );
+
+  it('R2-9: corrupt legacy session yaml is skipped and logged in hook-triggered migration while valid legacy session migrates and ordinary mutations stay strict', async () => {
+    const repo = await makeTempDir('cdeck-r2-9-');
+    const store = new ContextDeckStore(repo);
+    await store.createBoard({ title: 'Legacy Corrupt Migration', slug: 'main' });
+
+    const legacyDir = path.join(store.boardPath('main'), 'sessions');
+    await fs.mkdir(legacyDir, { recursive: true });
+    const now = new Date().toISOString();
+
+    const corruptLegacyPath = path.join(legacyDir, 'sess_legacy_corrupt.yaml');
+    const corruptRaw = 'bad: [unterminated\n';
+    await fs.writeFile(corruptLegacyPath, corruptRaw, 'utf8');
+
+    const validLegacyPath = path.join(legacyDir, 'sess_legacy_good.yaml');
+    await fs.writeFile(
+      validLegacyPath,
+      [
+        'id: sess_legacy_good',
+        'title: Valid Legacy Session',
+        'harness: codex',
+        'parentSessionId: null',
+        'relatedSessionIds: []',
+        'status: active',
+        'summary: ""',
+        'focusFiles: []',
+        'lastSyncedRevision: 1',
+        `createdAt: "${now}"`,
+        `updatedAt: "${now}"`,
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+
+    // SessionStart hook MUST still succeed, emit a Context Pack, log the corrupt legacy file,
+    // leave the corrupt original intact, and migrate the valid legacy session.
+    const startRes = await runCliWithStdin(['hook', 'claude-code', 'SessionStart'], {
+      cwd: repo,
+      stdin: JSON.stringify({
+        session_id: 'r2-9-start',
+        cwd: repo,
+        hook_event_name: 'SessionStart',
+        source: 'startup',
+      }),
+    });
+    expect(startRes.code).toBe(0);
+    expect(startRes.stdout.length).toBeGreaterThan(0);
+    const parsed = JSON.parse(startRes.stdout) as {
+      hookSpecificOutput: { hookEventName: string; additionalContext: string };
+    };
+    expect(parsed.hookSpecificOutput.hookEventName).toBe('SessionStart');
+    expect(parsed.hookSpecificOutput.additionalContext).toContain('Legacy Corrupt Migration');
+
+    // Valid legacy session migrated to workspace sessions/; corrupt original left untouched on disk
+    expect(await fs.readFile(corruptLegacyPath, 'utf8')).toBe(corruptRaw);
+    await expect(fs.stat(validLegacyPath)).rejects.toThrow();
+    expect(await fs.readFile(path.join(store.sessionsDir, 'sess_legacy_good.yaml'), 'utf8')).toContain(
+      'Valid Legacy Session',
+    );
+
+    // Logged to hooks.log
+    const hooksLog = await fs.readFile(path.join(store.runtimeDir, 'hooks.log'), 'utf8');
+    expect(hooksLog).toContain('sess_legacy_corrupt.yaml');
+
+    // Ordinary mutations MUST stay strict and fail closed on the remaining corrupt legacy file
+    await expect(
+      store.recordDecision('main', { title: 'Strict Mutation Fails On Corrupt Legacy' }),
+    ).rejects.toThrow(/Corrupt/i);
+  });
 });

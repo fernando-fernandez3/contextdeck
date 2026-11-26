@@ -63,6 +63,7 @@ import {
   ConflictError,
   CorruptDataError,
   LockCompromisedError,
+  LockTimeoutError,
   NotFoundError,
   SecurityError,
   ValidationError,
@@ -516,7 +517,14 @@ export class ContextDeckStore {
    *   preserves all conflicting originals, migrates non-conflicting sessions, cleans up empty
    *   legacy `sessions/` dirs, and raises a clear CorruptDataError naming the conflicting paths (H3).
    */
-  private async migrateLegacySessionsUnlocked(assertActive: () => void): Promise<void> {
+  private async migrateLegacySessionsUnlocked(
+    assertActive: () => void,
+    options: {
+      skipCorrupt?: boolean;
+      onCorrupt?: (filePath: string, err: unknown) => void;
+    } = {},
+  ): Promise<void> {
+    const { skipCorrupt = false, onCorrupt } = options;
     let boardEntries;
     try {
       boardEntries = await fs.readdir(this.boardsDir, { withFileTypes: true });
@@ -560,23 +568,42 @@ export class ContextDeckStore {
         const legacyPath = await assertContainedPath(safeDir, path.join(safeDir, file), {
           label: `legacy session ${file}`,
         });
-        const parsed = await readYamlStrict(legacyPath, LegacySessionFileSchema);
+        let parsed: LegacySessionFile | null;
+        try {
+          parsed = await readYamlStrict(legacyPath, LegacySessionFileSchema);
+        } catch (err) {
+          if (skipCorrupt && err instanceof CorruptDataError) {
+            // R2-9: On hook paths, leave corrupt original in place, log it, and migrate the rest
+            onCorrupt?.(legacyPath, err);
+            continue;
+          }
+          throw err;
+        }
         if (!parsed) continue;
 
-        const meta = SessionMetadataSchema.parse({
-          id: parsed.id,
-          title: parsed.title,
-          harness: parsed.harness,
-          ...(parsed.externalRef !== undefined ? { externalRef: parsed.externalRef } : {}),
-          board: parsed.board ?? slug,
-          parentSessionId: parsed.parentSessionId,
-          relatedSessionIds: parsed.relatedSessionIds,
-          status: parsed.status,
-          summary: parsed.summary,
-          focusFiles: parsed.focusFiles,
-          createdAt: parsed.createdAt,
-          updatedAt: parsed.updatedAt,
-        });
+        let meta: SessionMetadata;
+        try {
+          meta = SessionMetadataSchema.parse({
+            id: parsed.id,
+            title: parsed.title,
+            harness: parsed.harness,
+            ...(parsed.externalRef !== undefined ? { externalRef: parsed.externalRef } : {}),
+            board: parsed.board ?? slug,
+            parentSessionId: parsed.parentSessionId,
+            relatedSessionIds: parsed.relatedSessionIds,
+            status: parsed.status,
+            summary: parsed.summary,
+            focusFiles: parsed.focusFiles,
+            createdAt: parsed.createdAt,
+            updatedAt: parsed.updatedAt,
+          });
+        } catch (err) {
+          if (skipCorrupt) {
+            onCorrupt?.(legacyPath, err);
+            continue;
+          }
+          throw err;
+        }
 
         const group = byId.get(parsed.id) ?? [];
         group.push({ slug, safeDir, legacyPath, parsed, meta });
@@ -594,9 +621,18 @@ export class ContextDeckStore {
     for (const [id, group] of byId.entries()) {
       assertActive();
       const targetSessionPath = await this.safeSessionFilePath(id);
-      const existingWsMeta = existsSync(targetSessionPath)
-        ? await readYamlStrict(targetSessionPath, SessionMetadataSchema)
-        : null;
+      let existingWsMeta: SessionMetadata | null = null;
+      if (existsSync(targetSessionPath)) {
+        try {
+          existingWsMeta = await readYamlStrict(targetSessionPath, SessionMetadataSchema);
+        } catch (err) {
+          if (skipCorrupt && err instanceof CorruptDataError) {
+            onCorrupt?.(targetSessionPath, err);
+            continue;
+          }
+          throw err;
+        }
+      }
 
       const baselineFingerprint = this.sessionMetadataFingerprint(
         existingWsMeta ?? group[0].meta,
@@ -615,12 +651,22 @@ export class ContextDeckStore {
         continue;
       }
 
+      let existingCursor: SessionCursor | null;
+      try {
+        existingCursor = await this.readSessionCursor(id);
+      } catch (err) {
+        if (skipCorrupt && err instanceof CorruptDataError) {
+          onCorrupt?.(path.join(this.cursorsDir, `${id}.json`), err);
+          continue;
+        }
+        throw err;
+      }
+
       if (!existingWsMeta) {
         assertActive();
         await atomicWriteFile(targetSessionPath, dumpYaml(group[0].meta));
       }
 
-      const existingCursor = await this.readSessionCursor(id);
       const nextSynced: Record<string, number> = {
         ...(existingCursor?.syncedRevisions ?? {}),
       };
@@ -659,9 +705,14 @@ export class ContextDeckStore {
       const details = conflicts
         .map((c) => `${c.id} (${c.paths.join(' vs ')})`)
         .join('; ');
-      throw new CorruptDataError(
+      const conflictErr = new CorruptDataError(
         `Legacy session migration conflict detected; conflicting originals preserved on disk: ${details}`,
       );
+      if (skipCorrupt) {
+        onCorrupt?.(conflicts[0].paths[0] ?? this.boardsDir, conflictErr);
+      } else {
+        throw conflictErr;
+      }
     }
   }
 
@@ -2000,22 +2051,14 @@ export class ContextDeckStore {
     };
   }
 
-  /**
-   * Lightweight lock-free snapshot reader tailored for hook startup Context Packs (H7):
-   * - Skips loading media file contents (`loadContent: false`) and diagram bodies (`loadContent: false`).
-   * - Reads only the recent tail of `events.jsonl` via reverse-chunk scanning (`readRecentEvents`).
-   * - Computes stale artifacts accurately while omitting O(sessions x events) per-session drift scans.
-   * - Optionally skips and reports single corrupt session files (N3).
-   */
-  public async readContextPackSnapshot(
-    slug: string,
+  private async readContextPackSnapshotOnce(
+    validSlug: string,
     options: {
       maxRecentEvents?: number;
       skipCorruptSessions?: boolean;
       onCorruptSession?: (filePath: string, message: string) => void;
     } = {},
   ): Promise<BoardSnapshot> {
-    const validSlug = validateBoardSlug(slug);
     const config = await this.readBoardConfig(validSlug);
     const briefPath = await this.safeBoardFilePath(validSlug, 'brief.md');
     const brief = (await readFileStrict(briefPath)) ?? '';
@@ -2062,16 +2105,20 @@ export class ContextDeckStore {
       this.readRecentEvents(validSlug, options.maxRecentEvents ?? 16, config.revision),
     ]);
 
-    const drift = computeDriftReport({
-      config,
-      sessions: [], // H7: Omit O(S x E) per-session drift computation for hook startup packs
-      decisions,
-      tasks,
-      diagrams,
-      media,
-      quizzes,
-      events: [],
-    });
+    const drift = {
+      ...computeDriftReport({
+        config,
+        sessions: [], // H7: Omit O(S x E) per-session drift computation for hook startup packs
+        decisions,
+        tasks,
+        diagrams,
+        media,
+        quizzes,
+        events: [],
+      }),
+      // R2-5: Signal that per-session drift was intentionally omitted so formatters do not claim "synced"
+      sessionDriftComputed: false,
+    };
 
     return {
       config,
@@ -2085,6 +2132,78 @@ export class ContextDeckStore {
       events,
       drift,
     };
+  }
+
+  /**
+   * Lightweight consistent snapshot reader tailored for hook startup Context Packs (H7, R2-3, R2-5):
+   * - Skips loading media file contents (`loadContent: false`) and diagram bodies (`loadContent: false`).
+   * - Reads only the recent tail of `events.jsonl` via reverse-chunk scanning (`readRecentEvents`).
+   * - Computes stale artifacts accurately while omitting O(sessions x events) per-session drift scans
+   *   (marking `drift.sessionDriftComputed = false` so formatters omit sync claims).
+   * - Verifies transaction journal absence + unchanged board revision before/after reading (matching
+   *   `getSnapshot()`), retrying with bounded backoff and falling back to a bounded locked read so
+   *   uncommitted/torn content is never returned (R2-3).
+   * - Optionally skips and reports single corrupt session files (N3).
+   */
+  public async readContextPackSnapshot(
+    slug: string,
+    options: {
+      maxRecentEvents?: number;
+      skipCorruptSessions?: boolean;
+      onCorruptSession?: (filePath: string, message: string) => void;
+      maxWaitMs?: number;
+    } = {},
+  ): Promise<BoardSnapshot> {
+    const validSlug = validateBoardSlug(slug);
+    const txnPath = path.join(this.runtimeDir, TXN_FILENAME);
+    const maxRetries = 4;
+    const deadlineAt =
+      options.maxWaitMs !== undefined ? Date.now() + Math.max(0, options.maxWaitMs) : undefined;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+      const txnBefore = await this.txnJournalExists(txnPath);
+      if (txnBefore) {
+        if (attempt < maxRetries) {
+          const waitMs = 15 * (attempt + 1);
+          if (deadlineAt !== undefined && Date.now() + waitMs >= deadlineAt) {
+            break;
+          }
+          await new Promise((r) => setTimeout(r, waitMs));
+          continue;
+        }
+        break;
+      }
+
+      const snapshot = await this.readContextPackSnapshotOnce(validSlug, options);
+      // Same R5-1 ordering as getSnapshot(): check txn.json BEFORE re-reading board.yaml
+      const txnAfter = await this.txnJournalExists(txnPath);
+      if (!txnAfter) {
+        const configAfter = await this.readBoardConfig(validSlug);
+        if (configAfter.revision === snapshot.config.revision) {
+          return snapshot;
+        }
+      }
+
+      if (attempt < maxRetries) {
+        const waitMs = 15 * (attempt + 1);
+        if (deadlineAt !== undefined && Date.now() + waitMs >= deadlineAt) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, waitMs));
+      }
+    }
+
+    const remainingLockWaitMs =
+      deadlineAt !== undefined ? Math.max(10, deadlineAt - Date.now()) : undefined;
+    return withWorkspaceLock(
+      this.runtimeDir,
+      async (assertActive) => {
+        assertActive();
+        return this.readContextPackSnapshotOnce(validSlug, options);
+      },
+      this.deckDir,
+      remainingLockWaitMs !== undefined ? { maxWaitMs: remainingLockWaitMs } : {},
+    );
   }
 
   /**
@@ -2979,32 +3098,68 @@ export class ContextDeckStore {
   }
 
   /**
-   * Commit a hook delivery cursor acknowledgement AFTER stdout has been flushed (D12 at-least-once).
-   * Monotonically advances `.runtime/cursors/<sessionId>.json` via atomic write so concurrent or
-   * stale deliveries never rewind a newer cursor and never dirty git-tracked files.
+   * Internal unlocked cursor merge helper — caller MUST already hold the workspace lock (R2-2).
+   * Monotonically merges `syncedRevisions[board]` with `max()`, preserves all other boards,
+   * and preserves the newer `lastActiveAt` and `lastCursorInjectAt`.
    */
-  public async commitHookDelivery(ack: HookDeliveryAck): Promise<SessionCursor> {
+  private async commitHookDeliveryUnlocked(ack: HookDeliveryAck): Promise<SessionCursor> {
     const validId = validateEntityId(ack.sessionId, 'sessionId');
     const validBoard = validateBoardSlug(ack.boardSlug);
     const nowStr = ack.now ?? nowIso();
 
     const existingCursor = await this.readSessionCursor(validId);
     const prevSynced = existingCursor?.syncedRevisions[validBoard] ?? 0;
+    const lastActiveAt =
+      existingCursor?.lastActiveAt && existingCursor.lastActiveAt > nowStr
+        ? existingCursor.lastActiveAt
+        : nowStr;
+    const existingInjectAt = existingCursor?.lastCursorInjectAt;
+    const nextInjectAt = ack.stampCursorThrottle
+      ? existingInjectAt && existingInjectAt > nowStr
+        ? existingInjectAt
+        : nowStr
+      : existingInjectAt;
+
     const nextCursor: SessionCursor = {
       sessionId: validId,
       syncedRevisions: {
         ...(existingCursor?.syncedRevisions ?? {}),
         [validBoard]: Math.max(prevSynced, ack.revision),
       },
-      lastActiveAt: nowStr,
-      ...(ack.stampCursorThrottle
-        ? { lastCursorInjectAt: nowStr }
-        : existingCursor?.lastCursorInjectAt
-          ? { lastCursorInjectAt: existingCursor.lastCursorInjectAt }
-          : {}),
+      lastActiveAt,
+      ...(nextInjectAt ? { lastCursorInjectAt: nextInjectAt } : {}),
     };
     await this.writeSessionCursor(nextCursor);
     return nextCursor;
+  }
+
+  /**
+   * Commit a hook delivery cursor acknowledgement AFTER stdout has been flushed (D12, R2-2).
+   * Acquires the workspace lock bounded by `maxWaitMs` and monotonically merges `.runtime/cursors/<sessionId>.json`
+   * so concurrent hooks / `syncSession` never rewind revisions, drop other boards, or lose `lastCursorInjectAt`.
+   * On `LockTimeoutError`, skips the ack and returns `null` (duplicate next turn is acceptable per D12; loss/rewind is not).
+   */
+  public async commitHookDelivery(
+    ack: HookDeliveryAck,
+    options: { maxWaitMs?: number } = {},
+  ): Promise<SessionCursor | null> {
+    const maxWaitMs = options.maxWaitMs ?? 800;
+    try {
+      return await withWorkspaceLock(
+        this.runtimeDir,
+        async (assertActive) => {
+          assertActive();
+          return this.commitHookDeliveryUnlocked(ack);
+        },
+        this.deckDir,
+        { maxWaitMs },
+      );
+    } catch (err) {
+      if (err instanceof LockTimeoutError) {
+        return null;
+      }
+      throw err;
+    }
   }
 
   /**
@@ -3040,7 +3195,7 @@ export class ContextDeckStore {
     const { meta, boardSlug, created } = await withWorkspaceLock(
       this.runtimeDir,
       async (assertActive) => {
-        await this.migrateLegacySessionsUnlocked(assertActive);
+        await this.migrateLegacySessionsUnlocked(assertActive, { skipCorrupt: true, onCorrupt });
         const boards = await this.listBoards();
         if (boards.length === 0) {
           throw new NotFoundError('No ContextDeck boards exist in this workspace.');
@@ -3114,11 +3269,12 @@ export class ContextDeckStore {
       { maxWaitMs },
     );
 
-    // H7: Build lightweight context pack OUTSIDE the workspace lock
+    // H7 + R2-3: Build verified lightweight context pack OUTSIDE the workspace lock
     const [snapshot, existingCursor] = await Promise.all([
       this.readContextPackSnapshot(boardSlug, {
         skipCorruptSessions: true,
         onCorruptSession: params.onCorruptSession,
+        maxWaitMs,
       }),
       this.readSessionCursor(meta.id),
     ]);
@@ -3132,7 +3288,10 @@ export class ContextDeckStore {
 
     let hydratedCursor = existingCursor;
     if (!params.deferCursorCommit) {
-      hydratedCursor = await this.commitHookDelivery(pendingAck);
+      const committed = await this.commitHookDelivery(pendingAck, { maxWaitMs });
+      if (committed) {
+        hydratedCursor = committed;
+      }
     }
 
     return {
@@ -3213,15 +3372,17 @@ export class ContextDeckStore {
           });
 
           if (fastDigest.behindBy === 0 || fastDigest.digest.length === 0) {
-            // H8: Fast-forward runtime cursor past self-authored / housekeeping events
-            // (preserving lastCursorInjectAt, never touching git-tracked files)
-            await this.commitHookDelivery({
-              sessionId: fastMatch.id,
-              boardSlug,
-              revision: config.revision,
-              stampCursorThrottle: false,
-              now: nowStr,
-            });
+            // H8 + R2-2: Fast-forward runtime cursor via bounded locked commit (swallows lock timeout)
+            await this.commitHookDelivery(
+              {
+                sessionId: fastMatch.id,
+                boardSlug,
+                revision: config.revision,
+                stampCursorThrottle: false,
+                now: nowStr,
+              },
+              { maxWaitMs: Math.min(maxWaitMs, 250) },
+            );
             if (!needsReactivate) {
               return { action: 'noop' };
             }
@@ -3242,7 +3403,7 @@ export class ContextDeckStore {
     return withWorkspaceLock(
       this.runtimeDir,
       async (assertActive) => {
-        await this.migrateLegacySessionsUnlocked(assertActive);
+        await this.migrateLegacySessionsUnlocked(assertActive, { skipCorrupt: true, onCorrupt });
         const boards = await this.listBoards();
         if (boards.length === 0) {
           throw new NotFoundError('No ContextDeck boards exist in this workspace.');
@@ -3340,9 +3501,9 @@ export class ContextDeckStore {
         });
 
         if (digestResult.behindBy === 0 || digestResult.digest.length === 0) {
-          // H8: Fast-forward runtime cursor past self-authored / housekeeping events
+          // H8 + R2-2: Fast-forward runtime cursor using unlocked helper (workspace lock already held)
           assertActive();
-          await this.commitHookDelivery({
+          await this.commitHookDeliveryUnlocked({
             sessionId: activeExisting.id,
             boardSlug,
             revision: boardConfig.revision,
@@ -3369,26 +3530,8 @@ export class ContextDeckStore {
 
         let hydratedCursor = existingCursor;
         if (!params.deferCursorCommit) {
-          const nextCursor: SessionCursor = {
-            sessionId: activeExisting.id,
-            syncedRevisions: {
-              ...(existingCursor?.syncedRevisions ?? {}),
-              [boardSlug]: Math.max(
-                existingCursor?.syncedRevisions[boardSlug] ?? 0,
-                boardConfig.revision,
-              ),
-            },
-            lastActiveAt: nowStr,
-            // D12: Cursor throttle stamps ONLY when a digest is actually emitted
-            ...(params.throttleMs !== undefined
-              ? { lastCursorInjectAt: nowStr }
-              : existingCursor?.lastCursorInjectAt
-                ? { lastCursorInjectAt: existingCursor.lastCursorInjectAt }
-                : {}),
-          };
           assertActive();
-          await this.writeSessionCursor(nextCursor);
-          hydratedCursor = nextCursor;
+          hydratedCursor = await this.commitHookDeliveryUnlocked(pendingAck);
         }
 
         return {
@@ -3432,7 +3575,7 @@ export class ContextDeckStore {
     return withWorkspaceLock(
       this.runtimeDir,
       async (assertActive) => {
-        await this.migrateLegacySessionsUnlocked(assertActive);
+        await this.migrateLegacySessionsUnlocked(assertActive, { skipCorrupt: true, onCorrupt });
         const current = (await this.listAllRawSessions({ skipCorrupt: true, onCorrupt })).find(
           (s) => s.externalRef === params.externalRef,
         );

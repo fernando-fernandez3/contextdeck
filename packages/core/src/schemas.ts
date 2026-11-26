@@ -561,6 +561,11 @@ export interface DriftReport {
   currentRevision: number;
   staleArtifacts: StaleArtifactNotice[];
   driftedSessions: DriftedSessionNotice[];
+  /**
+   * False when per-session drift was intentionally skipped (e.g. lightweight hook startup snapshots).
+   * Formatters must not claim sessions are "synced" when this is false.
+   */
+  sessionDriftComputed?: boolean;
 }
 
 export interface BoardSnapshot {

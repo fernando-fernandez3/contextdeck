@@ -203,23 +203,26 @@ export function generateContextPack(
     remaining = appendSectionWithinBudget(bodySections, briefBlock, remaining, true);
   }
 
-  // Priority 5: Active Sessions (using honest drift counts)
+  // Priority 5: Active Sessions (using honest drift counts; omit sync label when drift was not computed — R2-5)
   const activeSessions = snapshot.sessions.filter(
     (s) => s.status !== 'archived' && s.status !== 'completed',
   );
   if (activeSessions.length > 0) {
-    const driftBySession = new Map(
-      snapshot.drift.driftedSessions.map((d) => [d.sessionId, d.behindBy]),
-    );
+    const sessionDriftComputed = snapshot.drift.sessionDriftComputed !== false;
+    const driftBySession = sessionDriftComputed
+      ? new Map(snapshot.drift.driftedSessions.map((d) => [d.sessionId, d.behindBy]))
+      : null;
     const lines = ['## Linked Agent Sessions'];
     for (const s of activeSessions) {
-      const lag = driftBySession.get(s.id) ?? 0;
-      const syncLabel = lag > 0 ? `behind by ${lag}` : 'synced';
+      const statusLabel =
+        driftBySession !== null
+          ? `${s.status}, ${(driftBySession.get(s.id) ?? 0) > 0 ? `behind by ${driftBySession.get(s.id)}` : 'synced'}`
+          : s.status;
       const parentLabel = s.parentSessionId ? ` (child of ${s.parentSessionId})` : '';
       const title = capSingleLine(s.title, MAX_TITLE_CHARS);
       const summary = s.summary ? `: ${capSingleLine(s.summary, MAX_SUMMARY_CHARS)}` : '';
       lines.push(
-        `- **${s.id}** [${capSingleLine(s.harness, 40)}] ${title}${parentLabel} — _${s.status}, ${syncLabel}_${summary}`,
+        `- **${s.id}** [${capSingleLine(s.harness, 40)}] ${title}${parentLabel} — _${statusLabel}_${summary}`,
       );
     }
     remaining = appendSectionWithinBudget(bodySections, lines.join('\n'), remaining, true);

@@ -524,7 +524,8 @@ export async function runHookCli(
           );
         }
         if (writeRes.ok && !deadlineTriggered) {
-          await store.commitHookDelivery(pendingAck);
+          const ackWait = Math.max(50, Math.min(HOOK_LOCK_WAIT_MS, deadlineAt - Date.now()));
+          await store.commitHookDelivery(pendingAck, { maxWaitMs: ackWait });
         }
       }
       return;
@@ -588,7 +589,8 @@ export async function runHookCli(
           );
         }
         if (writeRes.ok && !deadlineTriggered && result.pendingAck) {
-          await store.commitHookDelivery(result.pendingAck);
+          const ackWait = Math.max(50, Math.min(HOOK_LOCK_WAIT_MS, deadlineAt - Date.now()));
+          await store.commitHookDelivery(result.pendingAck, { maxWaitMs: ackWait });
         }
       }
       return;
