@@ -27,14 +27,14 @@ For how ContextDeck compares to existing tools, see [Prior art](./docs/prior-art
 
 ## What's in v0.2
 
-- **Human Catch up lens & reader cursors:** Tracks what *you* have and have not seen per reader and per board (`.contextdeck/.runtime/readers/<readerId>.yaml`, gitignored, zero reader noise in `events.jsonl`). Opening the app lands on **Catch up** whenever unseen changes exist, showing changed decisions (`old -> new`), newly stale artifacts, moved tasks, and new sessions, with an unseen count badge in the header.
+- **Human Catch up lens & reader cursors:** Tracks what *you* have and have not seen per reader and per board (`.contextdeck/.runtime/readers/<readerId>.yaml`, gitignored, zero reader noise in `events.jsonl`). Opening the app lands on **Catch up** whenever unseen changes exist, showing changed decisions (`old -> new`), newly stale artifacts, moved tasks, new sessions, and other meaningful changes, with an unseen count badge in the header.
 - **Confirm vs. Refresh (no silent clearing):** Stale artifacts offer two explicit actions:
-  - **Queue refresh** (1-tap): creates a deduplicated refresh job (`.contextdeck/boards/<slug>/jobs/<id>.yaml`) with atomic claiming, 15-minute lease TTL, and strict version-linked completion.
-  - **Still accurate**: records an auditable confirmation against the latest superseding decision (`confirmations` map) without rewriting `basedOnDecisions`. Confirmations automatically expire and re-stale the artifact if that decision is superseded again. Agent confirmations via MCP always require a `note` and are labeled as agent confirmations.
-- **Versioned artifacts & media pruning:** Diagrams, media, and quizzes track `version` and capped `history` (last 10 versions). Media binaries are stored as immutable `<id>.v<N>.<ext>` files; quiz updates preserve all past human mastery attempts; `cdeck media prune` reclaims old media files while protecting versions referenced by open refresh jobs.
+  - **Queue refresh** (1-tap): creates a deduplicated refresh job (`.contextdeck/boards/<slug>/jobs/<id>.yaml`) with atomic claiming, 15-minute lease TTL, claim-bound artifact writes (`jobId` + active `leaseToken`), and strict completion verification.
+  - **Still accurate**: records an auditable confirmation against the displayed replacement decision (`confirmations` map) without rewriting `basedOnDecisions`. Confirmations reject with `409 Conflict` if the artifact version or superseding decision changed since display, and automatically re-stale if superseded again. Agent confirmations via MCP require a non-blank `note` and are labeled as agent confirmations.
+- **Versioned artifacts & media pruning:** Diagrams, media, and quizzes track `version` and capped `history` (last 10 versions). Media binaries are stored as immutable `<id>.v<N>.<ext>` files; quiz updates preserve all past human mastery attempts; `cdeck media prune` reclaims old media files while protecting current and open-job input files.
 - **Local refresh workers (`cdeck worker`):** Run user-local video-explainer, quiz, or diagram scripts against queued jobs with explicit `cdeck worker trust` SHA-256 verification and `spawn(..., { shell: false })`. See [Refresh Job Handlers](./docs/handlers.md).
 - **Per-question quiz staleness & mastery trends:** Quiz questions reference `relatedDecisionIds` so only questions affected by a superseded decision are flagged stale, alongside a per-quiz mastery score trend across attempts.
-- **Fast, mobile-ready UI:** Heavy visualizations (React Flow, Mermaid, Excalidraw) are lazy-loaded on demand; all 6 lenses fit a `390px` phone viewport with zero horizontal overflow.
+- **Fast, mobile-ready UI with dark/light theme:** Heavy visualizations (React Flow, Mermaid, Excalidraw) are lazy-loaded on demand; all 6 lenses fit a `390px` phone viewport with zero horizontal overflow and support dark/light theme switching.
 
 ---
 
@@ -144,8 +144,8 @@ To process queued jobs locally with your own scripts or skills (video explainers
 ```bash
 cdeck worker trust
 cdeck worker --once
-# or poll continuously:
-cdeck worker
+# or poll continuously (seconds via --interval, or milliseconds via --poll-ms):
+cdeck worker --interval 5
 ```
 
 See [docs/handlers.md](./docs/handlers.md) for the full worker configuration schema, environment contract, and worked video-explainer and quiz handler examples.
@@ -155,7 +155,7 @@ See [docs/handlers.md](./docs/handlers.md) for the full worker configuration sch
 ## Security Model
 
 - **Loopback by default:** `cdeck serve` binds strictly to `127.0.0.1` and enforces strict `Host` and `Origin` validation (rejecting DNS rebinding and `Origin: null`). LAN/phone access requires explicit `--allow-remote` and `--allowed-hosts <csv>` and prints a plain-HTTP warning.
-- **Cookie + CSRF browser auth, bearer token for API/MCP:** A per-workspace 32-byte random bearer token lives in `<deck>/.runtime/token` (mode `0600`). Browser sessions authenticate via single-use launch URLs (`/auth?code=...`) that set an `HttpOnly; SameSite=Strict` cookie paired with an in-memory CSRF token (`X-CSRF-Token`) — zero auth tokens are ever stored in `localStorage`.
+- **Cookie + CSRF browser auth, bearer token for API/MCP:** A per-workspace 32-byte random bearer token lives in `<deck>/.runtime/token` (mode `0600`). Browser sessions authenticate via single-use launch URLs (`/auth?code=...`) that set an `HttpOnly; SameSite=Strict` cookie paired with an in-memory CSRF token (`X-CSRF-Token`) — zero auth or CSRF tokens are ever stored in `localStorage` (only the optional UI theme preference `contextdeck_theme` is persisted).
 - **Sandboxed content rendering:** Markdown and Mermaid SVGs are sanitized via DOMPurify; inline HTML artifacts render inside `<iframe sandbox="allow-scripts">` (no `allow-same-origin`) with a strict `default-src 'none'` CSP meta header; direct downloads of HTML/SVG media files are forced to `Content-Disposition: attachment` with `X-Content-Type-Options: nosniff`.
 - **Safe file storage & worker isolation:** Atomic temp-file-and-rename transactions with cross-process locking (`proper-lockfile`), strict slug/ID path containment, streaming byte-capped multipart uploads, and zero server-side command execution (`cdeck worker` runs only user-local, explicitly SHA-256-trusted `argv` handlers with `shell: false`).
 
@@ -173,17 +173,17 @@ See [docs/handlers.md](./docs/handlers.md) for the full worker configuration sch
 | `session_update` | Update session status, summary, or hierarchy links. |
 | `decision_record` | Record a decision (passing `supersedes` automatically flags dependent artifacts as stale). |
 | `task_upsert` | Create or move a Kanban task. |
-| `diagram_upsert` | Create or publish a new version of a Mermaid or Excalidraw diagram (supports `jobId` & `note`). |
+| `diagram_upsert` | Create or publish a new version of a Mermaid or Excalidraw diagram (supports `jobId` + `leaseToken` & `note`). |
 | `media_attach` | Attach a video, audio clip, Markdown doc, HTML widget, or custom artifact. |
-| `media_update` | Publish a new immutable version (`<id>.v<N>.<ext>`) of an existing media artifact (supports `jobId` & `note`). |
+| `media_update` | Publish a new immutable version (`<id>.v<N>.<ext>`) of an existing media artifact (supports `jobId` + `leaseToken` & `note`). |
 | `quiz_create` | Publish an interactive knowledge-check quiz. |
-| `quiz_update` | Publish a new version of a quiz while preserving past human mastery attempts (supports `jobId` & `note`). |
-| `artifact_confirm` | Record an agent confirmation (requires `note`) that a stale artifact remains accurate against the latest decision. |
-| `job_list` | List refresh jobs (optionally filtered by status). |
+| `quiz_update` | Publish a new version of a quiz while preserving past human mastery attempts (supports `jobId` + `leaseToken` & `note`). |
+| `artifact_confirm` | Record an agent confirmation (requires non-blank `note`; optional `artifactVersion` & `expectedAgainst` conflict checks). |
+| `job_list` | List refresh jobs (`leaseToken` omitted; optionally filtered by status). |
 | `job_claim` | Atomically claim a queued refresh job (returns `leaseToken` and 15-minute lease expiry). |
 | `job_renew` | Renew an active job lease using `leaseToken`. |
 | `job_release` | Release a claimed job back to `queued` using `leaseToken`. |
-| `job_complete` | Mark a claimed job `done` (verifying `version > baseVersion` created by `jobId`) or `failed`. |
+| `job_complete` | Mark a claimed job `done` (verifying `version > baseVersion` created by the active claim with changed content/file) or `failed`. |
 
 Resources: `contextdeck://brief` (`text/markdown`), `contextdeck://snapshot` (`application/json`).
 
