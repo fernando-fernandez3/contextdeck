@@ -458,7 +458,7 @@ describe('AC5.5-AC5.7 + C3/C4 + D13 cdeck setup and --uninstall', () => {
               { type: 'command', command: './scripts/user-startup.sh' },
               {
                 type: 'command',
-                command: 'node /old/path/index.js status --brief-hook --dir "/old/repo"',
+                command: `node /old/packages/cli/dist/index.js status --brief-hook --dir "${repo1}"`,
               },
             ],
           },
@@ -488,7 +488,7 @@ describe('AC5.5-AC5.7 + C3/C4 + D13 cdeck setup and --uninstall', () => {
       hooks: {
         SessionStart: [
           {
-            hooks: [{ type: 'command', command: 'cdeck status --brief-hook --dir "/old/repo"' }],
+            hooks: [{ type: 'command', command: `cdeck status --brief-hook --dir "${repo2}"` }],
           },
         ],
       },
@@ -528,7 +528,7 @@ describe('AC5.5-AC5.7 + C3/C4 + D13 cdeck setup and --uninstall', () => {
 
     // 2. Compound user hook (`foo; cdeck status --brief-hook`) is kept, while exact v0.1 shapes
     //    (with quoted path containing spaces and without --dir) are removed.
-    const repo2 = await makeTempDir('cdeck-r2-4-mixed-');
+    const repo2 = await makeTempDir('cdeck-r2-4-mixed with spaces-');
     const localPath2 = path.join(repo2, '.claude', 'settings.local.json');
     await fs.mkdir(path.dirname(localPath2), { recursive: true });
     const mixed = {
@@ -541,12 +541,12 @@ describe('AC5.5-AC5.7 + C3/C4 + D13 cdeck setup and --uninstall', () => {
               { type: 'command', command: 'cdeck status --brief-hook && echo done' },
               {
                 type: 'command',
-                command: 'cdeck status --brief-hook --dir "/tmp/my project with spaces"',
+                command: `cdeck status --brief-hook --dir "${repo2}"`,
               },
               { type: 'command', command: 'cdeck status --brief-hook' },
               {
                 type: 'command',
-                command: '"/usr/local/bin/cdeck" status --brief-hook --dir "/opt/repo"',
+                command: `"/usr/local/bin/cdeck" status --brief-hook --dir "${repo2}"`,
               },
             ],
           },
@@ -670,5 +670,95 @@ describe('AC5.5-AC5.7 + C3/C4 + D13 cdeck setup and --uninstall', () => {
     expect(extraRes.notes.join(' ')).not.toContain('(no absolute paths)');
     await setupHarness(repo4, 'claude-code', { uninstall: true });
     expect(JSON.parse(await fs.readFile(mcpPath4, 'utf8'))).toEqual(extraKeyMcp);
+  });
+
+  it('R3-4: Claude setup does not claim "(no absolute paths)" when preserved (noop) .claude/settings.local.json contains an absolute path', async () => {
+    const repo = await makeTempDir('cdeck-r3-4-');
+    const localPath = path.join(repo, '.claude', 'settings.local.json');
+    await fs.mkdir(path.dirname(localPath), { recursive: true });
+    const localWithAbsHook = {
+      hooks: {
+        SessionStart: [
+          {
+            hooks: [{ type: 'command', command: '/opt/team/startup.sh' }],
+          },
+        ],
+      },
+    };
+    const raw = `${JSON.stringify(localWithAbsHook, null, 2)}\n`;
+    await fs.writeFile(localPath, raw, 'utf8');
+
+    const res = await setupHarness(repo, 'claude-code');
+    expect(await fs.readFile(localPath, 'utf8')).toBe(raw);
+    expect(res.notes.join(' ')).not.toContain('(no absolute paths)');
+  });
+
+  it('C9 + C10: legacy brief-hook cleanup preserves non-ContextDeck node scripts and hooks pointing at another repo dir, while removing matching ContextDeck CLI hooks', async () => {
+    const repo = await makeTempDir('cdeck-c9-c10-');
+    const otherRepo = await makeTempDir('cdeck-c9-c10-other-');
+    const localPath = path.join(repo, '.claude', 'settings.local.json');
+    await fs.mkdir(path.dirname(localPath), { recursive: true });
+
+    const localObj = {
+      hooks: {
+        SessionStart: [
+          {
+            matcher: '*',
+            hooks: [
+              // C9: unrelated node script must be preserved
+              { type: 'command', command: 'node tools/report.js status --brief-hook' },
+              {
+                type: 'command',
+                command: `node /old/path/index.js status --brief-hook --dir "${repo}"`,
+              },
+              // C10: v0.1 hook pointing at a DIFFERENT repo dir must be preserved
+              {
+                type: 'command',
+                command: `cdeck status --brief-hook --dir "${otherRepo}"`,
+              },
+              {
+                type: 'command',
+                command: `cdeck status --brief-hook --dir="${otherRepo}"`,
+              },
+              // Matching ContextDeck CLI node form & matching --dir must be removed
+              {
+                type: 'command',
+                command: `node /opt/contextdeck/packages/cli/dist/index.js status --brief-hook --dir "${repo}"`,
+              },
+              {
+                type: 'command',
+                command: `node /usr/local/bin/cdeck.js status --brief-hook --dir="${repo}"`,
+              },
+            ],
+          },
+        ],
+      },
+    };
+    await fs.writeFile(localPath, `${JSON.stringify(localObj, null, 2)}\n`, 'utf8');
+
+    await setupHarness(repo, 'claude-code');
+    const after = JSON.parse(await fs.readFile(localPath, 'utf8')) as {
+      hooks: { SessionStart: Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }> };
+    };
+    expect(after.hooks.SessionStart).toEqual([
+      {
+        matcher: '*',
+        hooks: [
+          { type: 'command', command: 'node tools/report.js status --brief-hook' },
+          {
+            type: 'command',
+            command: `node /old/path/index.js status --brief-hook --dir "${repo}"`,
+          },
+          {
+            type: 'command',
+            command: `cdeck status --brief-hook --dir "${otherRepo}"`,
+          },
+          {
+            type: 'command',
+            command: `cdeck status --brief-hook --dir="${otherRepo}"`,
+          },
+        ],
+      },
+    ]);
   });
 });

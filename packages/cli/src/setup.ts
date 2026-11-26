@@ -209,12 +209,33 @@ const LEGACY_CDECK_EXECUTABLES = new Set([
   'contextdeck.exe',
 ]);
 
+const LEGACY_CDECK_NODE_SCRIPTS = new Set([
+  'cdeck',
+  'cdeck.js',
+  'cdeck.mjs',
+  'cdeck.cjs',
+  'contextdeck',
+  'contextdeck.js',
+  'contextdeck.mjs',
+  'contextdeck.cjs',
+]);
+
+function isLegacyCdeckCliScript(script: string): boolean {
+  if (!script || script.startsWith('-')) return false;
+  const normalized = script.replace(/\\/g, '/').toLowerCase();
+  if (normalized === 'cli/dist/index.js' || normalized.endsWith('/cli/dist/index.js')) {
+    return true;
+  }
+  return LEGACY_CDECK_NODE_SCRIPTS.has(execBaseName(script));
+}
+
 /**
- * R2-4: Match only the exact v0.1 brief-hook command shape:
- *   `<cdeck|node cli.js> status --brief-hook [--dir "<path>"]`
- * Ambiguous, quoted-mention (`echo ...`), or compound (`;`, `&&`, `|`) commands are preserved.
+ * R2-4 / C9 / C10: Match only the exact v0.1 brief-hook command shape:
+ *   `<cdeck|node <cdeck-cli-entry>> status --brief-hook [--dir "<rootDir>"]`
+ * Ambiguous, quoted-mention (`echo ...`), compound (`;`, `&&`, `|`), unrelated `node <script>`,
+ * or `--dir` pointing at a different repository directory are all preserved.
  */
-function isLegacyBriefHookCommand(cmd: unknown): boolean {
+function isLegacyBriefHookCommand(cmd: unknown, rootDir: string): boolean {
   if (typeof cmd !== 'string') return false;
   const trimmed = cmd.trim();
   if (!trimmed) return false;
@@ -227,8 +248,7 @@ function isLegacyBriefHookCommand(cmd: unknown): boolean {
   if (LEGACY_CDECK_EXECUTABLES.has(base0)) {
     argStart = 1;
   } else if ((base0 === 'node' || base0 === 'node.exe') && tokens.length >= 4) {
-    const script = tokens[1];
-    if (!script.startsWith('-') && /\.(?:m|c)?js$/i.test(script)) {
+    if (isLegacyCdeckCliScript(tokens[1])) {
       argStart = 2;
     }
   }
@@ -239,11 +259,14 @@ function isLegacyBriefHookCommand(cmd: unknown): boolean {
     return false;
   }
   if (rest.length === 2) return true;
-  if (rest.length === 4 && rest[2] === '--dir' && rest[3].length > 0) return true;
-  if (rest.length === 3 && rest[2].startsWith('--dir=') && rest[2].length > '--dir='.length) {
-    return true;
+  let dirArg: string | null = null;
+  if (rest.length === 4 && rest[2] === '--dir' && rest[3].length > 0) {
+    dirArg = rest[3];
+  } else if (rest.length === 3 && rest[2].startsWith('--dir=') && rest[2].length > '--dir='.length) {
+    dirArg = rest[2].slice('--dir='.length);
   }
-  return false;
+  if (dirArg === null) return false;
+  return path.resolve(dirArg) === path.resolve(rootDir);
 }
 
 function stringContainsAbsolutePath(value: string): boolean {
@@ -371,6 +394,7 @@ interface MatcherGroupSpec {
 function planLegacyClaudeLocalCleanup(
   filePath: string,
   existing: Record<string, unknown> | null,
+  rootDir: string,
 ): FileAction {
   if (!existing || existing.hooks === undefined) {
     return { kind: 'noop', filePath };
@@ -390,7 +414,7 @@ function planLegacyClaudeLocalCleanup(
     for (const group of rawGroups) {
       if (isPlainObject(group) && Array.isArray(group.hooks)) {
         const remainingHandlers = group.hooks.filter((h) => {
-          if (isPlainObject(h) && isLegacyBriefHookCommand(h.command)) {
+          if (isPlainObject(h) && isLegacyBriefHookCommand(h.command, rootDir)) {
             eventChanged = true;
             return false;
           }
@@ -403,7 +427,7 @@ function planLegacyClaudeLocalCleanup(
               : { ...group, hooks: remainingHandlers },
           );
         }
-      } else if (isPlainObject(group) && isLegacyBriefHookCommand(group.command)) {
+      } else if (isPlainObject(group) && isLegacyBriefHookCommand(group.command, rootDir)) {
         eventChanged = true;
       } else {
         keptGroups.push(group);
@@ -911,11 +935,11 @@ export async function setupHarness(
       },
       uninstall,
     );
-    // H16 / R2-4: Clean up legacy v0.1 `status --brief-hook` from `.claude/settings.local.json`
-    const localAction = planLegacyClaudeLocalCleanup(localSettingsPath, existingLocalSettings);
+    // H16 / R2-4 / C9 / C10: Clean up legacy v0.1 `status --brief-hook` from `.claude/settings.local.json`
+    const localAction = planLegacyClaudeLocalCleanup(localSettingsPath, existingLocalSettings, rootDir);
     actions.push(mcpAction, settingsAction, localAction);
 
-    // R2-6: Never print "(no absolute paths)" if any absolute path remains in a file setup touched or preserved
+    // R2-6 / R3-4: Never print "(no absolute paths)" if any absolute path remains in a file setup touched or preserved
     const finalMcpObj =
       mcpAction.kind === 'write'
         ? JSON.parse(mcpAction.content)
@@ -928,7 +952,12 @@ export async function setupHarness(
         : settingsAction.kind === 'noop'
           ? existingSettings
           : null;
-    const finalLocalObj = localAction.kind === 'write' ? JSON.parse(localAction.content) : null;
+    const finalLocalObj =
+      localAction.kind === 'write'
+        ? JSON.parse(localAction.content)
+        : localAction.kind === 'noop'
+          ? existingLocalSettings
+          : null;
     const hasRemainingAbsPath =
       jsonContainsAbsolutePath(finalMcpObj) ||
       jsonContainsAbsolutePath(finalSettingsObj) ||

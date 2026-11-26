@@ -2211,6 +2211,7 @@ export class ContextDeckStore {
     return withWorkspaceLock(
       this.runtimeDir,
       async (assertActive) => {
+        // C12: withWorkspaceLock's acquire-time txn recovery (B1) guarantees no pending txn.json inside the lock.
         assertActive();
         return this.readContextPackSnapshotOnce(validSlug, options);
       },
