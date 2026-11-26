@@ -3,6 +3,7 @@ export * from './schemas.js';
 export * from './ids.js';
 export * from './paths.js';
 export * from './workspace.js';
+export * from './worker-config.js';
 export * from './routing.js';
 export * from './txn.js';
 export * from './markdown.js';
