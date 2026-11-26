@@ -947,4 +947,34 @@ describe('E2 Server & MCP security (reproducing Bugs 2, 3, 4, 7-media, 8 + D5/D6
       await srv.close();
     }
   });
+
+  it('H18: /mcp responses include Cache-Control: no-store, Referrer-Policy: no-referrer, and X-Content-Type-Options: nosniff', async () => {
+    const dir = await makeTempDir('cdeck-h18-');
+    const store = new ContextDeckStore(dir);
+    await seedDemoBoard(store, 'demo');
+    const { app, token, close } = createApp({ store, port: 4310 });
+
+    try {
+      const res = await app.request('http://127.0.0.1:4310/mcp', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/call',
+          params: { name: 'board_list', arguments: {} },
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get('cache-control')).toBe('no-store');
+      expect(res.headers.get('referrer-policy')).toBe('no-referrer');
+      expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+    } finally {
+      await close();
+    }
+  });
 });

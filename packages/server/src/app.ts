@@ -874,7 +874,16 @@ export function createApp(options: AppOptions): {
     });
     await mcpServer.connect(transport);
     try {
-      return await transport.handleRequest(c.req.raw);
+      const rawRes = await transport.handleRequest(c.req.raw);
+      const headers = new Headers(rawRes.headers);
+      headers.set('Cache-Control', 'no-store');
+      headers.set('Referrer-Policy', 'no-referrer');
+      headers.set('X-Content-Type-Options', 'nosniff');
+      return new Response(rawRes.body, {
+        status: rawRes.status,
+        statusText: rawRes.statusText,
+        headers,
+      });
     } finally {
       await transport.close();
       await mcpServer.close();
