@@ -714,4 +714,101 @@ describe('D12 bounded lock acquisition timeout', () => {
       releaseLock();
     }
   });
+
+  it('R3-2: registerSession resolves both id and externalRef under lock, rejects conflicting reassignments without clobbering, and attaches ref to ref-less session preserving metadata', async () => {
+    const dir = await makeTempDir('cdeck-r3-2-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main', setAsDefault: true });
+    await store.createBoard({ title: 'Frontend', slug: 'frontend' });
+
+    // (1) Codex 1 exact repro: existing session with externalRef + metadata
+    const existing = await store.registerSession('main', {
+      id: 'sess_existing',
+      externalRef: 'codex:old',
+      title: 'Original Session',
+      harness: 'codex',
+      parentSessionId: 'sess_parent',
+      relatedSessionIds: ['sess_rel_1'],
+      summary: 'Important existing notes',
+      focusFiles: ['packages/core/src/store.ts'],
+    });
+    const existingPath = path.join(store.sessionsDir, 'sess_existing.yaml');
+    const existingRawBefore = await fs.readFile(existingPath, 'utf8');
+
+    await expect(
+      store.registerSession('main', {
+        id: 'sess_existing',
+        externalRef: 'codex:new',
+        title: 'New',
+      }),
+    ).rejects.toThrow(core.ValidationError);
+
+    expect(await fs.readFile(existingPath, 'utf8')).toBe(existingRawBefore);
+    const reloadedExisting = await store.getSession('sess_existing');
+    expect(reloadedExisting?.externalRef).toBe('codex:old');
+    expect(reloadedExisting?.summary).toBe('Important existing notes');
+    expect(reloadedExisting?.parentSessionId).toBe('sess_parent');
+    expect(reloadedExisting?.focusFiles).toEqual(['packages/core/src/store.ts']);
+    expect(reloadedExisting?.createdAt).toBe(existing.createdAt);
+
+    // (2) id of session A + externalRef owned by session B rejects and leaves both files untouched
+    await store.registerSession('main', {
+      id: 'sess_other',
+      externalRef: 'codex:other',
+      title: 'Other Session',
+      harness: 'codex',
+      summary: 'Other summary',
+    });
+    const otherPath = path.join(store.sessionsDir, 'sess_other.yaml');
+    const otherRawBefore = await fs.readFile(otherPath, 'utf8');
+
+    await expect(
+      store.registerSession('main', {
+        id: 'sess_existing',
+        externalRef: 'codex:other',
+        title: 'Cross Identity',
+      }),
+    ).rejects.toThrow(core.ValidationError);
+    expect(await fs.readFile(existingPath, 'utf8')).toBe(existingRawBefore);
+    expect(await fs.readFile(otherPath, 'utf8')).toBe(otherRawBefore);
+
+    // Also reject explicit non-existent id paired with externalRef already owned by another session
+    await expect(
+      store.registerSession('main', {
+        id: 'sess_unregistered',
+        externalRef: 'codex:other',
+        title: 'Mismatch New Id',
+      }),
+    ).rejects.toThrow(core.ValidationError);
+    expect(await fs.readFile(otherPath, 'utf8')).toBe(otherRawBefore);
+    await expect(fs.stat(path.join(store.sessionsDir, 'sess_unregistered.yaml'))).rejects.toThrow();
+
+    // (3) id of existing session with NO externalRef + new ref attaches the ref, keeps bound board when omitted, and preserves metadata
+    const noRef = await store.registerSession('frontend', {
+      id: 'sess_no_ref',
+      title: 'Initial No-Ref Session',
+      harness: 'cursor',
+      parentSessionId: 'sess_parent',
+      relatedSessionIds: ['sess_rel_2'],
+      summary: 'Preserved summary',
+      focusFiles: ['packages/web/src/App.tsx'],
+    });
+    expect(noRef.externalRef).toBeUndefined();
+
+    const attached = await store.registerSession(undefined, {
+      id: 'sess_no_ref',
+      externalRef: 'cursor:attached-1',
+      title: 'Attached Ref Session',
+    });
+    expect(attached.id).toBe('sess_no_ref');
+    expect(attached.board).toBe('frontend');
+    expect(attached.externalRef).toBe('cursor:attached-1');
+    expect(attached.title).toBe('Attached Ref Session');
+    expect(attached.harness).toBe('cursor');
+    expect(attached.parentSessionId).toBe('sess_parent');
+    expect(attached.relatedSessionIds).toEqual(['sess_rel_2']);
+    expect(attached.summary).toBe('Preserved summary');
+    expect(attached.focusFiles).toEqual(['packages/web/src/App.tsx']);
+    expect(attached.createdAt).toBe(noRef.createdAt);
+  });
 });

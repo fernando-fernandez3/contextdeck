@@ -9,6 +9,7 @@ import {
   UNTRUSTED_BOARD_CONTENT_HEADER,
   capSingleLine,
   isMeaningfulEvent,
+  isSessionDriftEvaluated,
   neutralizeUntrustedDelimiters,
 } from './drift.js';
 
@@ -16,6 +17,7 @@ export interface ContextPackOptions {
   includeUpdateProtocol?: boolean;
   maxRecentEvents?: number;
   maxChars?: number;
+  now?: Date;
 }
 
 const DEFAULT_MAX_CHARS = 12_000;
@@ -203,7 +205,8 @@ export function generateContextPack(
     remaining = appendSectionWithinBudget(bodySections, briefBlock, remaining, true);
   }
 
-  // Priority 5: Active Sessions (using honest drift counts; omit sync label when drift was not computed — R2-5)
+  // Priority 5: Active Sessions (using honest drift counts; omit sync label when drift was not
+  // computed or when a session was excluded from drift evaluation — R2-5, R3-3)
   const activeSessions = snapshot.sessions.filter(
     (s) => s.status !== 'archived' && s.status !== 'completed',
   );
@@ -212,12 +215,22 @@ export function generateContextPack(
     const driftBySession = sessionDriftComputed
       ? new Map(snapshot.drift.driftedSessions.map((d) => [d.sessionId, d.behindBy]))
       : null;
+    const evaluatedAtMs = snapshot.drift.evaluatedAt
+      ? Date.parse(snapshot.drift.evaluatedAt)
+      : Number.NaN;
+    const driftNow =
+      options.now ?? (Number.isFinite(evaluatedAtMs) ? new Date(evaluatedAtMs) : new Date());
     const lines = ['## Linked Agent Sessions'];
     for (const s of activeSessions) {
-      const statusLabel =
-        driftBySession !== null
-          ? `${s.status}, ${(driftBySession.get(s.id) ?? 0) > 0 ? `behind by ${driftBySession.get(s.id)}` : 'synced'}`
-          : s.status;
+      let statusLabel: string = s.status;
+      if (driftBySession !== null) {
+        const behindBy = driftBySession.get(s.id);
+        if (behindBy !== undefined && behindBy > 0) {
+          statusLabel = `${s.status}, behind by ${behindBy}`;
+        } else if (isSessionDriftEvaluated(s, driftNow)) {
+          statusLabel = `${s.status}, synced`;
+        }
+      }
       const parentLabel = s.parentSessionId ? ` (child of ${s.parentSessionId})` : '';
       const title = capSingleLine(s.title, MAX_TITLE_CHARS);
       const summary = s.summary ? `: ${capSingleLine(s.summary, MAX_SUMMARY_CHARS)}` : '';

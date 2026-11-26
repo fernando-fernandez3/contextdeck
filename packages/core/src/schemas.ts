@@ -566,6 +566,10 @@ export interface DriftReport {
    * Formatters must not claim sessions are "synced" when this is false.
    */
   sessionDriftComputed?: boolean;
+  /**
+   * ISO timestamp at which drift eligibility (e.g. 7-day inactivity cutoff) was evaluated.
+   */
+  evaluatedAt?: string;
 }
 
 export interface BoardSnapshot {

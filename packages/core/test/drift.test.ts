@@ -663,4 +663,70 @@ describe('E3 honest drift, bounded digest, fast tail reader, and context pack', 
     expect(lightPack).not.toMatch(/sess_arch_root[^\n]*synced/);
     expect(lightPack).not.toMatch(/sess_claude_storage[^\n]*synced/);
   });
+
+  it('R3-3: full Context Pack omits "synced" for idle and >7d-inactive sessions while keeping "synced" and "behind by N" for evaluated active sessions', async () => {
+    const dir = await makeTempDir('cdeck-r3-3-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Idle And Inactive Labels', slug: 'main' });
+
+    // 1. Neon repro: hook session marked idle, then 3 decisions recorded
+    const { session: idleSess } = await store.upsertHookSession({
+      externalRef: 'claude-code:idle-1',
+      harness: 'claude-code',
+      defaultTitle: 'Idle Session',
+    });
+    await store.markHookSessionIdle({ externalRef: 'claude-code:idle-1' });
+
+    // 2. Active session inactive > 7 days (8 days old), also behind
+    const staleActiveSess = await store.registerSession('main', {
+      title: 'Stale Active Session',
+      harness: 'codex',
+    });
+    const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+    await store.writeSessionCursor({
+      sessionId: staleActiveSess.id,
+      syncedRevisions: { main: 1 },
+      lastActiveAt: eightDaysAgo,
+    });
+
+    // 3. Evaluated active behind session
+    const activeBehindSess = await store.registerSession('main', {
+      title: 'Active Behind Session',
+      harness: 'cursor',
+    });
+
+    // Record 3 decisions after the sessions above
+    await store.recordDecision('main', { title: 'D1' });
+    await store.recordDecision('main', { title: 'D2' });
+    await store.recordDecision('main', { title: 'D3' });
+
+    // 4. Evaluated active synced session (registered at latest revision)
+    const activeSyncedSess = await store.registerSession('main', {
+      title: 'Active Synced Session',
+      harness: 'claude-code',
+    });
+
+    const snap = await store.getSnapshot('main');
+    const pack = core.generateContextPack(snap, { includeUpdateProtocol: false });
+    const lines = pack.split('\n');
+
+    const idleLine = lines.find((l) => l.includes(idleSess.id));
+    const staleLine = lines.find((l) => l.includes(staleActiveSess.id));
+    const behindLine = lines.find((l) => l.includes(activeBehindSess.id));
+    const syncedLine = lines.find((l) => l.includes(activeSyncedSess.id));
+
+    expect(idleLine).toBeDefined();
+    expect(idleLine).toContain('_idle_');
+    expect(idleLine).not.toContain('synced');
+
+    expect(staleLine).toBeDefined();
+    expect(staleLine).toContain('_active_');
+    expect(staleLine).not.toContain('synced');
+
+    expect(behindLine).toBeDefined();
+    expect(behindLine).toContain('_active, behind by 3_');
+
+    expect(syncedLine).toBeDefined();
+    expect(syncedLine).toContain('_active, synced_');
+  });
 });

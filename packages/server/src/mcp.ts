@@ -266,7 +266,7 @@ export function createContextDeckMcpServer(
           board: BoardSlugSchema.optional(),
           id: EntityIdSchema.optional(),
           title: z.string().min(1).max(300),
-          harness: z.string().max(100).default('mcp'),
+          harness: z.string().max(100).optional(),
           parentSessionId: EntityIdSchema.nullable().optional(),
           relatedSessionIds: z.array(EntityIdSchema).max(100).optional(),
           externalRef: z.string().max(500).optional(),
@@ -276,21 +276,22 @@ export function createContextDeckMcpServer(
         .strict(),
     },
     async ({ board, ...input }) => {
-      // H9: When board is omitted and an existing session matches externalRef or id, keep existing.board
+      // H9 / R3-2: When board is omitted and an existing session matches externalRef or id, keep existing.board
       let targetBoard = board;
       if (targetBoard === undefined) {
+        let existing: { board?: string } | null = null;
         if (input.externalRef) {
-          const existing = await store.findSessionByExternalRef(input.externalRef);
-          if (existing?.board) targetBoard = existing.board;
-        } else if (input.id) {
-          const existing = await store.getSession(input.id);
-          if (existing?.board) targetBoard = existing.board;
+          existing = await store.findSessionByExternalRef(input.externalRef);
         }
+        if (!existing && input.id) {
+          existing = await store.getSession(input.id);
+        }
+        if (existing?.board) targetBoard = existing.board;
       }
       const slug = await resolveSlug(targetBoard);
       const session = await store.registerSession(slug, input, {
         type: 'agent',
-        harness: input.harness,
+        harness: input.harness ?? 'mcp',
       });
       onMutate?.(session.board ?? slug);
       return {

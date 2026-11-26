@@ -344,4 +344,76 @@ describe('AC5.8 + AC6.1 + D10 MCP live sync, resource subscriptions, and session
       ]);
     }
   });
+
+  it('R3-2: MCP session_register surfaces ValidationError cleanly on conflicting externalRef/id and preserves board and harness when attaching ref by id', async () => {
+    const dir = await makeTempDir();
+    const store = new ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main', setAsDefault: true });
+    await store.createBoard({ title: 'Frontend', slug: 'frontend' });
+
+    await store.registerSession('frontend', {
+      id: 'sess_mcp_existing',
+      externalRef: 'codex:old',
+      title: 'Existing MCP Session',
+      harness: 'codex',
+      summary: 'Keep me intact',
+    });
+
+    await store.registerSession('frontend', {
+      id: 'sess_mcp_noref',
+      title: 'No Ref MCP Session',
+      harness: 'cursor',
+      summary: 'Preserved on attach',
+    });
+
+    const mcpServer = createContextDeckMcpServer(store, { defaultBoard: 'main' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'vitest-r3-2', version: '0.1.0' }, { capabilities: {} });
+
+    try {
+      await Promise.all([mcpServer.connect(serverTransport), client.connect(clientTransport)]);
+
+      // Conflicting externalRef reassignment via MCP returns an error tool result without clobbering
+      const conflictRes = await client.callTool({
+        name: 'session_register',
+        arguments: {
+          id: 'sess_mcp_existing',
+          externalRef: 'codex:new',
+          title: 'Clobber Attempt',
+        },
+      });
+      expect(conflictRes.isError).toBe(true);
+      const errText = (conflictRes.content as Array<{ text: string }>)[0]?.text ?? '';
+      expect(errText).toMatch(/externalRef|conflict|reassign/i);
+      const intact = await store.getSession('sess_mcp_existing');
+      expect(intact?.externalRef).toBe('codex:old');
+      expect(intact?.summary).toBe('Keep me intact');
+
+      // Attaching externalRef to ref-less session by id with omitted board preserves board, harness, and summary
+      const attachRes = await client.callTool({
+        name: 'session_register',
+        arguments: {
+          id: 'sess_mcp_noref',
+          externalRef: 'cursor:attached-mcp',
+          title: 'Attached MCP Session',
+        },
+      });
+      expect(attachRes.isError).not.toBe(true);
+      const attached = JSON.parse((attachRes.content as Array<{ text: string }>)[0].text) as {
+        id: string;
+        board: string;
+        harness: string;
+        externalRef: string;
+        summary: string;
+      };
+      expect(attached.id).toBe('sess_mcp_noref');
+      expect(attached.board).toBe('frontend');
+      expect(attached.harness).toBe('cursor');
+      expect(attached.externalRef).toBe('cursor:attached-mcp');
+      expect(attached.summary).toBe('Preserved on attach');
+    } finally {
+      await client.close();
+      await mcpServer.close();
+    }
+  });
 });

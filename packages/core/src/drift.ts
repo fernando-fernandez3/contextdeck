@@ -361,19 +361,9 @@ export function computeDriftReport(params: {
     }
   }
 
-  const nowMs = now.getTime();
   const driftedSessions: DriftedSessionNotice[] = [];
   for (const session of sessions) {
-    // D4: Exclude idle, completed, archived, or inactive > 7 days
-    if (
-      session.status === 'idle' ||
-      session.status === 'completed' ||
-      session.status === 'archived'
-    ) {
-      continue;
-    }
-    const updatedMs = Date.parse(session.lastActiveAt ?? session.updatedAt);
-    if (Number.isFinite(updatedMs) && nowMs - updatedMs > SESSION_INACTIVE_CUTOFF_MS) {
+    if (!isSessionDriftEvaluated(session, now)) {
       continue;
     }
     if (session.lastSyncedRevision >= config.revision) {
@@ -407,5 +397,29 @@ export function computeDriftReport(params: {
     currentRevision: config.revision,
     staleArtifacts,
     driftedSessions,
+    evaluatedAt: now.toISOString(),
   };
+}
+
+/**
+ * Shared D4 eligibility predicate used by both `computeDriftReport` and `generateContextPack`
+ * so formatters never label non-evaluated (`idle`, `completed`, `archived`, or >7d inactive)
+ * sessions as "synced" (R3-3).
+ */
+export function isSessionDriftEvaluated(
+  session: Pick<Session, 'status' | 'lastActiveAt' | 'updatedAt'>,
+  now: Date = new Date(),
+): boolean {
+  if (
+    session.status === 'idle' ||
+    session.status === 'completed' ||
+    session.status === 'archived'
+  ) {
+    return false;
+  }
+  const updatedMs = Date.parse(session.lastActiveAt ?? session.updatedAt);
+  if (Number.isFinite(updatedMs) && now.getTime() - updatedMs > SESSION_INACTIVE_CUTOFF_MS) {
+    return false;
+  }
+  return true;
 }

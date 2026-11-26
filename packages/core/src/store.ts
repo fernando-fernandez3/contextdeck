@@ -2346,21 +2346,58 @@ export class ContextDeckStore {
     const now = nowIso();
     await ensureDir(this.sessionsDir);
 
-    // D11: Dedupe by externalRef when provided so repeated calls / resumes reuse the same session record
-    let existing: (LegacySessionFile & { board: string }) | null = null;
-    if (input.externalRef) {
+    // D11 / R3-2: Resolve BOTH externalRef and explicit id under the lock so conflicting
+    // identity assignments reject with ValidationError and we never clobber an existing session.
+    const requestedId = input.id ? validateEntityId(input.id, 'sessionId') : undefined;
+    let existingByRef: (LegacySessionFile & { board: string }) | null = null;
+    if (input.externalRef !== undefined) {
       const all = await this.listAllRawSessions();
-      existing = all.find((s) => s.externalRef === input.externalRef) ?? null;
-    } else if (input.id) {
-      existing = await this.readWorkspaceSessionRaw(input.id);
+      existingByRef = all.find((s) => s.externalRef === input.externalRef) ?? null;
+    }
+    const existingById = requestedId ? await this.readWorkspaceSessionRaw(requestedId) : null;
+
+    if (existingByRef && requestedId && existingByRef.id !== requestedId) {
+      throw new ValidationError(
+        `Session identity conflict: externalRef "${input.externalRef}" already belongs to session "${existingByRef.id}", which differs from requested id "${requestedId}".`,
+      );
+    }
+    if (
+      existingById &&
+      input.externalRef !== undefined &&
+      existingById.externalRef !== undefined &&
+      existingById.externalRef !== input.externalRef
+    ) {
+      throw new ValidationError(
+        `Session "${existingById.id}" already has externalRef "${existingById.externalRef}"; cannot reassign to "${input.externalRef}".`,
+      );
     }
 
-    const id = existing
-      ? existing.id
-      : input.id
-        ? validateEntityId(input.id, 'sessionId')
-        : shortId('sess');
+    const existing = existingByRef ?? existingById;
+    const sessionPathExists = async (candidatePath: string): Promise<boolean> => {
+      try {
+        await fs.lstat(candidatePath);
+        return true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+        throw err;
+      }
+    };
+
+    let id: string;
+    if (existing) {
+      id = existing.id;
+    } else if (requestedId) {
+      id = requestedId;
+    } else {
+      id = shortId('sess');
+      while (await sessionPathExists(await this.safeSessionFilePath(id))) {
+        id = shortId('sess');
+      }
+    }
     const filePath = await this.safeSessionFilePath(id);
+    if (!existing && (await sessionPathExists(filePath))) {
+      throw new ValidationError(`Session "${id}" already exists on disk.`);
+    }
     const harness = input.harness ?? existing?.harness ?? effActor.harness ?? 'custom';
 
     const ev = tx.addEvent({
@@ -2938,13 +2975,14 @@ export class ContextDeckStore {
     let targetBoard = boardSlug;
     // H9: When board is omitted and an existing session matches externalRef/id, keep its bound board
     if (targetBoard === undefined || targetBoard === '') {
+      let existing: { board?: string } | null = null;
       if (input.externalRef) {
-        const existing = await this.findSessionByExternalRef(input.externalRef);
-        if (existing?.board) targetBoard = existing.board;
-      } else if (input.id) {
-        const existing = await this.readSessionRawAcrossWorkspace(input.id);
-        if (existing?.board) targetBoard = existing.board;
+        existing = await this.findSessionByExternalRef(input.externalRef);
       }
+      if (!existing && input.id) {
+        existing = await this.readSessionRawAcrossWorkspace(input.id);
+      }
+      if (existing?.board) targetBoard = existing.board;
     }
     return this.mutate(targetBoard, actor, (tx) => this.registerSessionUnlocked(tx, input));
   }
