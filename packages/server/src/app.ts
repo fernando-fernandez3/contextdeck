@@ -672,51 +672,58 @@ export function createApp(options: AppOptions): {
         maxMediaBytes,
       });
 
+      let title: string;
+      let kind: MediaKind;
+      let transcript: string | undefined;
+      let basedOnDecisions: string[];
+      let tags: string[];
       try {
-        const title = (parsed.fields.title || parsed.file?.fileName || 'Uploaded Media').slice(0, 300);
+        title = (parsed.fields.title || parsed.file?.fileName || 'Uploaded Media').slice(0, 300);
         const kindParsed = MediaKindSchema.safeParse(parsed.fields.kind || 'video');
         if (!kindParsed.success) {
           throw new ValidationError('Invalid media kind.');
         }
-        const kind: MediaKind = kindParsed.data;
-        const transcript = parsed.fields.transcript || undefined;
-        const basedOnDecisions = parsed.fields.basedOnDecisions
+        kind = kindParsed.data;
+        transcript = parsed.fields.transcript || undefined;
+        basedOnDecisions = parsed.fields.basedOnDecisions
           ? parsed.fields.basedOnDecisions
               .split(',')
               .map((s) => s.trim())
               .filter(Boolean)
               .map((id) => validateEntityId(id, 'decisionId'))
           : [];
-        const tags = parsed.fields.tags
+        tags = parsed.fields.tags
           ? parsed.fields.tags
               .split(',')
               .map((s) => s.trim())
               .filter(Boolean)
           : [];
-
-        const media = await store.addMedia(
-          slug,
-          {
-            title,
-            kind,
-            stagedTempPath: parsed.file?.tmpPath,
-            fileName: parsed.file?.fileName,
-            mimeType: parsed.file?.mimeType,
-            transcript,
-            basedOnDecisions,
-            tags,
-            maxBytes: maxMediaBytes,
-          },
-          { type: 'human', label: 'web-ui' },
-        );
-        broadcast('board.changed', slug);
-        return c.json(media, 201);
       } catch (err) {
         if (parsed.file?.tmpPath) {
           await fsp.rm(parsed.file.tmpPath, { force: true }).catch(() => {});
         }
         throw err;
       }
+
+      // Ownership of parsed.file.tmpPath transfers to store.addMedia (H2):
+      // addMedia removes it on error ONLY if txn.json was not yet committed.
+      const media = await store.addMedia(
+        slug,
+        {
+          title,
+          kind,
+          stagedTempPath: parsed.file?.tmpPath,
+          fileName: parsed.file?.fileName,
+          mimeType: parsed.file?.mimeType,
+          transcript,
+          basedOnDecisions,
+          tags,
+          maxBytes: maxMediaBytes,
+        },
+        { type: 'human', label: 'web-ui' },
+      );
+      broadcast('board.changed', slug);
+      return c.json(media, 201);
     }
 
     // Strict REST schema: sourceFilePath is completely removed!

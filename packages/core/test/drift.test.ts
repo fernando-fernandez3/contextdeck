@@ -324,4 +324,75 @@ describe('E3 honest drift, bounded digest, fast tail reader, and context pack', 
     );
     expect(pack).toContain('CRITICAL_DECISION_KEEP_FIRST');
   });
+
+  it('H5: readEventsSince preserves multi-byte UTF-8 (→) straddling 32 KB chunk boundary', async () => {
+    const dir = await makeTempDir('cdeck-h5-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'UTF8 Boundary', slug: 'main' });
+
+    const bdir = store.boardPath('main');
+    const eventsPath = path.join(bdir, 'events.jsonl');
+    const now = new Date().toISOString();
+
+    // Build events so one event containing '→' (3 UTF-8 bytes) straddles EOF - 32768
+    const targetSummary = 'Updated task_001 ("Boundary Check") → in_progress';
+    const makeEventLine = (rev: number, summary: string) =>
+      `${JSON.stringify({
+        id: `evt_${String(rev).padStart(6, '0')}`,
+        revision: rev,
+        timestamp: now,
+        actor: { type: 'agent', harness: 'codex', sessionId: 'sess_a' },
+        kind: 'task.updated',
+        entityId: `task_${rev}`,
+        summary,
+      })}\n`;
+
+    // Construct trailing events totaling slightly less than 32768 bytes, then pick exact padding
+    // so the '→' bytes straddle the 32768-byte offset from EOF.
+    const tailLines: string[] = [];
+    let tailBytes = 0;
+    let rev = 10;
+    // First compute target line and where '→' starts within it
+    const probeLine = makeEventLine(2, targetSummary);
+    const arrowByteOffsetInLine = Buffer.from(probeLine, 'utf8').indexOf(Buffer.from('→', 'utf8'));
+    const probeLineBytes = Buffer.byteLength(probeLine, 'utf8');
+    // Distance from end of probeLine to middle of '→' (1 byte inside the 3-byte char)
+    const bytesAfterArrowMid = probeLineBytes - (arrowByteOffsetInLine + 1);
+    const neededTailBytes = 32 * 1024 - bytesAfterArrowMid;
+
+    while (true) {
+      const nextLine = makeEventLine(rev, 'x'.repeat(200));
+      const padBaseAfter = makeEventLine(rev + 1, '');
+      if (
+        tailBytes + Buffer.byteLength(nextLine, 'utf8') + Buffer.byteLength(padBaseAfter, 'utf8') >
+        neededTailBytes
+      ) {
+        break;
+      }
+      tailLines.push(nextLine);
+      tailBytes += Buffer.byteLength(nextLine, 'utf8');
+      rev += 1;
+    }
+    const basePadLine = makeEventLine(rev, '');
+    const remaining = neededTailBytes - tailBytes - Buffer.byteLength(basePadLine, 'utf8');
+    expect(remaining).toBeGreaterThanOrEqual(0);
+    tailLines.push(makeEventLine(rev, 'p'.repeat(remaining)));
+
+    // Prepend an earlier event (rev 1) + the target event (rev 2) + tailLines (rev 10..N)
+    const content = [makeEventLine(1, 'init'), probeLine, ...tailLines].join('');
+    const totalBytes = Buffer.byteLength(content, 'utf8');
+    const arrowAbsPos = Buffer.from(content, 'utf8').indexOf(Buffer.from('→', 'utf8'));
+    // Verify the 3-byte '→' truly straddles totalBytes - 32768!
+    const boundary = totalBytes - 32 * 1024;
+    expect(arrowAbsPos).toBeLessThan(boundary);
+    expect(arrowAbsPos + 3).toBeGreaterThan(boundary);
+
+    await fs.writeFile(eventsPath, content, 'utf8');
+
+    const events = await store.readEventsSince('main', 1);
+    const found = events.find((e) => e.revision === 2);
+    expect(found).toBeDefined();
+    expect(found!.summary).toBe(targetSummary);
+    expect(found!.summary).not.toContain('\uFFFD');
+  });
 });

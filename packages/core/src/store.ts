@@ -79,6 +79,7 @@ import {
   executeTxnJournal,
   maybeInjectFault,
   streamFileToTempFsync,
+  toDeckRelativePath,
   withWorkspaceLock,
   writeTempFileFsync,
   type TxnEventEntry,
@@ -297,17 +298,21 @@ export class ContextDeckStore {
 
   public async setDefaultBoard(slug: string): Promise<void> {
     const validSlug = validateBoardSlug(slug);
-    await withWorkspaceLock(this.runtimeDir, async (assertActive) => {
-      await ensureDir(this.deckDir);
-      assertActive();
-      await atomicWriteFile(
-        this.workspaceMetaPath(),
-        dumpYaml({
-          defaultBoard: validSlug,
-          updatedAt: nowIso(),
-        }),
-      );
-    });
+    await withWorkspaceLock(
+      this.runtimeDir,
+      async (assertActive) => {
+        await ensureDir(this.deckDir);
+        assertActive();
+        await atomicWriteFile(
+          this.workspaceMetaPath(),
+          dumpYaml({
+            defaultBoard: validSlug,
+            updatedAt: nowIso(),
+          }),
+        );
+      },
+      this.deckDir,
+    );
   }
 
   public async resolveBoardSlug(boardSlug?: string): Promise<string> {
@@ -415,15 +420,31 @@ export class ContextDeckStore {
         const txn: TxnJournal = {
           id: shortId('txn'),
           boardSlug: slug,
-          ops: [{ kind: 'rename', tmpPath: briefTmp, finalPath: path.join(dir, 'brief.md') }],
-          events: [{ eventsPath, eventId: initEvent.id, line: `${JSON.stringify(initEvent)}\n` }],
-          boardCommit: { tmpPath: boardTmp, finalPath: boardYamlPath },
+          ops: [
+            {
+              kind: 'rename',
+              tmpPath: toDeckRelativePath(this.deckDir, briefTmp),
+              finalPath: toDeckRelativePath(this.deckDir, path.join(dir, 'brief.md')),
+            },
+          ],
+          events: [
+            {
+              eventsPath: toDeckRelativePath(this.deckDir, eventsPath),
+              eventId: initEvent.id,
+              line: `${JSON.stringify(initEvent)}\n`,
+            },
+          ],
+          boardCommit: {
+            tmpPath: toDeckRelativePath(this.deckDir, boardTmp),
+            finalPath: toDeckRelativePath(this.deckDir, boardYamlPath),
+          },
         };
 
         const txnPath = path.join(this.runtimeDir, TXN_FILENAME);
         assertActive();
         await atomicWriteFile(txnPath, `${JSON.stringify(txn, null, 2)}\n`);
         await executeTxnJournal(txnPath, txn, {
+          deckDir: this.deckDir,
           assertActive,
           allowFaultInjection: true,
           checkEventDedupe: false,
@@ -445,7 +466,7 @@ export class ContextDeckStore {
       }
 
       return config;
-    });
+    }, this.deckDir);
   }
 
   public async ensureDefaultBoard(title = 'Project Context'): Promise<BoardConfig> {
@@ -520,7 +541,7 @@ export class ContextDeckStore {
             details: evInput.details,
           });
           eventsToAppend.push({
-            eventsPath,
+            eventsPath: toDeckRelativePath(this.deckDir, eventsPath),
             eventId: ev.id,
             line: `${JSON.stringify(ev)}\n`,
           });
@@ -592,26 +613,26 @@ export class ContextDeckStore {
         for (let i = 0; i < stagedWrites.length; i += 1) {
           const item = stagedWrites[i];
           if (item.kind === 'unlink') {
-            ops.push({ kind: 'unlink', finalPath: item.finalPath });
+            ops.push({ kind: 'unlink', finalPath: toDeckRelativePath(this.deckDir, item.finalPath) });
           } else if (item.kind === 'write') {
             ops.push({
               kind: item.noClobber ? 'link_create' : 'rename',
-              tmpPath: stagedTmpBySlot.get(i)!,
-              finalPath: item.finalPath,
+              tmpPath: toDeckRelativePath(this.deckDir, stagedTmpBySlot.get(i)!),
+              finalPath: toDeckRelativePath(this.deckDir, item.finalPath),
             });
           } else if (item.kind === 'pre_staged') {
             ops.push({
               kind: item.noClobber ? 'link_create' : 'rename',
-              tmpPath: item.tmpPath!,
-              finalPath: item.finalPath,
+              tmpPath: toDeckRelativePath(this.deckDir, item.tmpPath!),
+              finalPath: toDeckRelativePath(this.deckDir, item.finalPath),
             });
           }
         }
 
         if (configDirty) {
           boardCommit = {
-            tmpPath: stagedTmpBySlot.get('board')!,
-            finalPath: boardYamlPath,
+            tmpPath: toDeckRelativePath(this.deckDir, stagedTmpBySlot.get('board')!),
+            finalPath: toDeckRelativePath(this.deckDir, boardYamlPath),
           };
         }
 
@@ -629,6 +650,7 @@ export class ContextDeckStore {
         maybeInjectFault('after-txn-write');
 
         await executeTxnJournal(txnPath, txn, {
+          deckDir: this.deckDir,
           assertActive,
           allowFaultInjection: true,
           checkEventDedupe: false,
@@ -641,7 +663,7 @@ export class ContextDeckStore {
         }
         throw err;
       }
-    });
+    }, this.deckDir);
   }
 
   public async readBoardConfig(slug: string): Promise<BoardConfig> {
@@ -711,10 +733,30 @@ export class ContextDeckStore {
     const CHUNK_SIZE = 32 * 1024;
     const collected: BoardEvent[] = [];
 
+    const parseEventLine = (lineBuf: Buffer): BoardEvent | null => {
+      const trimmed = lineBuf.toString('utf8').trim();
+      if (!trimmed) return null;
+      let parsedJson: unknown;
+      try {
+        parsedJson = JSON.parse(trimmed);
+      } catch (err) {
+        throw new CorruptDataError(
+          `Corrupt JSONL line in ${eventsPath}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      const parsed = BoardEventSchema.safeParse(parsedJson);
+      if (!parsed.success) {
+        throw new CorruptDataError(
+          `Invalid event schema in ${eventsPath}: ${formatZodError(parsed.error)}`,
+        );
+      }
+      return parsed.data;
+    };
+
     try {
       const stat = await fh.stat();
       let position = stat.size;
-      let carry = '';
+      let carry: Buffer = Buffer.alloc(0);
       let done = false;
 
       while (position > 0 && !done) {
@@ -723,29 +765,32 @@ export class ContextDeckStore {
         const buf = Buffer.allocUnsafe(readSize);
         await fh.read(buf, 0, readSize, position);
 
-        const chunkStr = buf.toString('utf8') + carry;
-        const lines = chunkStr.split('\n');
-        // First element may be an incomplete line if position > 0
-        carry = position > 0 ? (lines.shift() ?? '') : '';
+        // Keep carry as raw bytes and split on 0x0A so multi-byte UTF-8 sequences
+        // straddling 32 KB chunk boundaries are never decoded half-way (H5).
+        const combined = carry.length > 0 ? Buffer.concat([buf, carry]) : buf;
+        let regionStart = 0;
 
-        for (let i = lines.length - 1; i >= 0; i -= 1) {
-          const trimmed = lines[i].trim();
-          if (!trimmed) continue;
-          let parsedJson: unknown;
-          try {
-            parsedJson = JSON.parse(trimmed);
-          } catch (err) {
-            throw new CorruptDataError(
-              `Corrupt JSONL line in ${eventsPath}: ${err instanceof Error ? err.message : String(err)}`,
-            );
+        if (position > 0) {
+          const firstNl = combined.indexOf(0x0a);
+          if (firstNl === -1) {
+            carry = combined;
+            continue;
           }
-          const parsed = BoardEventSchema.safeParse(parsedJson);
-          if (!parsed.success) {
-            throw new CorruptDataError(
-              `Invalid event schema in ${eventsPath}: ${formatZodError(parsed.error)}`,
-            );
-          }
-          const ev = parsed.data;
+          carry = Buffer.from(combined.subarray(0, firstNl));
+          regionStart = firstNl + 1;
+        } else {
+          carry = Buffer.alloc(0);
+        }
+
+        let lineEnd = combined.length;
+        while (lineEnd > regionStart) {
+          const nlIdx = combined.lastIndexOf(0x0a, lineEnd - 1);
+          const lineStart = nlIdx >= regionStart ? nlIdx + 1 : regionStart;
+          const lineBuf = combined.subarray(lineStart, lineEnd);
+          lineEnd = nlIdx >= regionStart ? nlIdx : regionStart;
+
+          const ev = parseEventLine(lineBuf);
+          if (!ev) continue;
           if (ev.revision <= afterRevision) {
             done = true;
             break;
@@ -756,24 +801,9 @@ export class ContextDeckStore {
         }
       }
 
-      if (!done && carry.trim()) {
-        const trimmed = carry.trim();
-        let parsedJson: unknown;
-        try {
-          parsedJson = JSON.parse(trimmed);
-        } catch (err) {
-          throw new CorruptDataError(
-            `Corrupt JSONL line in ${eventsPath}: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-        const parsed = BoardEventSchema.safeParse(parsedJson);
-        if (!parsed.success) {
-          throw new CorruptDataError(
-            `Invalid event schema in ${eventsPath}: ${formatZodError(parsed.error)}`,
-          );
-        }
-        const ev = parsed.data;
-        if (ev.revision > afterRevision && (maxRevision === undefined || ev.revision <= maxRevision)) {
+      if (!done && carry.length > 0) {
+        const ev = parseEventLine(carry);
+        if (ev && ev.revision > afterRevision && (maxRevision === undefined || ev.revision <= maxRevision)) {
           collected.push(ev);
         }
       }
@@ -2028,16 +2058,6 @@ export class ContextDeckStore {
     },
     actor: Actor = DEFAULT_ACTOR,
   ): Promise<MediaArtifact> {
-    if (input.externalUrl !== undefined) {
-      validateHttpUrl(input.externalUrl, 'externalUrl');
-    }
-    const id = input.id ? validateEntityId(input.id, 'mediaId') : shortId('art');
-    const slug = await this.resolveBoardSlug(boardSlug);
-    // Verify board exists before staging big files
-    await this.readBoardConfig(slug);
-    const mediaDir = await this.safeBoardFilePath(slug, 'media');
-    await ensureDir(mediaDir);
-
     const limit = input.maxBytes ?? this.maxMediaBytes;
     let preStagedTmp: string | undefined;
     let storedFileName: string | undefined;
@@ -2049,13 +2069,27 @@ export class ContextDeckStore {
     };
 
     try {
+      if (input.externalUrl !== undefined) {
+        validateHttpUrl(input.externalUrl, 'externalUrl');
+      }
+      const id = input.id ? validateEntityId(input.id, 'mediaId') : shortId('art');
+      const slug = await this.resolveBoardSlug(boardSlug);
+      // Verify board exists before staging big files
+      await this.readBoardConfig(slug);
+      const mediaDir = await this.safeBoardFilePath(slug, 'media');
+      await ensureDir(mediaDir);
+
       // Stage file bytes OUTSIDE the lock (D1)
       if (input.stagedTempPath) {
         const ext = input.fileName ? safeExt(input.fileName) : safeExt(input.stagedTempPath);
         storedFileName = `${id}${ext}`;
-        // Ensure stagedTempPath lives inside mediaDir (same filesystem for atomic rename)
-        await assertContainedPath(mediaDir, input.stagedTempPath, { label: 'staged upload file' });
-        preStagedTmp = input.stagedTempPath;
+        // Ensure stagedTempPath lives inside mediaDir (same filesystem for atomic rename);
+        // once validated, addMedia owns temp cleanup on every path (H2).
+        const verifiedTmp = await assertContainedPath(mediaDir, input.stagedTempPath, {
+          label: 'staged upload file',
+        });
+        preStagedTmp = verifiedTmp;
+        ownPreStagedTmp = true;
       } else if (input.sourceFilePath) {
         const ext = safeExt(input.sourceFilePath);
         storedFileName = `${id}${ext}`;
@@ -2132,8 +2166,22 @@ export class ContextDeckStore {
         return artifact;
       });
     } catch (err) {
-      if (ownPreStagedTmp && preStagedTmp && !existsSync(path.join(this.runtimeDir, TXN_FILENAME))) {
-        await fs.rm(preStagedTmp, { force: true }).catch(() => {});
+      // Only remove staged temp if txn.json was NOT written (roll-forward needs it if txn.json exists)
+      const txnExists = existsSync(path.join(this.runtimeDir, TXN_FILENAME));
+      if (!txnExists) {
+        if (ownPreStagedTmp && preStagedTmp) {
+          await fs.rm(preStagedTmp, { force: true }).catch(() => {});
+        } else if (input.stagedTempPath) {
+          // If an error occurred before mediaDir verification, safely clean up if contained under boardsDir
+          const base = path.basename(input.stagedTempPath);
+          if (base.startsWith('.tmp-')) {
+            await assertContainedPath(this.boardsDir, input.stagedTempPath, {
+              label: 'staged upload cleanup',
+            })
+              .then((verified) => fs.rm(verified, { force: true }))
+              .catch(() => {});
+          }
+        }
       }
       throw err;
     }

@@ -2,9 +2,12 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import { createReadStream, existsSync, statSync } from 'node:fs';
 import path from 'node:path';
+import yaml from 'js-yaml';
 import lockfile from 'proper-lockfile';
 import { z } from 'zod';
 import { CorruptDataError, LockCompromisedError, PayloadTooLargeError } from './errors.js';
+import { BOARD_SLUG_REGEX, ENTITY_ID_REGEX } from './ids.js';
+import { assertContainedPath } from './paths.js';
 
 export const TXN_FILENAME = 'txn.json';
 export const LOCK_SENTINEL_NAME = 'lock';
@@ -178,7 +181,53 @@ export async function streamFileToTempFsync(
   return { tmpPath, bytesWritten };
 }
 
+export async function repairTornJsonlTail(filePath: string): Promise<boolean> {
+  let fh: fs.FileHandle;
+  try {
+    fh = await fs.open(filePath, 'r+');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return false;
+    }
+    throw err;
+  }
+
+  try {
+    const stat = await fh.stat();
+    if (stat.size === 0) return false;
+
+    const lastByte = Buffer.allocUnsafe(1);
+    await fh.read(lastByte, 0, 1, stat.size - 1);
+    if (lastByte[0] === 0x0a) {
+      return false;
+    }
+
+    // Torn tail without trailing newline: scan backwards for the last '\n'
+    const CHUNK = 4096;
+    let pos = stat.size;
+    let truncateTo = 0;
+    while (pos > 0) {
+      const size = Math.min(CHUNK, pos);
+      pos -= size;
+      const buf = Buffer.allocUnsafe(size);
+      await fh.read(buf, 0, size, pos);
+      const nlIdx = buf.lastIndexOf(0x0a);
+      if (nlIdx !== -1) {
+        truncateTo = pos + nlIdx + 1;
+        break;
+      }
+    }
+
+    await fh.truncate(truncateTo);
+    await fh.sync();
+    return true;
+  } finally {
+    await fh.close();
+  }
+}
+
 export async function appendLineFdatasync(filePath: string, line: string): Promise<void> {
+  await repairTornJsonlTail(filePath);
   let fh: fs.FileHandle;
   try {
     fh = await fs.open(filePath, 'a', 0o644);
@@ -246,8 +295,276 @@ export function maybeInjectFault(stage: string): void {
   throw new Error(`Simulated fault injection at stage "${stage}"`);
 }
 
+const TMP_BASENAME_REGEX = /^\.tmp-[A-Za-z0-9._-]+$/;
+const MEDIA_BLOB_FILENAME_REGEX = /^([A-Za-z0-9][A-Za-z0-9_-]{0,80})(?:\.[a-z0-9]{1,12})?$/;
+
+export function toDeckRelativePath(deckDir: string, targetPath: string): string {
+  const rel = path.relative(path.resolve(deckDir), path.resolve(targetPath));
+  if (!rel || rel === '.' || rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new CorruptDataError(`Transaction path "${targetPath}" is outside deckDir "${deckDir}".`);
+  }
+  return rel.split(path.sep).join('/');
+}
+
+function parseStrictRelativeSegments(rawPath: string, label: string): string[] {
+  if (
+    !rawPath ||
+    rawPath.includes('\0') ||
+    rawPath.includes('\\') ||
+    rawPath.startsWith('/') ||
+    /^[A-Za-z]:/.test(rawPath) ||
+    path.isAbsolute(rawPath)
+  ) {
+    throw new CorruptDataError(`Invalid transaction journal ${label}: must be a safe relative path.`);
+  }
+  const segments = rawPath.split('/');
+  for (const seg of segments) {
+    if (!seg || seg === '.' || seg === '..') {
+      throw new CorruptDataError(`Invalid transaction journal ${label}: illegal path segment "${seg}".`);
+    }
+  }
+  return segments;
+}
+
+function validateEntitySegments(
+  segments: string[],
+  kind: 'rename' | 'link_create' | 'unlink',
+  expectedBoardSlug?: string,
+): { isMediaBlob: boolean; mediaId?: string; boardSlug: string } {
+  if (segments.length < 3 || segments[0] !== 'boards') {
+    throw new CorruptDataError(
+      `Invalid transaction journal path "${segments.join('/')}": must reside under boards/<slug>/.`,
+    );
+  }
+  const slug = segments[1];
+  if (!BOARD_SLUG_REGEX.test(slug)) {
+    throw new CorruptDataError(`Invalid transaction journal board slug "${slug}".`);
+  }
+  if (expectedBoardSlug && slug !== expectedBoardSlug) {
+    throw new CorruptDataError(
+      `Invalid transaction journal path "${segments.join('/')}": board slug "${slug}" does not match "${expectedBoardSlug}".`,
+    );
+  }
+
+  if (segments.length === 3) {
+    if (kind === 'rename' && segments[2] === 'brief.md') {
+      return { isMediaBlob: false, boardSlug: slug };
+    }
+    throw new CorruptDataError(
+      `Invalid transaction journal ${kind} target "${segments.join('/')}".`,
+    );
+  }
+
+  if (segments.length !== 4) {
+    throw new CorruptDataError(
+      `Invalid transaction journal target "${segments.join('/')}": unexpected path depth.`,
+    );
+  }
+
+  const subdir = segments[2];
+  const file = segments[3];
+  const stripSuffix = (name: string, suffix: string): string | null =>
+    name.endsWith(suffix) ? name.slice(0, -suffix.length) : null;
+
+  if (subdir === 'sessions') {
+    const id = stripSuffix(file, '.yaml');
+    if (id && ENTITY_ID_REGEX.test(id)) return { isMediaBlob: false, boardSlug: slug };
+  } else if (subdir === 'decisions') {
+    const id = stripSuffix(file, '.md');
+    if (id && ENTITY_ID_REGEX.test(id)) return { isMediaBlob: false, boardSlug: slug };
+  } else if (subdir === 'tasks') {
+    const id = stripSuffix(file, '.md');
+    if (id && ENTITY_ID_REGEX.test(id)) return { isMediaBlob: false, boardSlug: slug };
+  } else if (subdir === 'diagrams') {
+    const id =
+      stripSuffix(file, '.meta.yaml') ??
+      stripSuffix(file, '.mmd') ??
+      stripSuffix(file, '.excalidraw');
+    if (id && ENTITY_ID_REGEX.test(id)) return { isMediaBlob: false, boardSlug: slug };
+  } else if (subdir === 'quizzes') {
+    const id = stripSuffix(file, '.quiz.json');
+    if (id && ENTITY_ID_REGEX.test(id)) return { isMediaBlob: false, boardSlug: slug };
+  } else if (subdir === 'media') {
+    const metaId = stripSuffix(file, '.meta.yaml');
+    if (metaId && ENTITY_ID_REGEX.test(metaId)) {
+      return { isMediaBlob: false, boardSlug: slug };
+    }
+    const blobMatch = file.match(MEDIA_BLOB_FILENAME_REGEX);
+    if (blobMatch) {
+      return { isMediaBlob: true, mediaId: blobMatch[1], boardSlug: slug };
+    }
+  }
+
+  throw new CorruptDataError(
+    `Invalid transaction journal ${kind} target "${segments.join('/')}": unrecognized entity file.`,
+  );
+}
+
+type ResolvedTxnOp =
+  | {
+      kind: 'rename' | 'link_create';
+      rawTmpPath: string;
+      rawFinalPath: string;
+      tmpPath: string;
+      finalPath: string;
+      isMediaBlob: boolean;
+      mediaId?: string;
+    }
+  | {
+      kind: 'unlink';
+      rawFinalPath: string;
+      finalPath: string;
+    };
+
+interface ResolvedTxnJournal {
+  ops: ResolvedTxnOp[];
+  events: Array<{ eventsPath: string; eventId: string; line: string }>;
+  boardCommit?: { tmpPath: string; finalPath: string; rawTmpPath: string; rawFinalPath: string };
+}
+
+async function validateAndResolveTxnJournal(
+  deckDir: string,
+  txn: TxnJournal,
+): Promise<ResolvedTxnJournal> {
+  const resolvedDeckDir = path.resolve(deckDir);
+  if (txn.boardSlug !== undefined && !BOARD_SLUG_REGEX.test(txn.boardSlug)) {
+    throw new CorruptDataError(`Invalid transaction journal boardSlug "${txn.boardSlug}".`);
+  }
+
+  const resolveContained = async (
+    rawPath: string,
+    label: string,
+  ): Promise<{ segments: string[]; absPath: string }> => {
+    const segments = parseStrictRelativeSegments(rawPath, label);
+    const candidate = path.resolve(resolvedDeckDir, ...segments);
+    try {
+      const absPath = await assertContainedPath(resolvedDeckDir, candidate, {
+        allowEqual: false,
+        label,
+      });
+      return { segments, absPath };
+    } catch (err) {
+      throw new CorruptDataError(
+        `Invalid transaction journal ${label} "${rawPath}": ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  };
+
+  const resolvedOps: ResolvedTxnOp[] = [];
+  for (let i = 0; i < txn.ops.length; i += 1) {
+    const op = txn.ops[i];
+    const finalInfo = await resolveContained(op.finalPath, `ops[${i}].finalPath`);
+    const entityInfo = validateEntitySegments(finalInfo.segments, op.kind, txn.boardSlug);
+
+    if (op.kind === 'unlink') {
+      resolvedOps.push({
+        kind: 'unlink',
+        rawFinalPath: op.finalPath,
+        finalPath: finalInfo.absPath,
+      });
+    } else {
+      const tmpInfo = await resolveContained(op.tmpPath, `ops[${i}].tmpPath`);
+      const tmpBase = tmpInfo.segments[tmpInfo.segments.length - 1];
+      if (!TMP_BASENAME_REGEX.test(tmpBase)) {
+        throw new CorruptDataError(
+          `Invalid transaction journal ops[${i}].tmpPath "${op.tmpPath}": temp file must use .tmp- prefix.`,
+        );
+      }
+      const tmpDirRel = tmpInfo.segments.slice(0, -1).join('/');
+      const finalDirRel = finalInfo.segments.slice(0, -1).join('/');
+      if (tmpDirRel !== finalDirRel || path.dirname(tmpInfo.absPath) !== path.dirname(finalInfo.absPath)) {
+        throw new CorruptDataError(
+          `Invalid transaction journal ops[${i}]: temp file "${op.tmpPath}" must reside in the same directory as "${op.finalPath}".`,
+        );
+      }
+      resolvedOps.push({
+        kind: op.kind,
+        rawTmpPath: op.tmpPath,
+        rawFinalPath: op.finalPath,
+        tmpPath: tmpInfo.absPath,
+        finalPath: finalInfo.absPath,
+        isMediaBlob: entityInfo.isMediaBlob,
+        mediaId: entityInfo.mediaId,
+      });
+    }
+  }
+
+  const resolvedEvents: Array<{ eventsPath: string; eventId: string; line: string }> = [];
+  for (let i = 0; i < txn.events.length; i += 1) {
+    const ev = txn.events[i];
+    const evInfo = await resolveContained(ev.eventsPath, `events[${i}].eventsPath`);
+    if (
+      evInfo.segments.length !== 3 ||
+      evInfo.segments[0] !== 'boards' ||
+      !BOARD_SLUG_REGEX.test(evInfo.segments[1]) ||
+      evInfo.segments[2] !== 'events.jsonl'
+    ) {
+      throw new CorruptDataError(
+        `Invalid transaction journal events[${i}].eventsPath "${ev.eventsPath}": must be boards/<slug>/events.jsonl.`,
+      );
+    }
+    if (txn.boardSlug && evInfo.segments[1] !== txn.boardSlug) {
+      throw new CorruptDataError(
+        `Invalid transaction journal events[${i}].eventsPath "${ev.eventsPath}": board slug mismatch.`,
+      );
+    }
+    resolvedEvents.push({
+      eventsPath: evInfo.absPath,
+      eventId: ev.eventId,
+      line: ev.line,
+    });
+  }
+
+  let resolvedBoardCommit: ResolvedTxnJournal['boardCommit'];
+  if (txn.boardCommit) {
+    const finalInfo = await resolveContained(txn.boardCommit.finalPath, 'boardCommit.finalPath');
+    if (
+      finalInfo.segments.length !== 3 ||
+      finalInfo.segments[0] !== 'boards' ||
+      !BOARD_SLUG_REGEX.test(finalInfo.segments[1]) ||
+      finalInfo.segments[2] !== 'board.yaml'
+    ) {
+      throw new CorruptDataError(
+        `Invalid transaction journal boardCommit.finalPath "${txn.boardCommit.finalPath}": must be boards/<slug>/board.yaml.`,
+      );
+    }
+    if (txn.boardSlug && finalInfo.segments[1] !== txn.boardSlug) {
+      throw new CorruptDataError(
+        `Invalid transaction journal boardCommit.finalPath "${txn.boardCommit.finalPath}": board slug mismatch.`,
+      );
+    }
+    const tmpInfo = await resolveContained(txn.boardCommit.tmpPath, 'boardCommit.tmpPath');
+    const tmpBase = tmpInfo.segments[tmpInfo.segments.length - 1];
+    if (!TMP_BASENAME_REGEX.test(tmpBase)) {
+      throw new CorruptDataError(
+        `Invalid transaction journal boardCommit.tmpPath "${txn.boardCommit.tmpPath}": temp file must use .tmp- prefix.`,
+      );
+    }
+    const tmpDirRel = tmpInfo.segments.slice(0, -1).join('/');
+    const finalDirRel = finalInfo.segments.slice(0, -1).join('/');
+    if (tmpDirRel !== finalDirRel || path.dirname(tmpInfo.absPath) !== path.dirname(finalInfo.absPath)) {
+      throw new CorruptDataError(
+        `Invalid transaction journal boardCommit: temp file must reside in the same directory as board.yaml.`,
+      );
+    }
+    resolvedBoardCommit = {
+      rawTmpPath: txn.boardCommit.tmpPath,
+      rawFinalPath: txn.boardCommit.finalPath,
+      tmpPath: tmpInfo.absPath,
+      finalPath: finalInfo.absPath,
+    };
+  }
+
+  return {
+    ops: resolvedOps,
+    events: resolvedEvents,
+    boardCommit: resolvedBoardCommit,
+  };
+}
+
 /**
  * Execute a prepared transaction journal (or roll forward an existing journal after crash).
+ * Validates the ENTIRE journal against `deckDir` before executing a single op.
  * Idempotent across retries at every step:
  *   entity renames/links/unlinks -> append events + fdatasync -> board.yaml rename LAST -> delete txn.json
  */
@@ -255,16 +572,26 @@ export async function executeTxnJournal(
   txnPath: string,
   txn: TxnJournal,
   options: {
+    deckDir?: string;
     assertActive?: () => void;
     allowFaultInjection?: boolean;
     checkEventDedupe?: boolean;
   } = {},
 ): Promise<void> {
-  const { assertActive, allowFaultInjection = false, checkEventDedupe = true } = options;
+  const {
+    deckDir = path.dirname(path.dirname(txnPath)),
+    assertActive,
+    allowFaultInjection = false,
+    checkEventDedupe = true,
+  } = options;
 
-  for (let i = 0; i < txn.ops.length; i += 1) {
+  // H1: Validate and canonicalize EVERY path in the journal BEFORE running op 0.
+  const resolved = await validateAndResolveTxnJournal(deckDir, txn);
+  const missingMediaBlobs: Array<{ mediaDir: string; mediaId: string; expectedBlobPath: string }> = [];
+
+  for (let i = 0; i < resolved.ops.length; i += 1) {
     assertActive?.();
-    const op = txn.ops[i];
+    const op = resolved.ops[i];
     if (op.kind === 'unlink') {
       await fs.rm(op.finalPath, { force: true });
     } else if (op.kind === 'rename') {
@@ -274,11 +601,26 @@ export async function executeTxnJournal(
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
           // Already renamed before crash
-          await fs.access(op.finalPath).catch(() => {
-            throw new CorruptDataError(
-              `Transaction recovery missing both temp "${op.tmpPath}" and target "${op.finalPath}"`,
-            );
-          });
+          const targetExists = await fs
+            .access(op.finalPath)
+            .then(() => true)
+            .catch(() => false);
+          if (!targetExists) {
+            if (checkEventDedupe && op.isMediaBlob && op.mediaId) {
+              console.warn(
+                `[ContextDeck] Transaction recovery skipping missing media blob "${op.rawFinalPath}" (temp "${op.rawTmpPath}" also missing); reconciling metadata.`,
+              );
+              missingMediaBlobs.push({
+                mediaDir: path.dirname(op.finalPath),
+                mediaId: op.mediaId,
+                expectedBlobPath: op.finalPath,
+              });
+            } else {
+              throw new CorruptDataError(
+                `Transaction recovery missing both temp "${op.rawTmpPath}" and target "${op.rawFinalPath}"`,
+              );
+            }
+          }
         } else {
           throw err;
         }
@@ -291,7 +633,7 @@ export async function executeTxnJournal(
         if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
           await fs.access(op.finalPath).catch(() => {
             throw new CorruptDataError(
-              `Transaction recovery missing both temp "${op.tmpPath}" and target "${op.finalPath}"`,
+              `Transaction recovery missing both temp "${op.rawTmpPath}" and target "${op.rawFinalPath}"`,
             );
           });
         } else {
@@ -305,14 +647,40 @@ export async function executeTxnJournal(
     }
   }
 
+  // Reconcile metadata for any media blobs that went missing prior to recovery (H2)
+  for (const missing of missingMediaBlobs) {
+    assertActive?.();
+    const metaPath = path.join(missing.mediaDir, `${missing.mediaId}.meta.yaml`);
+    try {
+      const rawMeta = await fs.readFile(metaPath, 'utf8');
+      const parsed = yaml.load(rawMeta);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const record = parsed as Record<string, unknown>;
+        if ('filePath' in record && !existsSync(missing.expectedBlobPath)) {
+          delete record.filePath;
+          const dumped = yaml.dump(record, { lineWidth: 100, noRefs: true, sortKeys: false });
+          await atomicWriteFile(metaPath, dumped);
+        }
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        console.warn(
+          `[ContextDeck] Could not reconcile metadata for missing media blob ${missing.mediaId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
+
   if (allowFaultInjection) {
     maybeInjectFault('after-renames');
   }
 
-  if (txn.events.length > 0) {
+  if (resolved.events.length > 0) {
     if (checkEventDedupe) {
-      for (const ev of txn.events) {
+      for (const ev of resolved.events) {
         assertActive?.();
+        // H3: Repair any torn partial line BEFORE checking dedupe or appending
+        await repairTornJsonlTail(ev.eventsPath);
         const alreadyPresent = await eventIdExistsInFile(ev.eventsPath, ev.eventId);
         if (!alreadyPresent) {
           await appendLineFdatasync(ev.eventsPath, ev.line);
@@ -322,13 +690,13 @@ export async function executeTxnJournal(
       // Fresh commit: event IDs were just minted in this transaction; skip scanning events.jsonl
       // and coalesce contiguous events per target path into one write + fdatasync.
       let idx = 0;
-      while (idx < txn.events.length) {
+      while (idx < resolved.events.length) {
         assertActive?.();
-        const targetPath = txn.events[idx].eventsPath;
-        let batch = txn.events[idx].line;
+        const targetPath = resolved.events[idx].eventsPath;
+        let batch = resolved.events[idx].line;
         idx += 1;
-        while (idx < txn.events.length && txn.events[idx].eventsPath === targetPath) {
-          batch += txn.events[idx].line;
+        while (idx < resolved.events.length && resolved.events[idx].eventsPath === targetPath) {
+          batch += resolved.events[idx].line;
           idx += 1;
         }
         await appendLineFdatasync(targetPath, batch);
@@ -340,16 +708,16 @@ export async function executeTxnJournal(
     maybeInjectFault('after-event');
   }
 
-  if (txn.boardCommit) {
+  if (resolved.boardCommit) {
     assertActive?.();
     try {
-      await fs.access(txn.boardCommit.tmpPath);
-      await renameWithRetry(txn.boardCommit.tmpPath, txn.boardCommit.finalPath);
+      await fs.access(resolved.boardCommit.tmpPath);
+      await renameWithRetry(resolved.boardCommit.tmpPath, resolved.boardCommit.finalPath);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        await fs.access(txn.boardCommit.finalPath).catch(() => {
+        await fs.access(resolved.boardCommit.finalPath).catch(() => {
           throw new CorruptDataError(
-            `Transaction recovery missing board commit file "${txn.boardCommit!.finalPath}"`,
+            `Transaction recovery missing board commit file "${resolved.boardCommit!.rawFinalPath}"`,
           );
         });
       } else {
@@ -369,6 +737,7 @@ export async function executeTxnJournal(
 export async function recoverPendingTxn(
   runtimeDir: string,
   assertActive?: () => void,
+  deckDir?: string,
 ): Promise<boolean> {
   const txnPath = path.join(runtimeDir, TXN_FILENAME);
   let raw: string;
@@ -395,6 +764,7 @@ export async function recoverPendingTxn(
   }
 
   await executeTxnJournal(txnPath, validated.data, {
+    deckDir: deckDir ?? path.dirname(runtimeDir),
     assertActive,
     allowFaultInjection: false,
     checkEventDedupe: true,
@@ -418,6 +788,7 @@ function getLockTimings(): { stale: number; update: number } {
 export async function withWorkspaceLock<T>(
   runtimeDir: string,
   fn: (assertActive: () => void) => Promise<T>,
+  deckDir?: string,
 ): Promise<T> {
   const sentinelPath = path.join(runtimeDir, LOCK_SENTINEL_NAME);
   if (!existsSync(sentinelPath)) {
@@ -480,7 +851,7 @@ export async function withWorkspaceLock<T>(
 
   try {
     assertActive();
-    await recoverPendingTxn(runtimeDir, assertActive);
+    await recoverPendingTxn(runtimeDir, assertActive, deckDir);
     assertActive();
     return await fn(assertActive);
   } finally {

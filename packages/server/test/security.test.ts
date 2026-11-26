@@ -421,6 +421,54 @@ describe('E2 Server & MCP security (reproducing Bugs 2, 3, 4, 7-media, 8 + D5/D6
     }
   });
 
+  it('H2: failed multipart upload after txn.json write does not delete staged temp or brick workspace', async () => {
+    const dir = await makeTempDir('cdeck-h2-');
+    const store = new ContextDeckStore(dir);
+    await seedDemoBoard(store, 'demo');
+    const { app, token, close } = createApp({ store, port: 4310 });
+
+    try {
+      const boundary = '----cdeckH2Boundary';
+      const bodyStr =
+        `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="title"\r\n\r\nFaulted Upload\r\n` +
+        `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="kind"\r\n\r\nvideo\r\n` +
+        `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="file"; filename="clip.mp4"\r\n` +
+        `Content-Type: video/mp4\r\n\r\n` +
+        'VIDEO_PAYLOAD_BYTES' +
+        `\r\n--${boundary}--\r\n`;
+
+      process.env.CONTEXTDECK_FAULT = 'after-txn-write';
+      const res = await app.request('http://127.0.0.1:4310/api/boards/demo/media', {
+        method: 'POST',
+        headers: {
+          'Content-Type': `multipart/form-data; boundary=${boundary}`,
+          Authorization: `Bearer ${token}`,
+        },
+        body: bodyStr,
+      });
+      delete process.env.CONTEXTDECK_FAULT;
+      expect(res.status).toBeGreaterThanOrEqual(400);
+
+      // Next mutation must cleanly roll forward txn.json and succeed
+      const task = await store.upsertTask('demo', { title: 'Post-fault task' });
+      expect(task.title).toBe('Post-fault task');
+
+      const snap = await store.getSnapshot('demo');
+      expect(snap.tasks.some((t) => t.title === 'Post-fault task')).toBe(true);
+      const uploaded = snap.media.find((m) => m.title === 'Faulted Upload');
+      expect(uploaded).toBeDefined();
+      const resolved = await store.resolveMediaFilePath('demo', uploaded!.id);
+      expect(resolved).not.toBeNull();
+      expect(await fs.readFile(resolved!.absolutePath, 'utf8')).toBe('VIDEO_PAYLOAD_BYTES');
+    } finally {
+      delete process.env.CONTEXTDECK_FAULT;
+      await close();
+    }
+  });
+
   it('enforces MCP media_attach path allowlist, secret denials, symlink escape rejection, string caps, and baseRevision', async () => {
     const dir = await makeTempDir();
     const outside = await makeTempDir('cdeck-outside-');

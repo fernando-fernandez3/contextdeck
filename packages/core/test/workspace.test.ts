@@ -224,6 +224,36 @@ describe('E4 workspace resolution, worktrees, global pointer, and watcher', () =
     await expect(store.resolveMediaFilePath('main', 'art_sym')).rejects.toThrow();
   });
 
+  it('H4: rejects dangling symlinks escaping allowed directory (async and sync)', async () => {
+    const base = await makeTempDir('cdeck-h4-');
+    const outside = await makeTempDir('cdeck-h4-outside-');
+    const pwnedPath = path.join(outside, 'pwned.jsonl');
+
+    const store = new core.ContextDeckStore({
+      deckDir: path.join(base, '.contextdeck'),
+      projectRoot: base,
+    });
+    await store.createBoard({ title: 'Main', slug: 'main' });
+
+    const eventsPath = path.join(store.boardPath('main'), 'events.jsonl');
+    await fs.rm(eventsPath, { force: true });
+    await fs.symlink(pwnedPath, eventsPath);
+
+    // Direct containment checks (async and sync) must throw SecurityError
+    await expect(
+      core.assertContainedPath(store.boardPath('main'), eventsPath),
+    ).rejects.toBeInstanceOf(core.SecurityError);
+    expect(() =>
+      core.assertContainedPathSync(store.boardPath('main'), eventsPath),
+    ).toThrow(core.SecurityError);
+
+    // Mutation must NOT follow the dangling symlink or create the outside file
+    await expect(store.upsertTask('main', { title: 'Should fail' })).rejects.toBeInstanceOf(
+      core.SecurityError,
+    );
+    await expect(fs.stat(pwnedPath)).rejects.toThrow();
+  });
+
   it('watcher ignores .runtime, .lock, and temp files and debounces per board', async () => {
     const base = await makeTempDir();
     const store = new core.ContextDeckStore({

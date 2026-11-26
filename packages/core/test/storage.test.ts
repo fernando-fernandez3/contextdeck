@@ -282,4 +282,168 @@ describe('E1 safe concurrent storage engine', () => {
     const refreshed = await store.getSnapshot('main');
     expect(refreshed.drift.staleArtifacts).toHaveLength(0);
   }, FSYNC_TEST_TIMEOUT_MS);
+
+  it('H1: rejects txn.json containing arbitrary absolute paths and leaves outside files + txn.json intact', async () => {
+    const root = await makeTempDir('cdeck-h1-');
+    const deck = path.join(root, 'repo', '.contextdeck');
+    const store = new core.ContextDeckStore({ deckDir: deck, projectRoot: path.join(root, 'repo') });
+    await store.createBoard({ title: 'Main', slug: 'main' });
+
+    const victim = path.join(root, 'outside-victim.txt');
+    await fs.writeFile(victim, 'precious', 'utf8');
+    const planted = path.join(root, 'repo', 'planted.txt');
+    await fs.writeFile(planted, 'attacker content', 'utf8');
+    const overwritten = path.join(root, 'outside-overwrite.txt');
+    await fs.writeFile(overwritten, 'original', 'utf8');
+
+    const txnPath = path.join(store.runtimeDir, 'txn.json');
+    await fs.mkdir(store.runtimeDir, { recursive: true });
+    await fs.writeFile(
+      txnPath,
+      JSON.stringify({
+        id: 'evil',
+        ops: [
+          { kind: 'unlink', finalPath: victim },
+          { kind: 'rename', tmpPath: planted, finalPath: overwritten },
+        ],
+        events: [],
+      }),
+      'utf8',
+    );
+
+    await expect(
+      store.recordDecision('main', { title: 'x', summary: 'y' }),
+    ).rejects.toMatchObject({ code: 'CORRUPT_DATA' });
+
+    expect(await fs.readFile(victim, 'utf8')).toBe('precious');
+    expect(await fs.readFile(overwritten, 'utf8')).toBe('original');
+    await expect(fs.stat(txnPath)).resolves.toBeTruthy();
+  }, FSYNC_TEST_TIMEOUT_MS);
+
+  it('H1: rejects txn.json escaping via symlinked boards/<slug> directory and executes zero ops', async () => {
+    const root = await makeTempDir('cdeck-h1-sym-');
+    const outside = await makeTempDir('cdeck-h1-out-');
+    const store = new core.ContextDeckStore(root);
+    await store.createBoard({ title: 'Main', slug: 'main' });
+
+    // Create a symlinked board directory pointing outside the workspace
+    const evilBoardLink = path.join(store.boardsDir, 'evil');
+    await fs.mkdir(path.join(outside, 'tasks'), { recursive: true });
+    const outsideTarget = path.join(outside, 'tasks', 'task_001.md');
+    await fs.writeFile(outsideTarget, 'KEEP_ME', 'utf8');
+    await fs.symlink(outside, evilBoardLink);
+
+    const txnPath = path.join(store.runtimeDir, 'txn.json');
+    await fs.writeFile(
+      txnPath,
+      JSON.stringify({
+        id: 'txn_sym_escape',
+        boardSlug: 'evil',
+        ops: [
+          { kind: 'unlink', finalPath: 'boards/evil/tasks/task_001.md' },
+        ],
+        events: [],
+      }),
+      'utf8',
+    );
+
+    await expect(
+      store.upsertTask('main', { title: 'Trigger recovery' }),
+    ).rejects.toMatchObject({ code: 'CORRUPT_DATA' });
+
+    expect(await fs.readFile(outsideTarget, 'utf8')).toBe('KEEP_ME');
+    await expect(fs.stat(txnPath)).resolves.toBeTruthy();
+  }, FSYNC_TEST_TIMEOUT_MS);
+
+  it('H1: stores relative paths inside txn.json during faulted writes', async () => {
+    const dir = await makeTempDir('cdeck-h1-rel-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main' });
+
+    process.env.CONTEXTDECK_FAULT = 'after-txn-write';
+    await expect(store.upsertTask('main', { title: 'Check relative journal' })).rejects.toThrow(/fault/i);
+    delete process.env.CONTEXTDECK_FAULT;
+
+    const raw = await fs.readFile(path.join(store.runtimeDir, 'txn.json'), 'utf8');
+    const txn = JSON.parse(raw) as core.TxnJournal;
+    for (const op of txn.ops) {
+      expect(path.isAbsolute(op.finalPath)).toBe(false);
+      if (op.kind !== 'unlink') {
+        expect(path.isAbsolute(op.tmpPath)).toBe(false);
+      }
+    }
+    for (const ev of txn.events) {
+      expect(path.isAbsolute(ev.eventsPath)).toBe(false);
+    }
+    if (txn.boardCommit) {
+      expect(path.isAbsolute(txn.boardCommit.tmpPath)).toBe(false);
+      expect(path.isAbsolute(txn.boardCommit.finalPath)).toBe(false);
+    }
+  }, FSYNC_TEST_TIMEOUT_MS);
+
+  it('H2: recovers missing media blob op without wedging the board and keeps metadata consistent', async () => {
+    const dir = await makeTempDir('cdeck-h2-blob-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main' });
+
+    process.env.CONTEXTDECK_FAULT = 'after-txn-write';
+    await expect(
+      store.addMedia('main', {
+        title: 'Clip',
+        kind: 'video',
+        fileName: 'clip.mp4',
+        fileBuffer: Buffer.from('video-bytes'),
+      }),
+    ).rejects.toThrow(/fault/i);
+    delete process.env.CONTEXTDECK_FAULT;
+
+    // Simulate external deletion of the staged media blob temp file before recovery
+    const txnPath = path.join(store.runtimeDir, 'txn.json');
+    const txn = JSON.parse(await fs.readFile(txnPath, 'utf8')) as core.TxnJournal;
+    const blobOp = txn.ops.find(
+      (o): o is Extract<core.TxnOp, { kind: 'rename' }> =>
+        o.kind === 'rename' && o.finalPath.endsWith('.mp4'),
+    );
+    expect(blobOp).toBeDefined();
+    const blobTmpAbs = path.isAbsolute(blobOp!.tmpPath)
+      ? blobOp!.tmpPath
+      : path.resolve(store.deckDir, blobOp!.tmpPath);
+    await fs.rm(blobTmpAbs, { force: true });
+
+    // Next mutation must recover instead of wedging forever
+    const task = await store.upsertTask('main', { title: 'After missing blob' });
+    expect(task.title).toBe('After missing blob');
+    const snap = await store.getSnapshot('main');
+    expect(snap.tasks).toHaveLength(1);
+    const clip = snap.media.find((m) => m.title === 'Clip');
+    expect(clip).toBeDefined();
+    expect(clip!.filePath).toBeUndefined();
+  }, FSYNC_TEST_TIMEOUT_MS);
+
+  it('H3: truncates torn partial event line on crash recovery so snapshot loads with event once', async () => {
+    const dir = await makeTempDir('cdeck-h3-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main', brief: '# V1\n' });
+
+    process.env.CONTEXTDECK_FAULT = 'after-renames';
+    await expect(
+      store.updateBrief('main', '# V2\n', undefined, { baseRevision: 1 }),
+    ).rejects.toThrow(/fault/i);
+    delete process.env.CONTEXTDECK_FAULT;
+
+    const txnPath = path.join(store.runtimeDir, 'txn.json');
+    const txn = JSON.parse(await fs.readFile(txnPath, 'utf8')) as core.TxnJournal;
+    expect(txn.events).toHaveLength(1);
+    const eventsPath = path.join(store.boardPath('main'), 'events.jsonl');
+    // Simulate mid-append crash: first 40 bytes without trailing newline
+    await fs.appendFile(eventsPath, txn.events[0].line.slice(0, 40), 'utf8');
+
+    const recovered = await core.recoverPendingTxn(store.runtimeDir);
+    expect(recovered).toBe(true);
+
+    const snap = await store.getSnapshot('main');
+    expect(snap.brief).toBe('# V2\n');
+    const briefEvents = snap.events.filter((e) => e.id === txn.events[0].eventId);
+    expect(briefEvents).toHaveLength(1);
+  }, FSYNC_TEST_TIMEOUT_MS);
 });

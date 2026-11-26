@@ -3,14 +3,17 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 import { SecurityError } from './errors.js';
 
+const MAX_SYMLINK_HOPS = 40;
+
 /**
  * Resolve the canonical path of `targetPath` by calling realpath on the
- * deepest existing ancestor and re-joining remaining segments.
+ * deepest existing ancestor and re-joining remaining segments, following
+ * dangling symlinks (up to MAX_SYMLINK_HOPS) so they cannot bypass containment.
  */
 export async function canonicalizePath(targetPath: string): Promise<string> {
-  const resolved = path.resolve(targetPath);
+  let current = path.resolve(targetPath);
   const tail: string[] = [];
-  let current = resolved;
+  let hops = 0;
 
   for (;;) {
     try {
@@ -18,12 +21,40 @@ export async function canonicalizePath(targetPath: string): Promise<string> {
       return tail.length > 0 ? path.join(real, ...tail.reverse()) : real;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ELOOP') {
+        throw new SecurityError('Access denied: symlink loop detected while resolving path.');
+      }
       if (code !== 'ENOENT' && code !== 'ENOTDIR') {
         throw err;
       }
+
+      // Check whether `current` itself is a dangling symlink before falling back to parent
+      try {
+        const st = await fs.lstat(current);
+        if (st.isSymbolicLink()) {
+          hops += 1;
+          if (hops > MAX_SYMLINK_HOPS) {
+            throw new SecurityError('Access denied: too many symbolic link hops while resolving path.');
+          }
+          const linkTarget = await fs.readlink(current);
+          const resolvedLink = path.resolve(path.dirname(current), linkTarget);
+          current = tail.length > 0 ? path.join(resolvedLink, ...tail.reverse()) : resolvedLink;
+          tail.length = 0;
+          continue;
+        }
+      } catch (lstatErr) {
+        if (lstatErr instanceof SecurityError) {
+          throw lstatErr;
+        }
+        const lstatCode = (lstatErr as NodeJS.ErrnoException).code;
+        if (lstatCode !== 'ENOENT' && lstatCode !== 'ENOTDIR') {
+          throw lstatErr;
+        }
+      }
+
       const parent = path.dirname(current);
       if (parent === current) {
-        return resolved;
+        return tail.length > 0 ? path.join(current, ...tail.reverse()) : current;
       }
       tail.push(path.basename(current));
       current = parent;
@@ -32,9 +63,9 @@ export async function canonicalizePath(targetPath: string): Promise<string> {
 }
 
 export function canonicalizePathSync(targetPath: string): string {
-  const resolved = path.resolve(targetPath);
+  let current = path.resolve(targetPath);
   const tail: string[] = [];
-  let current = resolved;
+  let hops = 0;
 
   for (;;) {
     try {
@@ -42,12 +73,39 @@ export function canonicalizePathSync(targetPath: string): string {
       return tail.length > 0 ? path.join(real, ...tail.reverse()) : real;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ELOOP') {
+        throw new SecurityError('Access denied: symlink loop detected while resolving path.');
+      }
       if (code !== 'ENOENT' && code !== 'ENOTDIR') {
         throw err;
       }
+
+      try {
+        const st = fsSync.lstatSync(current);
+        if (st.isSymbolicLink()) {
+          hops += 1;
+          if (hops > MAX_SYMLINK_HOPS) {
+            throw new SecurityError('Access denied: too many symbolic link hops while resolving path.');
+          }
+          const linkTarget = fsSync.readlinkSync(current);
+          const resolvedLink = path.resolve(path.dirname(current), linkTarget);
+          current = tail.length > 0 ? path.join(resolvedLink, ...tail.reverse()) : resolvedLink;
+          tail.length = 0;
+          continue;
+        }
+      } catch (lstatErr) {
+        if (lstatErr instanceof SecurityError) {
+          throw lstatErr;
+        }
+        const lstatCode = (lstatErr as NodeJS.ErrnoException).code;
+        if (lstatCode !== 'ENOENT' && lstatCode !== 'ENOTDIR') {
+          throw lstatErr;
+        }
+      }
+
       const parent = path.dirname(current);
       if (parent === current) {
-        return resolved;
+        return tail.length > 0 ? path.join(current, ...tail.reverse()) : current;
       }
       tail.push(path.basename(current));
       current = parent;
