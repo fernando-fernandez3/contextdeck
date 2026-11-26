@@ -37,6 +37,7 @@ export interface CreateMcpServerOptions {
   env?: NodeJS.ProcessEnv;
   homeDir?: string;
   maxMediaBytes?: number;
+  enableResourceSubscriptions?: boolean;
 }
 
 export function createContextDeckMcpServer(
@@ -51,6 +52,7 @@ export function createContextDeckMcpServer(
 
   const { defaultBoard, onMutate, env, homeDir } = options;
   const maxMediaBytes = options.maxMediaBytes ?? store.maxMediaBytes;
+  const enableResourceSubscriptions = options.enableResourceSubscriptions ?? true;
 
   const server = new McpServer(
     {
@@ -59,30 +61,36 @@ export function createContextDeckMcpServer(
     },
     {
       capabilities: {
-        resources: {
-          subscribe: true,
-          listChanged: true,
-        },
+        resources: enableResourceSubscriptions
+          ? {
+              subscribe: true,
+              listChanged: true,
+            }
+          : {
+              listChanged: true,
+            },
       },
     },
   );
 
-  const subscribedUris = new Set<string>();
-  subscribedUrisByServer.set(server, subscribedUris);
+  if (enableResourceSubscriptions) {
+    const subscribedUris = new Set<string>();
+    subscribedUrisByServer.set(server, subscribedUris);
 
-  server.server.setRequestHandler(SubscribeRequestSchema, async (req) => {
-    const uri = req.params.uri;
-    if (!SUBSCRIBABLE_RESOURCE_URIS.has(uri)) {
-      throw new McpError(ErrorCode.InvalidParams, `Unknown subscribable resource URI: ${uri}`);
-    }
-    subscribedUris.add(uri);
-    return {};
-  });
+    server.server.setRequestHandler(SubscribeRequestSchema, async (req) => {
+      const uri = req.params.uri;
+      if (!SUBSCRIBABLE_RESOURCE_URIS.has(uri)) {
+        throw new McpError(ErrorCode.InvalidParams, `Unknown subscribable resource URI: ${uri}`);
+      }
+      subscribedUris.add(uri);
+      return {};
+    });
 
-  server.server.setRequestHandler(UnsubscribeRequestSchema, async (req) => {
-    subscribedUris.delete(req.params.uri);
-    return {};
-  });
+    server.server.setRequestHandler(UnsubscribeRequestSchema, async (req) => {
+      subscribedUris.delete(req.params.uri);
+      return {};
+    });
+  }
 
   // D4 / D9 / AC6.1: Never auto-initialize a workspace. Default to the session's bound board when sessionId is passed.
   const resolveSlug = async (board?: string, sessionId?: string | null) => {
@@ -630,17 +638,39 @@ export async function startStdioMcpServer(
   store: ContextDeckStore,
   defaultBoard?: string,
 ): Promise<void> {
-  const server = createContextDeckMcpServer(store, { defaultBoard });
+  const server = createContextDeckMcpServer(store, {
+    defaultBoard,
+    enableResourceSubscriptions: true,
+  });
   const transport = new StdioServerTransport();
 
   // D10 / AC5.8: MCP stdio watches only boards/*/board.yaml (depth 2) and notifies subscribers
   const watcher = attachMcpResourceWatcher(server, store);
 
-  transport.onclose = () => {
-    if (watcher) {
-      void watcher.close();
-    }
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    process.stdin.removeListener('end', onShutdown);
+    process.stdin.removeListener('close', onShutdown);
+    process.removeListener('SIGINT', onShutdown);
+    process.removeListener('SIGTERM', onShutdown);
+    await Promise.allSettled([
+      watcher ? watcher.close() : Promise.resolve(),
+      server.close(),
+    ]);
+    process.stdin.pause();
+    (process.stdin as { unref?: () => void }).unref?.();
   };
+  const onShutdown = () => {
+    void shutdown();
+  };
+
+  transport.onclose = onShutdown;
+  process.stdin.once('end', onShutdown);
+  process.stdin.once('close', onShutdown);
+  process.once('SIGINT', onShutdown);
+  process.once('SIGTERM', onShutdown);
 
   await server.connect(transport);
 }

@@ -311,9 +311,55 @@ describe('@contextdeck/cli B1 commands', () => {
         3000,
       );
       expect(notif).toBeDefined();
+
+      // H4: Closing stdin (EOF) must cleanly shut down watcher + server and exit without child.kill
+      const exitResult = await new Promise<{ exited: boolean; code: number | null; signal: NodeJS.Signals | null }>(
+        (resolve) => {
+          const timer = setTimeout(() => {
+            resolve({ exited: false, code: null, signal: null });
+          }, 2500);
+          child.once('exit', (code, signal) => {
+            clearTimeout(timer);
+            resolve({ exited: true, code, signal });
+          });
+          child.stdin.end();
+        },
+      );
+      expect(exitResult.exited).toBe(true);
+      expect(exitResult.code).toBe(0);
     } finally {
       child.stdin.end();
-      child.kill('SIGTERM');
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL');
+      }
     }
+  });
+
+  it('H5: cdeck board use <slug> switches default board in --global workspace mode (AC6.4)', async () => {
+    const base = await makeTempDir('cdeck-h5-global-');
+    const fakeHome = path.join(base, 'home');
+    const repo = path.join(base, 'repo');
+    await fs.mkdir(repo, { recursive: true });
+    const env = { CONTEXTDECK_HOME: fakeHome };
+
+    expect((await runCli(['init', '--global', 'myws', '--slug', 'main'], { cwd: repo, env })).code).toBe(0);
+    expect((await runCli(['board', 'create', 'Web', '--slug', 'web'], { cwd: repo, env })).code).toBe(0);
+    expect((await runCli(['board', 'use', 'web'], { cwd: repo, env })).code).toBe(0);
+
+    const listRes = await runCli(['board', 'list'], { cwd: repo, env });
+    expect(listRes.code).toBe(0);
+    expect(listRes.stdout).toMatch(/^\*\s+web\b/m);
+    expect(listRes.stdout).not.toMatch(/^\*\s+main\b/m);
+
+    const decRes = await runCli(['decision', 'add', 'Should go to web'], { cwd: repo, env });
+    expect(decRes.code).toBe(0);
+
+    const webStatus = await runCli(['status', '--board', 'web'], { cwd: repo, env });
+    expect(webStatus.code).toBe(0);
+    expect(webStatus.stdout).toContain('Decisions: 1');
+
+    const mainStatus = await runCli(['status', '--board', 'main'], { cwd: repo, env });
+    expect(mainStatus.code).toBe(0);
+    expect(mainStatus.stdout).toContain('Decisions: 0');
   });
 });

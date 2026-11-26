@@ -292,8 +292,12 @@ export class ContextDeckStore {
   public readonly boardsDir: string;
   public readonly sessionsDir: string;
   public readonly cursorsDir: string;
-  public readonly defaultBoardHint?: string;
+  private _defaultBoardHint?: string;
   public readonly maxMediaBytes: number;
+
+  public get defaultBoardHint(): string | undefined {
+    return this._defaultBoardHint;
+  }
 
   constructor(rootDirOrOptions: string | ContextDeckStoreOptions) {
     if (typeof rootDirOrOptions === 'string') {
@@ -308,7 +312,7 @@ export class ContextDeckStore {
         ? canonicalizePathSync(path.resolve(rootDirOrOptions.projectRoot))
         : undefined;
       this.rootDir = this.projectRoot ?? path.dirname(this.deckDir);
-      this.defaultBoardHint = rootDirOrOptions.defaultBoard
+      this._defaultBoardHint = rootDirOrOptions.defaultBoard
         ? validateBoardSlug(rootDirOrOptions.defaultBoard, 'defaultBoard')
         : undefined;
       this.maxMediaBytes = rootDirOrOptions.maxMediaBytes ?? DEFAULT_MAX_MEDIA_BYTES;
@@ -713,6 +717,7 @@ export class ContextDeckStore {
       },
       this.deckDir,
     );
+    this._defaultBoardHint = validSlug;
   }
 
   public async resolveBoardSlug(boardSlug?: string): Promise<string> {

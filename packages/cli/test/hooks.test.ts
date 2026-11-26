@@ -982,4 +982,33 @@ describe('AC5.1-AC5.4 + AC5.9 + D11/D12/D14 cdeck hook contract fixtures and cro
     const snap = await store.getSnapshot('main');
     expect(snap.drift.driftedSessions.some((d) => d.sessionId === sess!.id)).toBe(true);
   });
+
+  it('H10: Cursor multi-root workspace tries all workspace_roots entries in order and routes against the matched root', async () => {
+    const repoA = await makeTempDir('cdeck-h10-uninit-');
+    const repoB = await makeTempDir('cdeck-h10-init-');
+    const webDir = path.join(repoB, 'packages', 'web');
+    await fs.mkdir(webDir, { recursive: true });
+
+    const store = new ContextDeckStore(repoB);
+    await store.createBoard({ title: 'Main B', slug: 'main', setAsDefault: true });
+    await store.createBoard({
+      title: 'Web B',
+      slug: 'web',
+      paths: ['packages/web/**'],
+    });
+
+    const startRes = await runCliWithStdin(['hook', 'cursor', 'sessionStart'], {
+      cwd: repoA,
+      stdin: JSON.stringify({
+        conversation_id: 'conv_multi_root',
+        hook_event_name: 'sessionStart',
+        workspace_roots: [repoA, webDir],
+      }),
+    });
+    expect(startRes.code).toBe(0);
+    expect(startRes.stdout.length).toBeGreaterThan(0);
+    const parsed = JSON.parse(startRes.stdout) as { additional_context: string };
+    expect(parsed.additional_context).toContain('Web B');
+    expect(parsed.additional_context).toContain('Board: `web`');
+  });
 });

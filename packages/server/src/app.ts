@@ -879,6 +879,7 @@ export function createApp(options: AppOptions): {
       env,
       homeDir,
       maxMediaBytes,
+      enableResourceSubscriptions: false,
     });
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: undefined,

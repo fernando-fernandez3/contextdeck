@@ -7,6 +7,7 @@ import { z } from 'zod';
 import { CorruptDataError, WorkspaceNotFoundError } from './errors.js';
 import { validateBoardSlug, validateWorkspaceName } from './ids.js';
 import { assertContainedPathSync, canonicalizePathSync } from './paths.js';
+import { atomicWriteFile } from './txn.js';
 
 export const CONTEXTDECK_DIR_NAME = '.contextdeck';
 export const CONTEXTDECK_POINTER_FILE = '.contextdeck.yaml';
@@ -452,6 +453,36 @@ export async function initGlobalWorkspacePointer(options: {
     workspaceName,
     pointerPath,
   };
+}
+
+/**
+ * Atomically update the `board:` field of an existing `.contextdeck.yaml` pointer file
+ * while preserving all other keys (H5 / AC6.4).
+ */
+export async function updateGlobalWorkspacePointerBoard(
+  pointerPath: string,
+  boardSlug: string,
+): Promise<void> {
+  const validSlug = validateBoardSlug(boardSlug, 'board slug');
+  const raw = await fs.readFile(pointerPath, 'utf8');
+  let loaded: unknown;
+  try {
+    loaded = yaml.load(raw);
+  } catch (err) {
+    throw new CorruptDataError(
+      `Corrupt ${CONTEXTDECK_POINTER_FILE} at ${pointerPath}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (!loaded || typeof loaded !== 'object' || Array.isArray(loaded)) {
+    throw new CorruptDataError(`Invalid ${CONTEXTDECK_POINTER_FILE} at ${pointerPath}: expected an object.`);
+  }
+  const existing = loaded as Record<string, unknown>;
+  const next: Record<string, unknown> = {
+    ...existing,
+    board: validSlug,
+  };
+  const serialized = yaml.dump(next, { lineWidth: 100, noRefs: true, sortKeys: false });
+  await atomicWriteFile(pointerPath, serialized);
 }
 
 const REQUIRED_GITIGNORE_ENTRIES = ['.contextdeck/.runtime/', '.contextdeck/.lock'];

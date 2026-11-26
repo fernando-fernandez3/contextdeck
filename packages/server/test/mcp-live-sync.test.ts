@@ -238,4 +238,39 @@ describe('AC5.8 + AC6.1 + D10 MCP live sync, resource subscriptions, and session
       await close();
     }
   });
+
+  it('H13: stateless HTTP /mcp does not advertise resources.subscribe while stdio MCP still does', async () => {
+    const dir = await makeTempDir('cdeck-h13-');
+    const store = new ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main' });
+
+    const { app, token, close } = createApp({ store, port: 4310 });
+    try {
+      const initRes = await app.request('http://127.0.0.1:4310/mcp', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: {
+            protocolVersion: '2025-03-26',
+            capabilities: {},
+            clientInfo: { name: 'http-test', version: '0.1.0' },
+          },
+        }),
+      });
+      expect(initRes.status).toBe(200);
+      const body = (await initRes.json()) as {
+        result?: { capabilities?: { resources?: { subscribe?: boolean } } };
+      };
+      expect(body.result?.capabilities?.resources?.subscribe).not.toBe(true);
+    } finally {
+      await close();
+    }
+  });
 });

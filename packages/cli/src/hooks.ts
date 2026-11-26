@@ -157,25 +157,37 @@ function formatDefaultHookSessionTitle(harness: HookHarness, now: Date): string 
   return `${harness} session ${hh}:${mm} UTC`;
 }
 
-function extractPayloadCwd(
+interface CandidateCwd {
+  cwd: string;
+  explicitFromPayload: boolean;
+}
+
+function extractCandidateCwds(
   harness: HookHarness,
   payload: Record<string, unknown>,
   env: NodeJS.ProcessEnv,
-): { cwd: string; explicitFromPayload: boolean } {
-  if (typeof payload.cwd === 'string' && payload.cwd.trim()) {
-    return { cwd: payload.cwd.trim(), explicitFromPayload: true };
-  }
+): CandidateCwd[] {
+  const candidates: CandidateCwd[] = [];
+  const seen = new Set<string>();
+  const add = (raw: unknown, explicitFromPayload: boolean) => {
+    if (typeof raw !== 'string') return;
+    const trimmed = raw.trim();
+    if (!trimmed || seen.has(trimmed)) return;
+    seen.add(trimmed);
+    candidates.push({ cwd: trimmed, explicitFromPayload });
+  };
+
+  add(payload.cwd, true);
   if (Array.isArray(payload.workspace_roots)) {
     for (const root of payload.workspace_roots) {
-      if (typeof root === 'string' && root.trim()) {
-        return { cwd: root.trim(), explicitFromPayload: true };
-      }
+      add(root, true);
     }
   }
-  if (harness === 'cursor' && env.CURSOR_PROJECT_DIR?.trim()) {
-    return { cwd: env.CURSOR_PROJECT_DIR.trim(), explicitFromPayload: false };
+  if (harness === 'cursor') {
+    add(env.CURSOR_PROJECT_DIR, false);
   }
-  return { cwd: process.cwd(), explicitFromPayload: false };
+  add(process.cwd(), false);
+  return candidates;
 }
 
 function extractExternalSessionId(
@@ -197,34 +209,58 @@ function extractExternalSessionId(
   return null;
 }
 
-function resolveHookWorkspace(
-  payloadCwd: string,
-  explicitFromPayload: boolean,
+function resolveHookWorkspaceFromCandidates(
+  candidates: CandidateCwd[],
   env: NodeJS.ProcessEnv,
-): ResolvedWorkspace | null {
-  try {
-    if (env.CONTEXTDECK_DIR?.trim()) {
-      return resolveWorkspace({ env });
+): { workspace: ResolvedWorkspace; matchedCwd: string } | null {
+  const primaryCwd = candidates[0]?.cwd ?? process.cwd();
+  if (env.CONTEXTDECK_DIR?.trim()) {
+    try {
+      return { workspace: resolveWorkspace({ env }), matchedCwd: primaryCwd };
+    } catch (err) {
+      if (err instanceof WorkspaceNotFoundError) return null;
+      throw err;
     }
-    if (explicitFromPayload) {
-      const envWithoutClaude = { ...env };
-      delete envWithoutClaude.CLAUDE_PROJECT_DIR;
-      try {
-        return resolveWorkspace({ cwd: payloadCwd, env: envWithoutClaude });
-      } catch (err) {
-        if (err instanceof WorkspaceNotFoundError && env.CLAUDE_PROJECT_DIR?.trim()) {
-          return resolveWorkspace({ env });
-        }
-        throw err;
-      }
-    }
-    return resolveWorkspace({ cwd: payloadCwd, env });
-  } catch (err) {
-    if (err instanceof WorkspaceNotFoundError) {
-      return null;
-    }
-    throw err;
   }
+
+  const envWithoutClaude = { ...env };
+  delete envWithoutClaude.CLAUDE_PROJECT_DIR;
+
+  // 1. Try explicit payload candidates in order (payload.cwd, then every workspace_roots entry — H10)
+  for (const cand of candidates) {
+    if (!cand.explicitFromPayload) continue;
+    try {
+      const workspace = resolveWorkspace({ cwd: cand.cwd, env: envWithoutClaude });
+      return { workspace, matchedCwd: cand.cwd };
+    } catch (err) {
+      if (err instanceof WorkspaceNotFoundError) continue;
+      throw err;
+    }
+  }
+
+  // 2. Fallback to CLAUDE_PROJECT_DIR if set
+  if (env.CLAUDE_PROJECT_DIR?.trim()) {
+    try {
+      const workspace = resolveWorkspace({ env });
+      return { workspace, matchedCwd: env.CLAUDE_PROJECT_DIR.trim() };
+    } catch (err) {
+      if (!(err instanceof WorkspaceNotFoundError)) throw err;
+    }
+  }
+
+  // 3. Try non-explicit candidates (CURSOR_PROJECT_DIR, process.cwd())
+  for (const cand of candidates) {
+    if (cand.explicitFromPayload) continue;
+    try {
+      const workspace = resolveWorkspace({ cwd: cand.cwd, env: envWithoutClaude });
+      return { workspace, matchedCwd: cand.cwd };
+    } catch (err) {
+      if (err instanceof WorkspaceNotFoundError) continue;
+      throw err;
+    }
+  }
+
+  return null;
 }
 
 function formatHookOutput(
@@ -332,8 +368,11 @@ export async function runHookCli(
   try {
     // Best-effort deckDir lookup for logging early stdin errors
     try {
-      const fallbackWs = resolveHookWorkspace(process.cwd(), false, env);
-      resolvedDeckDir = fallbackWs?.deckDir;
+      const fallbackWs = resolveHookWorkspaceFromCandidates(
+        [{ cwd: process.cwd(), explicitFromPayload: false }],
+        env,
+      );
+      resolvedDeckDir = fallbackWs?.workspace.deckDir;
     } catch {
       // ignore
     }
@@ -363,11 +402,12 @@ export async function runHookCli(
     }
     const payload = parsed as Record<string, unknown>;
 
-    const { cwd: payloadCwd, explicitFromPayload } = extractPayloadCwd(rawHarness, payload, env);
-    const workspace = resolveHookWorkspace(payloadCwd, explicitFromPayload, env);
-    if (!workspace) {
+    const candidates = extractCandidateCwds(rawHarness, payload, env);
+    const resolvedMatch = resolveHookWorkspaceFromCandidates(candidates, env);
+    if (!resolvedMatch) {
       return;
     }
+    const { workspace, matchedCwd: payloadCwd } = resolvedMatch;
     resolvedDeckDir = workspace.deckDir;
 
     const store = new ContextDeckStore({
