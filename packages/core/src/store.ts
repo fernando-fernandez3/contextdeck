@@ -3031,6 +3031,57 @@ export class ContextDeckStore {
     return task;
   }
 
+  private static sha256Hex(value: string): string {
+    return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
+  }
+
+  private static computeClaimFingerprint(leaseToken: string): string {
+    return ContextDeckStore.sha256Hex(leaseToken).slice(0, 16);
+  }
+
+  private async validateActiveJobClaim(
+    slug: string,
+    jobId: string | undefined,
+    leaseToken: string | undefined,
+    artifactType: RefreshJobArtifactType,
+    artifactId: string,
+    nowMs: number,
+  ): Promise<{ job: RefreshJob; claimFingerprint: string } | null> {
+    if (!jobId) {
+      if (leaseToken !== undefined) {
+        throw new ValidationError('leaseToken can only be supplied together with jobId.');
+      }
+      return null;
+    }
+    if (!leaseToken) {
+      throw new ValidationError(`Refresh job write for "${jobId}" requires an active leaseToken.`);
+    }
+    const job = await this.readJobById(slug, jobId);
+    if (!job) {
+      throw new NotFoundError(`Refresh job "${jobId}" not found on board "${slug}".`);
+    }
+    if (job.artifactType !== artifactType || job.artifactId !== artifactId) {
+      throw new ValidationError(
+        `Refresh job "${jobId}" targets ${job.artifactType}/${job.artifactId}, not ${artifactType}/${artifactId}.`,
+      );
+    }
+    if (job.status !== 'claimed' || !job.leaseToken) {
+      throw new ConflictError(
+        `Refresh job "${jobId}" is not actively claimed (status: ${job.status}).`,
+      );
+    }
+    if (job.leaseToken !== leaseToken) {
+      throw new ConflictError(`Invalid lease token for refresh job "${jobId}".`);
+    }
+    if (job.leaseExpiresAt && Date.parse(job.leaseExpiresAt) <= nowMs) {
+      throw new ConflictError(`Lease for refresh job "${jobId}" has expired.`);
+    }
+    return {
+      job,
+      claimFingerprint: ContextDeckStore.computeClaimFingerprint(leaseToken),
+    };
+  }
+
   private async upsertDiagramUnlocked(
     tx: MutationContext,
     rawInput: {
@@ -3042,34 +3093,35 @@ export class ContextDeckStore {
       basedOnDecisions?: string[];
       sessionId?: string | null;
       jobId?: string;
+      leaseToken?: string;
       note?: string;
+      now?: Date;
     },
     actorOverride?: Actor,
   ): Promise<Diagram> {
-    const input = parseStrict(UpsertDiagramInputSchema.omit({ actor: true }), rawInput, 'diagram');
+    const { now: nowOpt, ...schemaInput } = rawInput;
+    const input = parseStrict(UpsertDiagramInputSchema.omit({ actor: true }), schemaInput, 'diagram');
     const effActor = actorOverride ?? tx.actor;
     const existing = input.id ? ((await this.readDiagramById(tx.slug, input.id)) ?? undefined) : undefined;
-    const now = nowIso();
+    const nowDate = nowOpt ?? new Date();
+    const now = nowDate.toISOString();
 
     const kind = input.kind ?? existing?.kind ?? 'mermaid';
     const id = existing?.id ?? input.id ?? `diag_${slugify(input.title)}_${shortId('x').slice(2, 6)}`;
     validateEntityId(id, 'diagramId');
 
-    if (input.jobId) {
-      const job = await this.readJobById(tx.slug, input.jobId);
-      if (!job) {
-        throw new NotFoundError(`Refresh job "${input.jobId}" not found on board "${tx.slug}".`);
-      }
-      if (job.artifactType !== 'diagram' || job.artifactId !== id) {
-        throw new ValidationError(
-          `Refresh job "${input.jobId}" targets ${job.artifactType}/${job.artifactId}, not diagram/${id}.`,
-        );
-      }
-      if (existing && input.content.trim() === existing.content.trim()) {
-        throw new ValidationError(
-          'Cannot record refresh job version without changing diagram content.',
-        );
-      }
+    const activeClaim = await this.validateActiveJobClaim(
+      tx.slug,
+      input.jobId,
+      input.leaseToken,
+      'diagram',
+      id,
+      nowDate.getTime(),
+    );
+    if (activeClaim && existing && input.content.trim() === existing.content.trim()) {
+      throw new ValidationError(
+        'Cannot record refresh job version without changing diagram content.',
+      );
     }
 
     // H10: Attribute the event ONLY to the actual caller's sessionId (never existing.sessionId),
@@ -3093,7 +3145,10 @@ export class ContextDeckStore {
       boardRevision: ev.revision,
       actor: eventActor,
       basedOnDecisions: nextBasedOn,
-      ...(input.jobId ? { createdByJob: input.jobId } : {}),
+      contentHash: ContextDeckStore.sha256Hex(input.content),
+      ...(activeClaim
+        ? { createdByJob: activeClaim.job.id, createdByClaim: activeClaim.claimFingerprint }
+        : {}),
       ...(input.note ? { note: input.note } : {}),
     });
 
@@ -3139,41 +3194,46 @@ export class ContextDeckStore {
     rawPatch: Record<string, unknown>,
     actorOverride?: Actor,
     stagedBinary?: { tmpPath: string; ext: string; mimeType?: string },
+    nowOpt?: Date,
   ): Promise<MediaArtifact> {
     validateEntityId(mediaId, 'mediaId');
     const patch = parseStrict(UpdateMediaPatchSchema.omit({ actor: true }), rawPatch, 'media patch');
     const effActor = actorOverride ?? tx.actor;
+    const nowDate = nowOpt ?? new Date();
+    const now = nowDate.toISOString();
 
     const existing = await this.readMediaById(tx.slug, mediaId, { loadContent: true });
     if (!existing) {
       throw new NotFoundError(`Media artifact "${mediaId}" not found on board "${tx.slug}".`);
     }
 
-    if (patch.jobId) {
-      const job = await this.readJobById(tx.slug, patch.jobId);
-      if (!job) {
-        throw new NotFoundError(`Refresh job "${patch.jobId}" not found on board "${tx.slug}".`);
-      }
-      if (job.artifactType !== 'media' || job.artifactId !== existing.id) {
-        throw new ValidationError(
-          `Refresh job "${patch.jobId}" targets ${job.artifactType}/${job.artifactId}, not media/${existing.id}.`,
-        );
-      }
+    const activeClaim = await this.validateActiveJobClaim(
+      tx.slug,
+      patch.jobId,
+      patch.leaseToken,
+      'media',
+      existing.id,
+      nowDate.getTime(),
+    );
+    if (activeClaim) {
       const hasNewBinary = Boolean(stagedBinary);
       const hasNewContent = patch.content !== undefined && patch.content !== existing.content;
       const hasNewTranscript =
         patch.transcript !== undefined && patch.transcript !== existing.transcript;
       const hasNewUrl =
         patch.externalUrl !== undefined && patch.externalUrl !== existing.externalUrl;
-      if (
-        (existing.kind === 'video' || existing.kind === 'audio') &&
-        !hasNewBinary &&
-        !hasNewUrl &&
-        !hasNewTranscript
-      ) {
-        throw new ValidationError(
-          'Cannot record refresh job version for video/audio without a new media file, URL, or transcript.',
-        );
+      if (existing.kind === 'video' || existing.kind === 'audio') {
+        if (existing.filePath) {
+          if (!hasNewBinary) {
+            throw new ValidationError(
+              'Cannot record refresh job version for file-backed video/audio without a new media file.',
+            );
+          }
+        } else if (!hasNewBinary && !hasNewUrl) {
+          throw new ValidationError(
+            'Cannot record refresh job version for video/audio without a new media file or URL.',
+          );
+        }
       }
       if (
         (existing.kind === 'doc' || existing.kind === 'html' || existing.kind === 'json') &&
@@ -3192,7 +3252,6 @@ export class ContextDeckStore {
     }
 
     const nextVersion = existing.version + 1;
-    const now = nowIso();
     const mediaDir = await this.safeBoardFilePath(tx.slug, 'media');
     let nextFilePath = existing.filePath;
     let nextMimeType = stagedBinary?.mimeType ?? existing.mimeType;
@@ -3234,6 +3293,7 @@ export class ContextDeckStore {
       actor: effActor,
     });
 
+    const nextContentForHash = patch.content !== undefined ? patch.content : existing.content;
     const versionEntry: ArtifactVersionEntry = ArtifactVersionEntrySchema.parse({
       version: nextVersion,
       updatedAt: now,
@@ -3241,7 +3301,12 @@ export class ContextDeckStore {
       actor: effActor,
       basedOnDecisions: nextBasedOn,
       ...(nextFilePath ? { filePath: nextFilePath } : {}),
-      ...(patch.jobId ? { createdByJob: patch.jobId } : {}),
+      ...(nextContentForHash !== undefined
+        ? { contentHash: ContextDeckStore.sha256Hex(nextContentForHash) }
+        : {}),
+      ...(activeClaim
+        ? { createdByJob: activeClaim.job.id, createdByClaim: activeClaim.claimFingerprint }
+        : {}),
       ...(patch.note ? { note: patch.note } : {}),
     });
 
@@ -4342,7 +4407,9 @@ export class ContextDeckStore {
       basedOnDecisions?: string[];
       sessionId?: string | null;
       jobId?: string;
+      leaseToken?: string;
       note?: string;
+      now?: Date;
     },
     actor: Actor = DEFAULT_ACTOR,
   ): Promise<Diagram> {
@@ -4579,7 +4646,9 @@ export class ContextDeckStore {
       fileName?: string;
       maxBytes?: number;
       jobId?: string;
+      leaseToken?: string;
       note?: string;
+      now?: Date;
     },
     actor: Actor = DEFAULT_ACTOR,
   ): Promise<MediaArtifact> {
@@ -4591,6 +4660,7 @@ export class ContextDeckStore {
       fileName,
       mimeType,
       maxBytes,
+      now: nowOpt,
       ...metadataPatch
     } = patch;
     const limit = maxBytes ?? this.maxMediaBytes;
@@ -4637,7 +4707,7 @@ export class ContextDeckStore {
         : undefined;
 
       return await this.mutate(slug, actor, (tx) =>
-        this.updateMediaUnlocked(tx, mediaId, metadataPatch as Record<string, unknown>, undefined, stagedBinary),
+        this.updateMediaUnlocked(tx, mediaId, metadataPatch as Record<string, unknown>, undefined, stagedBinary, nowOpt),
       );
     } catch (err) {
       const txnExists = existsSync(path.join(this.runtimeDir, TXN_FILENAME));
@@ -4734,6 +4804,11 @@ export class ContextDeckStore {
           if (art.filePath) protectedFiles.add(art.filePath);
           const openJobs = openJobsByMedia.get(art.id) ?? [];
           const openJobIds = new Set(openJobs.map((j) => j.id));
+          for (const openJob of openJobs) {
+            if (openJob.inputFilePath) {
+              protectedFiles.add(openJob.inputFilePath);
+            }
+          }
           const minProtectedVer =
             openJobs.length > 0 ? Math.min(...openJobs.map((j) => j.baseVersion)) : Infinity;
 
@@ -4839,12 +4914,17 @@ export class ContextDeckStore {
       questions?: QuizQuestion[];
       basedOnDecisions?: string[];
       jobId?: string;
+      leaseToken?: string;
       note?: string;
+      now?: Date;
     },
     actor: Actor = DEFAULT_ACTOR,
   ): Promise<Quiz> {
     validateEntityId(quizId, 'quizId');
-    const patch = parseStrict(UpdateQuizPatchSchema.omit({ actor: true }), rawPatch, 'quiz update');
+    const { now: nowOpt, ...schemaPatch } = rawPatch;
+    const patch = parseStrict(UpdateQuizPatchSchema.omit({ actor: true }), schemaPatch, 'quiz update');
+    const nowDate = nowOpt ?? new Date();
+    const now = nowDate.toISOString();
 
     return this.mutate(boardSlug, actor, async (tx) => {
       const existing = await this.readQuizById(tx.slug, quizId);
@@ -4852,16 +4932,15 @@ export class ContextDeckStore {
         throw new NotFoundError(`Quiz "${quizId}" not found on board "${tx.slug}".`);
       }
 
-      if (patch.jobId) {
-        const job = await this.readJobById(tx.slug, patch.jobId);
-        if (!job) {
-          throw new NotFoundError(`Refresh job "${patch.jobId}" not found on board "${tx.slug}".`);
-        }
-        if (job.artifactType !== 'quiz' || job.artifactId !== existing.id) {
-          throw new ValidationError(
-            `Refresh job "${patch.jobId}" targets ${job.artifactType}/${job.artifactId}, not quiz/${existing.id}.`,
-          );
-        }
+      const activeClaim = await this.validateActiveJobClaim(
+        tx.slug,
+        patch.jobId,
+        patch.leaseToken,
+        'quiz',
+        existing.id,
+        nowDate.getTime(),
+      );
+      if (activeClaim) {
         if (
           !patch.questions ||
           JSON.stringify(patch.questions) === JSON.stringify(existing.questions)
@@ -4872,7 +4951,6 @@ export class ContextDeckStore {
         }
       }
 
-      const now = nowIso();
       const nextVersion = existing.version + 1;
       const nextQuestions = patch.questions ?? existing.questions;
       const nextBasedOn = patch.basedOnDecisions ?? existing.basedOnDecisions;
@@ -4888,7 +4966,10 @@ export class ContextDeckStore {
         boardRevision: ev.revision,
         actor: tx.actor,
         basedOnDecisions: nextBasedOn,
-        ...(patch.jobId ? { createdByJob: patch.jobId } : {}),
+        contentHash: ContextDeckStore.sha256Hex(JSON.stringify(nextQuestions)),
+        ...(activeClaim
+          ? { createdByJob: activeClaim.job.id, createdByClaim: activeClaim.claimFingerprint }
+          : {}),
         ...(patch.note ? { note: patch.note } : {}),
       });
 
@@ -5172,6 +5253,8 @@ export class ContextDeckStore {
       let basedOnDecisions: string[];
       let mediaKind: MediaKind | undefined;
       let diagramKind: DiagramKind | undefined;
+      let inputFilePath: string | undefined;
+      let inputContentHash: string | undefined;
       let kindLabel: string = input.artifactType;
 
       if (input.artifactType === 'diagram') {
@@ -5181,14 +5264,19 @@ export class ContextDeckStore {
         baseVersion = diag.version;
         basedOnDecisions = diag.basedOnDecisions;
         diagramKind = diag.kind;
+        inputContentHash = ContextDeckStore.sha256Hex(diag.content);
         kindLabel = `${diag.kind} diagram`;
       } else if (input.artifactType === 'media') {
-        const media = await this.readMediaById(tx.slug, input.artifactId, { loadContent: false });
+        const media = await this.readMediaById(tx.slug, input.artifactId, { loadContent: true });
         if (!media) throw new NotFoundError(`Media "${input.artifactId}" not found.`);
         artifactTitle = media.title;
         baseVersion = media.version;
         basedOnDecisions = media.basedOnDecisions;
         mediaKind = media.kind;
+        inputFilePath = media.filePath;
+        if (media.content !== undefined) {
+          inputContentHash = ContextDeckStore.sha256Hex(media.content);
+        }
         kindLabel = media.kind;
       } else {
         const quiz = await this.readQuizById(tx.slug, input.artifactId);
@@ -5199,6 +5287,7 @@ export class ContextDeckStore {
           ...quiz.basedOnDecisions,
           ...quiz.questions.flatMap((q) => q.relatedDecisionIds ?? []),
         ];
+        inputContentHash = ContextDeckStore.sha256Hex(JSON.stringify(quiz.questions));
         kindLabel = 'quiz';
       }
 
@@ -5231,6 +5320,8 @@ export class ContextDeckStore {
         decisionsBefore,
         decisionsNow,
         baseVersion,
+        ...(inputFilePath ? { inputFilePath } : {}),
+        ...(inputContentHash ? { inputContentHash } : {}),
         status: 'queued',
         claimedBy: null,
         leaseToken: null,
@@ -5369,7 +5460,7 @@ export class ContextDeckStore {
       if (existing.status !== 'claimed' || !existing.leaseToken || existing.leaseToken !== input.leaseToken) {
         throw new ConflictError(`Invalid lease token or job "${jobId}" is not actively claimed.`);
       }
-      if (existing.leaseExpiresAt && Date.parse(existing.leaseExpiresAt) < nowMs) {
+      if (existing.leaseExpiresAt && Date.parse(existing.leaseExpiresAt) <= nowMs) {
         throw new ConflictError(`Lease for refresh job "${jobId}" has already expired.`);
       }
 
@@ -5466,7 +5557,7 @@ export class ContextDeckStore {
       if (existing.status !== 'claimed' || !existing.leaseToken || existing.leaseToken !== input.leaseToken) {
         throw new ConflictError(`Invalid lease token or job "${jobId}" is not claimed.`);
       }
-      if (existing.leaseExpiresAt && Date.parse(existing.leaseExpiresAt) < nowMs) {
+      if (existing.leaseExpiresAt && Date.parse(existing.leaseExpiresAt) <= nowMs) {
         throw new ConflictError(`Lease for refresh job "${jobId}" has expired; reclaim before completing.`);
       }
 
@@ -5492,22 +5583,31 @@ export class ContextDeckStore {
         return failed;
       }
 
-      // D19 / AC7.4 strict verification: artifact must have version > baseVersion AND createdByJob === job.id
+      // D19 / AC7.4 strict verification: artifact must have version > baseVersion,
+      // createdByJob === job.id AND createdByClaim === fingerprint(leaseToken),
+      // and must have changed the underlying media file / diagram content / quiz questions.
+      const expectedClaim = ContextDeckStore.computeClaimFingerprint(existing.leaseToken);
       let artifactVersion: number;
       let history: ArtifactVersionEntry[];
+      let currentDiagram: Diagram | null = null;
+      let currentMedia: MediaArtifact | null = null;
+      let currentQuiz: Quiz | null = null;
       if (existing.artifactType === 'diagram') {
         const diag = await this.readDiagramById(tx.slug, existing.artifactId);
         if (!diag) throw new NotFoundError(`Target diagram "${existing.artifactId}" no longer exists.`);
+        currentDiagram = diag;
         artifactVersion = diag.version;
         history = diag.history;
       } else if (existing.artifactType === 'media') {
-        const media = await this.readMediaById(tx.slug, existing.artifactId, { loadContent: false });
+        const media = await this.readMediaById(tx.slug, existing.artifactId, { loadContent: true });
         if (!media) throw new NotFoundError(`Target media "${existing.artifactId}" no longer exists.`);
+        currentMedia = media;
         artifactVersion = media.version;
         history = media.history;
       } else {
         const quiz = await this.readQuizById(tx.slug, existing.artifactId);
         if (!quiz) throw new NotFoundError(`Target quiz "${existing.artifactId}" no longer exists.`);
+        currentQuiz = quiz;
         artifactVersion = quiz.version;
         history = quiz.history;
       }
@@ -5520,12 +5620,63 @@ export class ContextDeckStore {
       }
 
       const matchingEntry = history.find(
-        (h) => h.version === claimedVersion && h.createdByJob === existing.id,
+        (h) =>
+          h.version === claimedVersion &&
+          h.createdByJob === existing.id &&
+          h.createdByClaim === expectedClaim,
       );
       if (!matchingEntry) {
         throw new ValidationError(
-          `Cannot complete refresh job "${existing.id}": artifact version ${claimedVersion} was not created with createdByJob="${existing.id}".`,
+          `Cannot complete refresh job "${existing.id}": artifact version ${claimedVersion} was not created by the active claim for job "${existing.id}".`,
         );
+      }
+
+      if (currentMedia) {
+        const isFileBackedAv =
+          (currentMedia.kind === 'video' || currentMedia.kind === 'audio') &&
+          Boolean(existing.inputFilePath || currentMedia.filePath);
+        if (isFileBackedAv) {
+          if (!matchingEntry.filePath || matchingEntry.filePath === existing.inputFilePath) {
+            throw new ValidationError(
+              `Cannot complete refresh job "${existing.id}": file-backed ${currentMedia.kind} version ${claimedVersion} did not produce a new media file.`,
+            );
+          }
+        } else if (
+          existing.inputFilePath &&
+          (currentMedia.kind === 'doc' || currentMedia.kind === 'html' || currentMedia.kind === 'json')
+        ) {
+          const currentHash =
+            matchingEntry.contentHash ??
+            (currentMedia.content !== undefined
+              ? ContextDeckStore.sha256Hex(currentMedia.content)
+              : undefined);
+          if (
+            matchingEntry.filePath === existing.inputFilePath &&
+            existing.inputContentHash &&
+            currentHash === existing.inputContentHash
+          ) {
+            throw new ValidationError(
+              `Cannot complete refresh job "${existing.id}": ${currentMedia.kind} content is unchanged.`,
+            );
+          }
+        }
+      } else if (currentDiagram && existing.inputContentHash) {
+        const currentHash =
+          matchingEntry.contentHash ?? ContextDeckStore.sha256Hex(currentDiagram.content);
+        if (currentHash === existing.inputContentHash) {
+          throw new ValidationError(
+            `Cannot complete refresh job "${existing.id}": diagram content is unchanged from base version.`,
+          );
+        }
+      } else if (currentQuiz && existing.inputContentHash) {
+        const currentHash =
+          matchingEntry.contentHash ??
+          ContextDeckStore.sha256Hex(JSON.stringify(currentQuiz.questions));
+        if (currentHash === existing.inputContentHash) {
+          throw new ValidationError(
+            `Cannot complete refresh job "${existing.id}": quiz questions are unchanged from base version.`,
+          );
+        }
       }
 
       const completed = RefreshJobSchema.parse({

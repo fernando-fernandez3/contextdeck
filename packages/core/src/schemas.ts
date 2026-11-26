@@ -242,6 +242,8 @@ export const ArtifactVersionEntrySchema = z
     basedOnDecisions: z.array(EntityIdSchema).default([]),
     filePath: z.string().optional(),
     createdByJob: EntityIdSchema.optional(),
+    createdByClaim: z.string().regex(/^[0-9a-f]{16}$/).optional(),
+    contentHash: z.string().regex(/^[0-9a-f]{64}$/).optional(),
     note: z.string().max(500).optional(),
   })
   .strict();
@@ -379,6 +381,8 @@ export const RefreshJobSchema = z.object({
   decisionsBefore: z.array(EntityIdSchema).default([]),
   decisionsNow: z.array(EntityIdSchema).default([]),
   baseVersion: z.number().int().min(1).default(1),
+  inputFilePath: z.string().optional(),
+  inputContentHash: z.string().regex(/^[0-9a-f]{64}$/).optional(),
   status: RefreshJobStatusSchema.default('queued'),
   claimedBy: z.string().max(200).nullable().default(null),
   leaseToken: z.string().max(128).nullable().default(null),
@@ -563,6 +567,7 @@ export const UpsertDiagramInputSchema = z
     basedOnDecisions: z.array(EntityIdSchema).max(100).optional(),
     sessionId: EntityIdSchema.nullable().optional(),
     jobId: EntityIdSchema.optional(),
+    leaseToken: z.string().min(1).max(128).optional(),
     note: z.string().max(500).optional(),
     actor: ActorSchema.optional(),
   })
@@ -602,6 +607,7 @@ export const UpdateMediaPatchSchema = z
     externalUrl: HttpUrlSchema.optional(),
     metadata: z.record(z.string(), z.unknown()).optional(),
     jobId: EntityIdSchema.optional(),
+    leaseToken: z.string().min(1).max(128).optional(),
     note: z.string().max(500).optional(),
     actor: ActorSchema.optional(),
   })
@@ -628,6 +634,7 @@ export const UpdateQuizPatchSchema = z
     questions: z.array(QuizQuestionSchema).min(1).max(100).optional(),
     basedOnDecisions: z.array(EntityIdSchema).max(100).optional(),
     jobId: EntityIdSchema.optional(),
+    leaseToken: z.string().min(1).max(128).optional(),
     note: z.string().max(500).optional(),
     actor: ActorSchema.optional(),
   })

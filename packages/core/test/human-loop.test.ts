@@ -298,7 +298,7 @@ describe('B3 Core: Refresh Jobs, Leases, Dedupe, Completion Gate, and Neon 15 Di
       }),
     ).rejects.toThrow(/createdByJob|job/i);
 
-    // Updating diagram WITH jobId and new content satisfies D19 and allows completion
+    // Updating diagram WITH jobId + leaseToken and new content satisfies D19 and allows completion
     const updatedDiag = await store.upsertDiagram('main', {
       id: diag.id,
       title: diag.title,
@@ -306,6 +306,8 @@ describe('B3 Core: Refresh Jobs, Leases, Dedupe, Completion Gate, and Neon 15 Di
       content: 'flowchart LR\nA-->NewSpec',
       basedOnDecisions: [d2.id],
       jobId: r1.job.id,
+      leaseToken: c3!.leaseToken!,
+      now: new Date(t0.getTime() + 17 * 60 * 1000),
     });
     expect(updatedDiag.version).toBe(3);
 
@@ -398,7 +400,8 @@ describe('B3 Core: Immutable Media Versions, Quiz Update, Prune, and Per-Questio
     expect(await fs.readFile(path.join(mediaDir, `${art.id}.v1.mp4`), 'utf8')).toBe('video-bytes-v1');
     expect(await fs.readFile(path.join(mediaDir, `${art.id}.v2.mp4`), 'utf8')).toBe('video-bytes-v2');
 
-    // Open job created at baseVersion 2 -> v2 must be protected from prune even after v3 exists!
+    // Open job created at baseVersion 2 -> claim first (D19), write v3 under active lease,
+    // and verify v2 is protected from prune while job is still open!
     const d2 = await store.recordDecision('main', { title: 'D2', supersedes: d1.id });
     const { job } = await store.createRefreshJob('main', {
       artifactType: 'media',
@@ -406,15 +409,17 @@ describe('B3 Core: Immutable Media Versions, Quiz Update, Prune, and Per-Questio
     });
     expect(job.baseVersion).toBe(2);
 
+    const claimed = await store.claimJob('main', { jobId: job.id, claimedBy: 'worker' });
     const v3 = await store.updateMedia('main', art.id, {
       sourceFilePath: srcV3,
       basedOnDecisions: [d2.id],
       jobId: job.id,
+      leaseToken: claimed!.leaseToken!,
     });
     expect(v3.version).toBe(3);
     expect(v3.filePath).toBe(`${art.id}.v3.mp4`);
 
-    // Prune while job is STILL OPEN -> v1 pruned, v2 (baseVersion of open job) & v3 (current) KEPT!
+    // Prune while job is STILL OPEN (claimed) -> v1 pruned, v2 (baseVersion of open job) & v3 (current) KEPT!
     const prune1 = await store.pruneMedia('main', { keepVersions: 1 });
     expect(prune1.prunedFiles).toContain(`${art.id}.v1.mp4`);
     expect(prune1.prunedFiles).not.toContain(`${art.id}.v2.mp4`);
@@ -423,7 +428,6 @@ describe('B3 Core: Immutable Media Versions, Quiz Update, Prune, and Per-Questio
     await expect(fs.stat(path.join(mediaDir, `${art.id}.v2.mp4`))).resolves.toBeTruthy();
 
     // Complete job -> now prune removes v2 too
-    const claimed = await store.claimJob('main', { jobId: job.id, claimedBy: 'worker' });
     await store.completeJob('main', job.id, { leaseToken: claimed!.leaseToken!, artifactVersion: 3 });
 
     const prune2 = await store.pruneMedia('main', { keepVersions: 1 });
@@ -519,5 +523,321 @@ describe('B3 Core: Immutable Media Versions, Quiz Update, Prune, and Per-Questio
     expect(finalSnap.quizzes[0].version).toBe(14);
     expect(finalSnap.quizzes[0].history).toHaveLength(10);
     expect(finalSnap.quizzes[0].attempts).toHaveLength(1);
+  });
+});
+
+describe('B3 Hardening G1: Claim-bound refresh jobs, substantive changes, and prune input protection (H1-H3)', () => {
+  it('H1: binds jobId writes to an active leaseToken/claim and rejects queued, wrong, expired, or cross-claim completions', async () => {
+    const dir = await makeTempDir('cdeck-h1-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'H1', slug: 'main' });
+
+    const d1 = await store.recordDecision('main', { title: 'Spec v1' });
+    const diag = await store.upsertDiagram('main', {
+      title: 'System Flow',
+      kind: 'mermaid',
+      content: 'flowchart LR\nA-->V1',
+      basedOnDecisions: [d1.id],
+    });
+    const d2 = await store.recordDecision('main', { title: 'Spec v2', supersedes: d1.id });
+    const { job } = await store.createRefreshJob('main', {
+      artifactType: 'diagram',
+      artifactId: diag.id,
+    });
+
+    // (a) jobId write on a queued job MUST be rejected (even without or with fake leaseToken)
+    await expect(
+      store.upsertDiagram('main', {
+        id: diag.id,
+        title: diag.title,
+        kind: 'mermaid',
+        content: 'flowchart LR\nA-->PreClaim',
+        basedOnDecisions: [d2.id],
+        jobId: job.id,
+      }),
+    ).rejects.toThrow(/lease|claim/i);
+
+    const t0 = new Date('2026-11-26T12:00:00.000Z');
+    const claimA = await store.claimJob('main', { jobId: job.id, claimedBy: 'worker-A', now: t0 });
+    expect(claimA?.leaseToken).toBeTruthy();
+
+    // (b) Wrong leaseToken rejected
+    await expect(
+      store.upsertDiagram('main', {
+        id: diag.id,
+        title: diag.title,
+        kind: 'mermaid',
+        content: 'flowchart LR\nA-->WrongToken',
+        basedOnDecisions: [d2.id],
+        jobId: job.id,
+        leaseToken: 'wrong-lease-token',
+        now: new Date(t0.getTime() + 60_000),
+      }),
+    ).rejects.toThrow(/lease/i);
+
+    // (b2) Expired leaseToken rejected
+    await expect(
+      store.upsertDiagram('main', {
+        id: diag.id,
+        title: diag.title,
+        kind: 'mermaid',
+        content: 'flowchart LR\nA-->ExpiredToken',
+        basedOnDecisions: [d2.id],
+        jobId: job.id,
+        leaseToken: claimA!.leaseToken!,
+        now: new Date(t0.getTime() + 16 * 60 * 1000),
+      }),
+    ).rejects.toThrow(/expired|lease/i);
+
+    // (c) Worker A writes v2 while lease is valid, then lease expires and Worker B reclaims
+    const v2ByA = await store.upsertDiagram('main', {
+      id: diag.id,
+      title: diag.title,
+      kind: 'mermaid',
+      content: 'flowchart LR\nA-->WorkerA',
+      basedOnDecisions: [d2.id],
+      jobId: job.id,
+      leaseToken: claimA!.leaseToken!,
+      now: new Date(t0.getTime() + 60_000),
+    });
+    expect(v2ByA.version).toBe(2);
+    const v2Entry = v2ByA.history.find((h) => h.version === 2)!;
+    expect(v2Entry.createdByJob).toBe(job.id);
+    expect(v2Entry.createdByClaim).toMatch(/^[0-9a-f]{16}$/);
+    expect(v2Entry.createdByClaim).not.toBe(claimA!.leaseToken);
+
+    const claimB = await store.claimJob('main', {
+      jobId: job.id,
+      claimedBy: 'worker-B',
+      now: new Date(t0.getTime() + 16 * 60 * 1000),
+    });
+    expect(claimB?.leaseToken).toBeTruthy();
+    expect(claimB?.leaseToken).not.toBe(claimA?.leaseToken);
+
+    // Worker B CANNOT complete against Worker A's v2!
+    await expect(
+      store.completeJob('main', job.id, {
+        leaseToken: claimB!.leaseToken!,
+        artifactVersion: 2,
+        now: new Date(t0.getTime() + 17 * 60 * 1000),
+      }),
+    ).rejects.toThrow(/claim/i);
+
+    // (d) Happy path: Worker B writes v3 with B's leaseToken and completes
+    const v3ByB = await store.upsertDiagram('main', {
+      id: diag.id,
+      title: diag.title,
+      kind: 'mermaid',
+      content: 'flowchart LR\nA-->WorkerB',
+      basedOnDecisions: [d2.id],
+      jobId: job.id,
+      leaseToken: claimB!.leaseToken!,
+      now: new Date(t0.getTime() + 17 * 60 * 1000),
+    });
+    expect(v3ByB.version).toBe(3);
+
+    const done = await store.completeJob('main', job.id, {
+      leaseToken: claimB!.leaseToken!,
+      artifactVersion: 3,
+      now: new Date(t0.getTime() + 17 * 60 * 1000),
+    });
+    expect(done.status).toBe('done');
+
+    // Codex 1 repro: Worker A's late write after B completed MUST be rejected (with old token or without token)
+    await expect(
+      store.upsertDiagram('main', {
+        id: diag.id,
+        title: diag.title,
+        kind: 'mermaid',
+        content: 'flowchart LR\nOLD-->WRONG',
+        basedOnDecisions: [d2.id],
+        jobId: job.id,
+        leaseToken: claimA!.leaseToken!,
+        now: new Date(t0.getTime() + 18 * 60 * 1000),
+      }),
+    ).rejects.toThrow(/claim|lease/i);
+    await expect(
+      store.upsertDiagram('main', {
+        id: diag.id,
+        title: diag.title,
+        kind: 'mermaid',
+        content: 'flowchart LR\nOLD-->WRONG',
+        basedOnDecisions: [d2.id],
+        jobId: job.id,
+      }),
+    ).rejects.toThrow(/lease|claim/i);
+
+    const snap = await store.getSnapshot('main');
+    const latestDiag = snap.diagrams.find((d) => d.id === diag.id)!;
+    expect(latestDiag.version).toBe(3);
+    expect(latestDiag.content).toBe('flowchart LR\nA-->WorkerB');
+  });
+
+  it('H2: rejects transcript-only refresh updates on file-backed video/audio and rejects unchanged content on completeJob for media/diagram/quiz', async () => {
+    const dir = await makeTempDir('cdeck-h2-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'H2', slug: 'main' });
+
+    const d1 = await store.recordDecision('main', { title: 'D1' });
+    const srcMp4 = path.join(dir, 'clip.mp4');
+    const srcMp3 = path.join(dir, 'clip.mp3');
+    await fs.writeFile(srcMp4, Buffer.from('video-v1'));
+    await fs.writeFile(srcMp3, Buffer.from('audio-v1'));
+
+    const video = await store.addMedia('main', {
+      title: 'Video',
+      kind: 'video',
+      sourceFilePath: srcMp4,
+      basedOnDecisions: [d1.id],
+    });
+    const audio = await store.addMedia('main', {
+      title: 'Audio',
+      kind: 'audio',
+      sourceFilePath: srcMp3,
+      basedOnDecisions: [d1.id],
+    });
+    const diag = await store.upsertDiagram('main', {
+      title: 'Arch',
+      kind: 'mermaid',
+      content: 'flowchart LR\nA-->B',
+      basedOnDecisions: [d1.id],
+    });
+    const quiz = await store.createQuiz('main', {
+      title: 'Quiz',
+      basedOnDecisions: [d1.id],
+      questions: [
+        {
+          id: 'q1',
+          prompt: 'Q1?',
+          type: 'true_false',
+          correctAnswer: 'true',
+          explanation: 'yes',
+          relatedDecisionIds: [d1.id],
+        },
+      ],
+    });
+    await store.recordDecision('main', { title: 'D2', supersedes: d1.id });
+
+    // File-backed video: transcript-only update with jobId MUST be rejected
+    const { job: vJob } = await store.createRefreshJob('main', { artifactType: 'media', artifactId: video.id });
+    const vClaim = await store.claimJob('main', { jobId: vJob.id, claimedBy: 'w1' });
+    await expect(
+      store.updateMedia('main', video.id, {
+        transcript: 'new transcript only',
+        jobId: vJob.id,
+        leaseToken: vClaim!.leaseToken!,
+      }),
+    ).rejects.toThrow(/media file|binary/i);
+
+    // File-backed audio: transcript-only update with jobId MUST be rejected
+    const { job: aJob } = await store.createRefreshJob('main', { artifactType: 'media', artifactId: audio.id });
+    const aClaim = await store.claimJob('main', { jobId: aJob.id, claimedBy: 'w1' });
+    await expect(
+      store.updateMedia('main', audio.id, {
+        transcript: 'new audio transcript only',
+        jobId: aJob.id,
+        leaseToken: aClaim!.leaseToken!,
+      }),
+    ).rejects.toThrow(/media file|binary/i);
+
+    // Diagram: byte-identical update rejected, AND reverting to base content rejected on completeJob
+    const { job: dJob } = await store.createRefreshJob('main', { artifactType: 'diagram', artifactId: diag.id });
+    const dClaim = await store.claimJob('main', { jobId: dJob.id, claimedBy: 'w1' });
+    await expect(
+      store.upsertDiagram('main', {
+        id: diag.id,
+        title: diag.title,
+        kind: 'mermaid',
+        content: 'flowchart LR\nA-->B',
+        jobId: dJob.id,
+        leaseToken: dClaim!.leaseToken!,
+      }),
+    ).rejects.toThrow(/content/i);
+
+    // Change diagram outside job to temp content, then write back base content under jobId -> completeJob rejects!
+    await store.upsertDiagram('main', {
+      id: diag.id,
+      title: diag.title,
+      kind: 'mermaid',
+      content: 'flowchart LR\nA-->TEMP',
+    });
+    await store.upsertDiagram('main', {
+      id: diag.id,
+      title: diag.title,
+      kind: 'mermaid',
+      content: 'flowchart LR\nA-->B',
+      jobId: dJob.id,
+      leaseToken: dClaim!.leaseToken!,
+    });
+    await expect(
+      store.completeJob('main', dJob.id, { leaseToken: dClaim!.leaseToken!, artifactVersion: 3 }),
+    ).rejects.toThrow(/unchanged|identical|content/i);
+
+    // Quiz: unchanged questions rejected, AND reverting to base questions rejected on completeJob
+    const { job: qJob } = await store.createRefreshJob('main', { artifactType: 'quiz', artifactId: quiz.id });
+    const qClaim = await store.claimJob('main', { jobId: qJob.id, claimedBy: 'w1' });
+    await expect(
+      store.updateQuiz('main', quiz.id, {
+        questions: quiz.questions,
+        jobId: qJob.id,
+        leaseToken: qClaim!.leaseToken!,
+      }),
+    ).rejects.toThrow(/questions/i);
+
+    await store.updateQuiz('main', quiz.id, {
+      questions: [{ ...quiz.questions[0], prompt: 'Temp prompt?' }],
+    });
+    await store.updateQuiz('main', quiz.id, {
+      questions: quiz.questions,
+      jobId: qJob.id,
+      leaseToken: qClaim!.leaseToken!,
+    });
+    await expect(
+      store.completeJob('main', qJob.id, { leaseToken: qClaim!.leaseToken!, artifactVersion: 3 }),
+    ).rejects.toThrow(/unchanged|questions/i);
+  });
+
+  it('H3: pruneMedia protects an open job input file even after capped history rolls over (Codex 2 repro)', async () => {
+    const dir = await makeTempDir('cdeck-h3-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'H3', slug: 'main' });
+
+    const v1 = path.join(dir, 'v1.mp4');
+    const v13 = path.join(dir, 'v13.mp4');
+    await fs.writeFile(v1, Buffer.from('mp4-bytes-v1'));
+    await fs.writeFile(v13, Buffer.from('mp4-bytes-v13'));
+
+    const art = await store.addMedia('main', {
+      id: 'art_test',
+      title: 'Test Video',
+      kind: 'video',
+      sourceFilePath: v1,
+    });
+    expect(art.filePath).toBe('art_test.v1.mp4');
+
+    // 11 title-only updates -> artifact v12 still referencing art_test.v1.mp4
+    for (let i = 2; i <= 12; i += 1) {
+      await store.updateMedia('main', art.id, { title: `Test Video v${i}` });
+    }
+
+    // Open a refresh job at baseVersion 12
+    const { job } = await store.createRefreshJob('main', {
+      artifactType: 'media',
+      artifactId: art.id,
+    });
+    expect(job.baseVersion).toBe(12);
+
+    // Replace binary at v13, then 10 title-only updates through v23 so history rolls over v1..v13
+    const updated13 = await store.updateMedia('main', art.id, { sourceFilePath: v13 });
+    expect(updated13.filePath).toBe('art_test.v13.mp4');
+    for (let i = 14; i <= 23; i += 1) {
+      await store.updateMedia('main', art.id, { title: `Test Video v${i}` });
+    }
+
+    // Dry-run prune MUST protect art_test.v1.mp4 because the open job still references it!
+    const dryPrune = await store.pruneMedia('main', { keepVersions: 1, dryRun: true });
+    expect(dryPrune.prunedFiles).not.toContain('art_test.v1.mp4');
+    expect(dryPrune.keptFiles).toContain('art_test.v1.mp4');
+    expect(dryPrune.keptFiles).toContain('art_test.v13.mp4');
   });
 });

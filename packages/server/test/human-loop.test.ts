@@ -115,6 +115,62 @@ describe('B3 Server: REST catchup, confirmations, jobs, and versioned updates', 
         { method: 'POST', headers: auth, body: JSON.stringify({}) },
       );
       expect(taskConfirm.status).toBe(400);
+
+      // H1: REST multipart media PATCH threads leaseToken and enforces active claim
+      const vidV1 = path.join(dir, 'rest-v1.mp4');
+      await fs.writeFile(vidV1, Buffer.from('rest-v1-bytes'));
+      const media = await store.addMedia('main', {
+        title: 'REST Video',
+        kind: 'video',
+        sourceFilePath: vidV1,
+        basedOnDecisions: [d1.id],
+      });
+      const { job: mJob } = await store.createRefreshJob('main', {
+        artifactType: 'media',
+        artifactId: media.id,
+      });
+      const claimedM = await store.claimJob('main', { jobId: mJob.id, claimedBy: 'rest-worker' });
+
+      const badForm = new FormData();
+      badForm.set('jobId', mJob.id);
+      badForm.set('file', new Blob(['rest-v2-bytes'], { type: 'video/mp4' }), 'v2.mp4');
+      const badMultipart = await app.request(
+        `http://127.0.0.1:4310/api/boards/main/media/${media.id}`,
+        {
+          method: 'PATCH',
+          headers: { Authorization: `Bearer ${token}` },
+          body: badForm,
+        },
+      );
+      expect(badMultipart.status).toBe(400);
+
+      const goodForm = new FormData();
+      goodForm.set('jobId', mJob.id);
+      goodForm.set('leaseToken', claimedM!.leaseToken!);
+      goodForm.set('basedOnDecisions', d2.id);
+      goodForm.set('file', new Blob(['rest-v2-bytes'], { type: 'video/mp4' }), 'v2.mp4');
+      const goodMultipart = await app.request(
+        `http://127.0.0.1:4310/api/boards/main/media/${media.id}`,
+        {
+          method: 'PATCH',
+          headers: { Authorization: `Bearer ${token}` },
+          body: goodForm,
+        },
+      );
+      expect(goodMultipart.status).toBe(200);
+      const patchedMedia = (await goodMultipart.json()) as { version: number; filePath: string };
+      expect(patchedMedia.version).toBe(2);
+      expect(patchedMedia.filePath).toBe(`${media.id}.v2.mp4`);
+
+      const doneM = await app.request(
+        `http://127.0.0.1:4310/api/boards/main/jobs/${mJob.id}/complete`,
+        {
+          method: 'POST',
+          headers: auth,
+          body: JSON.stringify({ leaseToken: claimedM!.leaseToken!, artifactVersion: 2 }),
+        },
+      );
+      expect(doneM.status).toBe(200);
     } finally {
       await close();
     }
@@ -235,7 +291,19 @@ describe('B3 Server: MCP artifact_confirm, job_*, media_update, quiz_update', ()
       });
       expect(badComplete.isError).toBe(true);
 
-      // media_update with sourceFilePath + jobId bumps version to 2
+      // media_update without leaseToken must fail (H1)
+      const missingLeaseMedia = await client.callTool({
+        name: 'media_update',
+        arguments: {
+          mediaId: media.id,
+          sourceFilePath: mediaV2File,
+          basedOnDecisions: [d2.id],
+          jobId: mediaJob.id,
+        },
+      });
+      expect(missingLeaseMedia.isError).toBe(true);
+
+      // media_update with sourceFilePath + jobId + leaseToken bumps version to 2
       const updMediaRes = await client.callTool({
         name: 'media_update',
         arguments: {
@@ -243,6 +311,7 @@ describe('B3 Server: MCP artifact_confirm, job_*, media_update, quiz_update', ()
           sourceFilePath: mediaV2File,
           basedOnDecisions: [d2.id],
           jobId: mediaJob.id,
+          leaseToken: claimedMediaJob.leaseToken,
         },
       });
       expect(updMediaRes.isError).not.toBe(true);
@@ -284,6 +353,7 @@ describe('B3 Server: MCP artifact_confirm, job_*, media_update, quiz_update', ()
           quizId: quiz.id,
           basedOnDecisions: [d2.id],
           jobId: quizJob.id,
+          leaseToken: qLease2,
           questions: [
             {
               id: 'q1',

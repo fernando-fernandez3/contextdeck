@@ -420,6 +420,12 @@ export function createContextDeckMcpServer(
           basedOnDecisions: z.array(EntityIdSchema).max(100).optional(),
           sessionId: EntityIdSchema.nullable().optional(),
           jobId: EntityIdSchema.optional().describe('Optional claimed refresh job ID fulfilled by this version'),
+          leaseToken: z
+            .string()
+            .min(1)
+            .max(128)
+            .optional()
+            .describe('Active lease token from job_claim (required when jobId is set)'),
           note: z.string().max(500).optional(),
           harness: z.string().max(100).optional(),
         })
@@ -523,6 +529,12 @@ export function createContextDeckMcpServer(
           tags: z.array(z.string().max(100)).max(50).optional(),
           basedOnDecisions: z.array(EntityIdSchema).max(100).optional(),
           jobId: EntityIdSchema.optional().describe('Optional claimed refresh job ID fulfilled by this version'),
+          leaseToken: z
+            .string()
+            .min(1)
+            .max(128)
+            .optional()
+            .describe('Active lease token from job_claim (required when jobId is set)'),
           note: z.string().max(500).optional(),
           sessionId: EntityIdSchema.nullable().optional(),
           harness: z.string().max(100).optional(),
@@ -611,6 +623,12 @@ export function createContextDeckMcpServer(
           questions: z.array(QuizQuestionSchema).min(1).max(100).optional(),
           basedOnDecisions: z.array(EntityIdSchema).max(100).optional(),
           jobId: EntityIdSchema.optional().describe('Optional claimed refresh job ID fulfilled by this version'),
+          leaseToken: z
+            .string()
+            .min(1)
+            .max(128)
+            .optional()
+            .describe('Active lease token from job_claim (required when jobId is set)'),
           note: z.string().max(500).optional(),
           sessionId: EntityIdSchema.nullable().optional(),
           harness: z.string().max(100).optional(),

@@ -779,6 +779,7 @@ export function createApp(options: AppOptions): {
       let basedOnDecisions: string[] | undefined;
       let tags: string[] | undefined;
       let jobId: string | undefined;
+      let leaseToken: string | undefined;
       let note: string | undefined;
       try {
         title = parsed.fields.title?.trim() ? parsed.fields.title.trim().slice(0, 300) : undefined;
@@ -799,6 +800,9 @@ export function createApp(options: AppOptions): {
         jobId = parsed.fields.jobId?.trim()
           ? validateEntityId(parsed.fields.jobId.trim(), 'jobId')
           : undefined;
+        leaseToken = parsed.fields.leaseToken?.trim()
+          ? parsed.fields.leaseToken.trim().slice(0, 128)
+          : undefined;
         note = parsed.fields.note?.trim() ? parsed.fields.note.trim().slice(0, 500) : undefined;
       } catch (err) {
         if (parsed.file?.tmpPath) {
@@ -816,6 +820,7 @@ export function createApp(options: AppOptions): {
           ...(basedOnDecisions !== undefined ? { basedOnDecisions } : {}),
           ...(tags !== undefined ? { tags } : {}),
           ...(jobId !== undefined ? { jobId } : {}),
+          ...(leaseToken !== undefined ? { leaseToken } : {}),
           ...(note !== undefined ? { note } : {}),
           ...(parsed.file
             ? {

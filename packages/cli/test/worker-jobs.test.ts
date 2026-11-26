@@ -98,9 +98,28 @@ describe('B3 CLI: cdeck job, cdeck media update/prune, cdeck worker + trust (AC7
     expect(claim2.code).toBe(0);
     const c2 = JSON.parse(claim2.stdout) as { leaseToken: string };
 
-    // Update media with --job
-    const updRes = await runCli(
+    // Update media with --job without --lease must fail (H1)
+    const noLeaseUpd = await runCli(
       ['media', 'update', media.id, '--file', v2, '--based-on', d2.id, '--job', created.job.id],
+      { cwd: dir },
+    );
+    expect(noLeaseUpd.code).not.toBe(0);
+
+    // Update media with --job and --lease succeeds
+    const updRes = await runCli(
+      [
+        'media',
+        'update',
+        media.id,
+        '--file',
+        v2,
+        '--based-on',
+        d2.id,
+        '--job',
+        created.job.id,
+        '--lease',
+        c2.leaseToken,
+      ],
       { cwd: dir },
     );
     expect(updRes.code).toBe(0);
@@ -180,6 +199,7 @@ execFileSync(process.execPath, [
   '--file', ${JSON.stringify(outVideo)},
   '--based-on', payload.job.decisionsNow.join(','),
   '--job', payload.job.id,
+  '--lease', process.env.CONTEXTDECK_LEASE_TOKEN,
 ], { cwd: ${JSON.stringify(repo)}, stdio: 'inherit' });
 `,
       'utf8',

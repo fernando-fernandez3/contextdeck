@@ -87,6 +87,7 @@ export interface ArtifactVersionEntry {
   basedOnDecisions: string[];
   filePath?: string;
   createdByJob?: string;
+  createdByClaim?: string;
   note?: string;
 }
 
@@ -190,6 +191,7 @@ export interface RefreshJob {
   decisionsBefore: string[];
   decisionsNow: string[];
   baseVersion: number;
+  inputFilePath?: string;
   status: RefreshJobStatus;
   claimedBy: string | null;
   leaseToken: string | null;
