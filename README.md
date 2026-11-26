@@ -1,42 +1,40 @@
 # ContextDeck
 
-**A local-first, Git-backed shared context board for keeping your human mental model and multiple AI coding agent sessions in sync—across any harness.**
+**A local-first, Git-backed shared context board for keeping a human mental model and multiple AI coding agent sessions in sync across harnesses.**
 
-Working across **Cursor**, **Claude Code**, **Codex**, **Grok**, and custom local skills (`idea-to-video`, quiz generators, architecture scripts) creates two painful failure modes:
-1. **Cross-Session Drift:** A decision reached in one agent thread never propagates to your other chats.
-2. **Mental Model Erosion:** Your own understanding changes over time, while static diagrams, explainer videos, and notes quietly go out of date.
+Working across **Claude Code**, **Codex CLI**, **Cursor**, **Grok**, **Antigravity**, and custom local skills creates two failure modes:
+1. **Cross-session drift:** A decision reached in one agent session never reaches your other live sessions.
+2. **Mental-model erosion:** Decisions evolve while your diagrams, explainer videos, quizzes, and own understanding quietly go out of date.
 
-**ContextDeck** solves both without forcing you out of your favorite tools. It acts as a neutral, Git-backed workspace (`.contextdeck/`) paired with a live local web UI, universal **MCP server** (stdio + Streamable HTTP), **CLI** (`cdeck`), and **1-click Context Packs** for browser-only chats.
+ContextDeck stores your project's living context in plain YAML, Markdown, and JSON files (`.contextdeck/` in-repo or outside the repo via `--global`), paired with a local web UI, universal **MCP server** (stdio and Streamable HTTP), **CLI** (`cdeck`), harness lifecycle hooks, local refresh workers, and 1-click **Context Packs** for browser chats.
 
----
-
-## Key Features
-
-- **5 Built-in Lenses (Pluggable Tabs):**
-  - **Brief:** Living Markdown mental model (`brief.md`), chronological pulse (`events.jsonl`), stale-artifact alerts, and behind-revision session warnings.
-  - **Sessions:** Interactive hierarchical **Session Tree/Graph** linking parent/child and sibling threads across Cursor, Claude Code, Codex, Grok, and skills—with live sync lag badges.
-  - **Architecture & Decisions:** Versioned Decision Ledger (`dec_001` → superseded by `dec_003`) paired with live **Mermaid** diagrams and an embedded **Excalidraw** whiteboard saved directly to Git.
-  - **Tasks:** Drag-and-drop Kanban board (`Backlog` / `In Progress` / `In Review` / `Done`) linked to sessions and decisions.
-  - **Media & Mastery:** Built-in HTTP-Range video player (with chapter markers and Kokoro TTS narration transcripts for `idea-to-video` workflows), an **interactive Quiz Runner** with mastery tracking, and Markdown/HTML/JSON reference docs.
-- **Automatic Staleness & Drift Detection:** When any agent or human records a decision that `supersedes` an older decision ID, ContextDeck automatically flags dependent diagrams, videos, quizzes, and open tasks as **Stale**, and shows active sessions how many revisions behind they are.
-- **Harness-Agnostic Connectivity:**
-  - **MCP (stdio & Streamable HTTP `/mcp`)** for Claude Code, Cursor, Codex, Windsurf, Cline, and Antigravity.
-  - **CLI (`cdeck`) & Local REST/SSE API** for shell scripts and custom skills.
-  - **1-Click Copy Context Pack & Paste Update** for web chats without local tool access (Grok, ChatGPT web, Claude web).
-- **100% Local-First & Git-Friendly:** Plain YAML, Markdown, `.mmd`, `.excalidraw`, `.quiz.json`, and append-only `events.jsonl` files—zero cloud lock-in, zero external database daemons.
+For how ContextDeck compares to existing tools, see [Prior art](./docs/prior-art.md).
 
 ---
 
-## Core Nomenclature
+## Core Concepts
 
 | Term | Meaning |
 | :--- | :--- |
-| **Board** | A topic, feature, or project workspace stored under `.contextdeck/boards/<slug>/`. |
-| **Lens** | A switchable view tab (`Brief`, `Sessions`, `Architecture & Decisions`, `Tasks`, `Media & Mastery`). |
-| **Session** | An external agent chat or skill run (`sess_*`) with optional `parentSessionId` hierarchy and `lastSyncedRevision`. |
+| **Board** | A topic, feature, or project workspace stored under `.contextdeck/boards/<slug>/` (optionally scoped by `paths` globs and `parentBoard`). |
+| **Lens** | A switchable view tab: **Catch up**, **Brief**, **Sessions**, **Architecture & Decisions**, **Tasks**, and **Media & Mastery**. |
+| **Session** | A workspace-scoped external agent chat or skill run (`sess_*`) with optional `parentSessionId` hierarchy and volatile per-board sync cursors. |
 | **Decision** | A versioned choice (`dec_001`) with `status` (`proposed`, `accepted`, `superseded`, `deprecated`) and `supersedes` lineage. |
-| **Artifact** | Any diagram, video, audio clip, quiz, doc, task, or custom asset referencing governing decisions (`basedOnDecisions`). |
-| **Context Pack** | A compact Markdown snapshot of the Board ready to inject into any MCP agent or paste into any web chat. |
+| **Artifact** | A versioned diagram, video/audio explainer, doc, HTML widget, or quiz referencing governing decisions (`basedOnDecisions`). |
+| **Context Pack** | A bounded Markdown snapshot of the Board prioritized for MCP agents, hooks, or pasting into web chats. |
+
+---
+
+## What's in v0.2
+
+- **Human Catch up lens & reader cursors:** Tracks what *you* have and have not seen per reader and per board (`.contextdeck/.runtime/readers/<readerId>.yaml`, gitignored, zero reader noise in `events.jsonl`). Opening the app lands on **Catch up** whenever unseen changes exist, showing changed decisions (`old -> new`), newly stale artifacts, moved tasks, and new sessions, with an unseen count badge in the header.
+- **Confirm vs. Refresh (no silent clearing):** Stale artifacts offer two explicit actions:
+  - **Queue refresh** (1-tap): creates a deduplicated refresh job (`.contextdeck/boards/<slug>/jobs/<id>.yaml`) with atomic claiming, 15-minute lease TTL, and strict version-linked completion.
+  - **Still accurate**: records an auditable confirmation against the latest superseding decision (`confirmations` map) without rewriting `basedOnDecisions`. Confirmations automatically expire and re-stale the artifact if that decision is superseded again. Agent confirmations via MCP always require a `note` and are labeled as agent confirmations.
+- **Versioned artifacts & media pruning:** Diagrams, media, and quizzes track `version` and capped `history` (last 10 versions). Media binaries are stored as immutable `<id>.v<N>.<ext>` files; quiz updates preserve all past human mastery attempts; `cdeck media prune` reclaims old media files while protecting versions referenced by open refresh jobs.
+- **Local refresh workers (`cdeck worker`):** Run user-local video-explainer, quiz, or diagram scripts against queued jobs with explicit `cdeck worker trust` SHA-256 verification and `spawn(..., { shell: false })`. See [Refresh Job Handlers](./docs/handlers.md).
+- **Per-question quiz staleness & mastery trends:** Quiz questions reference `relatedDecisionIds` so only questions affected by a superseded decision are flagged stale, alongside a per-quiz mastery score trend across attempts.
+- **Fast, mobile-ready UI:** Heavy visualizations (React Flow, Mermaid, Excalidraw) are lazy-loaded on demand; all 6 lenses fit a `390px` phone viewport with zero horizontal overflow.
 
 ---
 
@@ -50,113 +48,116 @@ Working across **Cursor**, **Claude Code**, **Codex**, **Grok**, and custom loca
 ```bash
 pnpm install
 pnpm build
+
+# Optional: put `cdeck` and `contextdeck` on your PATH globally
+pnpm --filter @contextdeck/cli link --global
 ```
 
-### Launch with the Interactive Demo Board
+### Initialize & Launch the Demo Board
 ```bash
-node packages/cli/dist/index.js init --demo
-node packages/cli/dist/index.js serve
+cdeck init --demo
+cdeck serve
 ```
 
-Then open **http://127.0.0.1:4310** in your browser!
-- Web UI & REST/SSE API: `http://127.0.0.1:4310`
-- Streamable HTTP MCP Endpoint: `http://127.0.0.1:4310/mcp`
+`cdeck serve` binds to `127.0.0.1:4310` and prints a **single-use launch URL** (`http://127.0.0.1:4310/auth?code=...`, valid for 120 seconds). Open that launch URL in your browser to start an authenticated session. Need a fresh link later? Run:
 
-*(You can also link `cdeck` globally via `pnpm --filter @contextdeck/cli link --global`.)*
+```bash
+cdeck open
+```
 
 ---
 
-## Connecting Any Agent Harness
+## Workspace Storage: In-Repo, Global, and Git Worktrees
 
-All generated project configs (`cdeck setup <target>`) merge idempotently into existing files, never write absolute machine paths (the workspace resolver automatically locates `.contextdeck/`, `.contextdeck.yaml`, and linked git worktrees), and support `--uninstall` to remove only ContextDeck-managed entries. Setup ownership is determined by shape: an entry identical to what `cdeck setup` writes (or a legacy v0.1 `--dir <repo>` MCP entry) is treated as ContextDeck-managed and removed by `--uninstall`, while customized entries (extra fields, custom flags, or other servers/hooks) are left alone.
+- **In-repo (default):** `cdeck init` creates `.contextdeck/` in your repository and adds `.contextdeck/.runtime/`, `.contextdeck/.cache/`, and `.contextdeck/.lock` to `.gitignore`. Entities stay plain YAML/Markdown/JSON so teams can diff and review context in Git.
+- **Global (out-of-repo):** `cdeck init --global <name>` stores the deck under `~/.contextdeck/workspaces/<name>` and writes a tiny `.contextdeck.yaml` pointer in the project root.
+- **Linked git worktrees:** ContextDeck resolves linked git worktrees automatically (pure-filesystem `.git` → `commondir` lookup) so parallel agent worktrees share one board without absolute machine paths in config files.
+- **Multi-board routing:** Declare `paths` globs and optional `parentBoard` in `board.yaml`; hooks route sessions to the most specific matching board. Switch default or per-session boards with:
+  ```bash
+  cdeck board use <slug>
+  cdeck board use <slug> --session <sessionId>
+  ```
 
-> **Team prerequisite:** Committed project hook configs (`.claude/settings.json`, `.codex/hooks.json`, `.cursor/hooks.json`) invoke `cdeck` directly, so `cdeck` must be available on every teammate's `PATH` (a missing binary will surface a hook error in the host harness).
+---
+
+## Connecting Agent Harnesses
+
+All `cdeck setup <target>` commands merge idempotently into existing project files, never write absolute machine paths, and support `--uninstall` to remove only ContextDeck-managed entries.
+
+> **Team prerequisite:** Project hook configs (`.claude/settings.json`, `.codex/hooks.json`, `.cursor/hooks.json`) invoke `cdeck` directly, so `cdeck` must be on `PATH`.
 
 ### Harness Capabilities at a Glance
 
-| Harness | Setup Command | Automatic | Manual / Not Supported |
+| Harness | Setup Command | Automatic | Manual / Notes |
 | :--- | :--- | :--- | :--- |
 | **Claude Code** | `cdeck setup claude-code` | Stdio MCP (`.mcp.json`), startup Context Pack (`SessionStart`), per-prompt drift digest (`UserPromptSubmit`), auto-idle (`SessionEnd`) | Requires `cdeck` on `PATH` |
-| **Codex CLI** | `cdeck setup codex` (+ `agents-md`) | Project MCP (`.codex/config.toml`), startup Context Pack (`SessionStart`), per-prompt drift digest (`UserPromptSubmit`), auto-idle (`SessionEnd`) respecting `additionalContextLimit` | Requires `cdeck` on `PATH`; Codex executes project `.codex/hooks.json` hooks only in a trusted project |
-| **Cursor** | `cdeck setup cursor` | Stdio MCP (`.cursor/mcp.json`), startup Context Pack (`sessionStart`), throttled post-tool drift digest (`postToolUse`, max once per 60s), auto-idle (`sessionEnd`), always-apply rule | **No prompt-submit injection** — Cursor's `beforeSubmitPrompt` hook cannot inject additional context (as of Cursor docs fetched 2026-11-25); mid-session push happens via `postToolUse` |
-| **Grok Bot** | `cdeck setup grok` | Project MCP (`.grok/config.toml`) + `AGENTS.md` protocol | **No lifecycle hooks** — syncs via MCP tools (`board_get_brief`, `decision_record`, etc.) guided by `AGENTS.md` |
+| **Codex CLI** | `cdeck setup codex` (+ `agents-md`) | Project MCP (`.codex/config.toml`), startup Context Pack (`SessionStart`), per-prompt drift digest (`UserPromptSubmit`), auto-idle (`SessionEnd`) | Requires `cdeck` on `PATH`. **Run `/hooks` inside Codex CLI to review and trust `.codex/hooks.json`** (ContextDeck never modifies `~/.codex/config.toml`) |
+| **Cursor** | `cdeck setup cursor` | Stdio MCP (`.cursor/mcp.json`), startup Context Pack (`sessionStart`), throttled post-tool drift digest (`postToolUse`, max once per 60s), auto-idle (`sessionEnd`), always-apply rule | **No prompt-submit injection** — Cursor's `beforeSubmitPrompt` hook cannot inject additional context; mid-session drift push runs via `postToolUse` |
+| **Grok Bot** | `cdeck setup grok` | Project MCP (`.grok/config.toml`) + `AGENTS.md` protocol | **No lifecycle hooks** — syncs via MCP tools guided by `AGENTS.md` |
 | **Gemini / Antigravity** | `cdeck setup antigravity [--apply]` | Stdio MCP (`agy mcp add contextdeck cdeck mcp`) + `AGENTS.md` protocol | **No lifecycle hooks** — syncs via MCP tools guided by `AGENTS.md` |
-| **Web Chats** (Grok Web, ChatGPT, Claude Web) | _(no setup needed)_ | — | **Copy Context Pack** / **Paste Update** in the web UI (or `cdeck brief --pack`) |
+| **Web Chats** (Grok Web, ChatGPT, Claude Web) | _(none)_ | — | Use **Copy Context Pack** and **Paste Update** in the header (or `cdeck brief --pack`) |
 
 ### Claude Code
 ```bash
 cdeck setup claude-code
-# Remove only ContextDeck entries:
 cdeck setup claude-code --uninstall
 ```
-Merges the `contextdeck` stdio server into `.mcp.json` (`cdeck mcp`, no `--dir`) and adds `SessionStart`, `UserPromptSubmit`, and `SessionEnd` hooks into `.claude/settings.json`. Pre-existing hooks and servers are preserved untouched.
+Merges `contextdeck` into `.mcp.json` and adds `SessionStart`, `UserPromptSubmit`, and `SessionEnd` hooks into `.claude/settings.json`.
 
 ### Codex CLI
 ```bash
 cdeck setup codex
 cdeck setup agents-md
-# Remove only ContextDeck entries:
 cdeck setup codex --uninstall
 ```
-Merges `[mcp_servers.contextdeck]` inside `# contextdeck:start` / `# contextdeck:end` markers in `.codex/config.toml` and adds `SessionStart`, `UserPromptSubmit`, and `SessionEnd` hooks into `.codex/hooks.json` (with `additionalContextLimit` on context-emitting events and `timeout: 3` on `SessionEnd`; Codex enables hooks by default, but only runs project `.codex/hooks.json` hooks in a trusted project and requires `cdeck` on every teammate's `PATH`).
+Merges `[mcp_servers.contextdeck]` inside `# contextdeck:start` / `# contextdeck:end` markers in `.codex/config.toml` and writes `SessionStart`, `UserPromptSubmit`, and `SessionEnd` hooks into `.codex/hooks.json`.
+
+> **Important:** After running `cdeck setup codex`, open Codex CLI in the repo and run `/hooks` to review and trust the project hooks. ContextDeck intentionally does not edit your personal `~/.codex/config.toml`.
 
 ### Cursor
 ```bash
 cdeck setup cursor
-# Remove only ContextDeck entries:
 cdeck setup cursor --uninstall
 ```
-Merges `.cursor/mcp.json`, `.cursor/hooks.json` (`version: 1` with `sessionStart`, throttled `postToolUse`, and `sessionEnd`), and `.cursor/rules/contextdeck.mdc`. Because Cursor's `beforeSubmitPrompt` hook cannot inject `additional_context` (as of docs fetched 2026-11-25), live drift digests are injected via `postToolUse` (at most once every 60 seconds per session, never advancing the sync cursor when throttled).
+Merges `.cursor/mcp.json`, `.cursor/hooks.json` (`sessionStart`, throttled `postToolUse`, `sessionEnd`), and `.cursor/rules/contextdeck.mdc`. Because Cursor's `beforeSubmitPrompt` hook cannot inject additional context, live drift digests are delivered via `postToolUse` (at most once every 60 seconds per session).
 
-### Grok Bot
+### Grok Bot, Antigravity, and `AGENTS.md`
 ```bash
 cdeck setup grok
-# Equivalent Grok CLI command:
-grok mcp add --scope project contextdeck -- cdeck mcp
-```
-Merges `[mcp_servers.contextdeck]` into project-scope `.grok/config.toml` and updates `AGENTS.md`. Grok Bot has no lifecycle hooks configured here; it relies on MCP tools and `AGENTS.md`.
-
-### Gemini / Antigravity
-```bash
-# Print the registration command and update AGENTS.md:
-cdeck setup antigravity
-# Or also execute `agy mcp add contextdeck cdeck mcp`:
 cdeck setup antigravity --apply
-```
-Antigravity has no lifecycle hooks; it connects via MCP and `AGENTS.md`. Passing a stable `externalRef` on `session_register` deduplicates repeat calls without creating duplicate session records.
-
-### Universal (`AGENTS.md`)
-```bash
 cdeck setup agents-md
 ```
-Merges a marker-bounded ContextDeck protocol block into `AGENTS.md` instructing agents to reuse hook-injected `sessionId`s (without calling `session_register` again) and record decisions/supersessions via MCP.
 
-### Multi-Board Routing & Switching
-- Sessions are workspace-scoped under `.contextdeck/sessions/<id>.yaml` (metadata only); volatile sync cursors live in gitignored `.contextdeck/.runtime/cursors/<id>.json` so hooks never dirty `git status`.
-- Boards may declare `paths` globs (e.g. `packages/web/**`) and `parentBoard` in `board.yaml`. Hooks automatically route new sessions to the most specific matching board (longest literal prefix, then segment count, then slug).
-- Rebind the workspace default board or a specific session anytime:
-  ```bash
-  cdeck board use <slug>
-  cdeck board use <slug> --session <sessionId>
-  ```
-- In `--global` mode, `cdeck board use <slug>` rewrites the project's `.contextdeck.yaml` pointer (in addition to the global workspace's `workspace.yaml`), which shows up as a working-tree change if `.contextdeck.yaml` is committed; each linked git worktree has its own copy of `.contextdeck.yaml`.
+---
 
-### Grok / ChatGPT Web / Claude Web
-Click **Copy Context Pack** in the top bar and paste it into any browser chat. When the chat reaches new decisions or tasks, copy its fenced JSON update block and click **Paste Update** in ContextDeck.
+## Refresh Jobs & Local Workers
 
-### Custom Skills (`idea-to-video`, Quiz Generators, etc.)
+Queue refreshes from the UI (**Queue refresh**) or CLI:
+
 ```bash
-# Attach a generated Kokoro TTS explainer video with transcript & governing decisions
-cdeck media add "OAuth Flow Walkthrough" \
-  --type video \
-  --file ./out/oauth-explainer.mp4 \
-  --transcript ./out/oauth-script.txt \
-  --based-on dec_002,dec_003 \
-  --tags idea-to-video,kokoro
-
-# Publish a generated interactive quiz JSON file
-cdeck quiz add --file ./out/oauth-quiz.json
+cdeck job create media art_explainer --reason "Updated after dec_003"
+cdeck job list
 ```
+
+To process queued jobs locally with your own scripts or skills (video explainers, quiz generators, diagram pipelines), configure user-local `~/.contextdeck/worker.yaml`, approve it, and start a worker:
+
+```bash
+cdeck worker trust
+cdeck worker --once
+# or poll continuously:
+cdeck worker
+```
+
+See [docs/handlers.md](./docs/handlers.md) for the full worker configuration schema, environment contract, and worked video-explainer and quiz handler examples.
+
+---
+
+## Security Model
+
+- **Loopback by default:** `cdeck serve` binds strictly to `127.0.0.1` and enforces strict `Host` and `Origin` validation (rejecting DNS rebinding and `Origin: null`). LAN/phone access requires explicit `--allow-remote` and `--allowed-hosts <csv>` and prints a plain-HTTP warning.
+- **Cookie + CSRF browser auth, bearer token for API/MCP:** A per-workspace 32-byte random bearer token lives in `<deck>/.runtime/token` (mode `0600`). Browser sessions authenticate via single-use launch URLs (`/auth?code=...`) that set an `HttpOnly; SameSite=Strict` cookie paired with an in-memory CSRF token (`X-CSRF-Token`) — zero auth tokens are ever stored in `localStorage`.
+- **Sandboxed content rendering:** Markdown and Mermaid SVGs are sanitized via DOMPurify; inline HTML artifacts render inside `<iframe sandbox="allow-scripts">` (no `allow-same-origin`) with a strict `default-src 'none'` CSP meta header; direct downloads of HTML/SVG media files are forced to `Content-Disposition: attachment` with `X-Content-Type-Options: nosniff`.
+- **Safe file storage & worker isolation:** Atomic temp-file-and-rename transactions with cross-process locking (`proper-lockfile`), strict slug/ID path containment, streaming byte-capped multipart uploads, and zero server-side command execution (`cdeck worker` runs only user-local, explicitly SHA-256-trusted `argv` handlers with `shell: false`).
 
 ---
 
@@ -164,18 +165,25 @@ cdeck quiz add --file ./out/oauth-quiz.json
 
 | Tool | Purpose |
 | :--- | :--- |
-| `board_list` | List all boards in `.contextdeck/`. |
-| `board_get_brief` | Fetch the living Context Pack (optionally syncing a `sessionId` and returning missed events). |
-| `board_update_brief` | Update `brief.md`. |
-| `board_check_drift` | Inspect stale artifacts and drifted sessions. |
-| `session_register` | Register a session with harness badge and optional `parentSessionId`. |
+| `board_list` | List all boards in the workspace. |
+| `board_get_brief` | Fetch the bounded Context Pack (optionally syncing a `sessionId` and returning missed events). |
+| `board_update_brief` | Update `brief.md` (supports optimistic locking via `baseRevision`). |
+| `board_check_drift` | Inspect stale artifacts and behind-revision sessions. |
+| `session_register` | Register a session with harness badge, optional `externalRef`, and `parentSessionId`. |
 | `session_update` | Update session status, summary, or hierarchy links. |
-| `decision_record` | Record a decision (passing `supersedes` auto-flags dependent artifacts as stale). |
+| `decision_record` | Record a decision (passing `supersedes` automatically flags dependent artifacts as stale). |
 | `task_upsert` | Create or move a Kanban task. |
-| `diagram_upsert` | Create or update a Mermaid or Excalidraw diagram. |
+| `diagram_upsert` | Create or publish a new version of a Mermaid or Excalidraw diagram (supports `jobId` & `note`). |
 | `media_attach` | Attach a video, audio clip, Markdown doc, HTML widget, or custom artifact. |
+| `media_update` | Publish a new immutable version (`<id>.v<N>.<ext>`) of an existing media artifact (supports `jobId` & `note`). |
 | `quiz_create` | Publish an interactive knowledge-check quiz. |
-| `artifact_refresh` | Mark a stale artifact aligned with the latest superseding decisions. |
+| `quiz_update` | Publish a new version of a quiz while preserving past human mastery attempts (supports `jobId` & `note`). |
+| `artifact_confirm` | Record an agent confirmation (requires `note`) that a stale artifact remains accurate against the latest decision. |
+| `job_list` | List refresh jobs (optionally filtered by status). |
+| `job_claim` | Atomically claim a queued refresh job (returns `leaseToken` and 15-minute lease expiry). |
+| `job_renew` | Renew an active job lease using `leaseToken`. |
+| `job_release` | Release a claimed job back to `queued` using `leaseToken`. |
+| `job_complete` | Mark a claimed job `done` (verifying `version > baseVersion` created by `jobId`) or `failed`. |
 
 Resources: `contextdeck://brief` (`text/markdown`), `contextdeck://snapshot` (`application/json`).
 
@@ -185,18 +193,20 @@ Resources: `contextdeck://brief` (`text/markdown`), `contextdeck://snapshot` (`a
 
 ```text
 packages/
-├── core/    # @contextdeck/core   — Git-backed BoardStore, Zod schemas, drift engine, Context Pack
-├── server/  # @contextdeck/server — Hono REST API, SSE live push, Range media streaming, MCP (stdio + HTTP)
-├── cli/     # @contextdeck/cli    — `cdeck` / `contextdeck` CLI + harness setup adapters
-└── web/     # @contextdeck/web    — React 19 + Vite + Tailwind v4 + React Flow + Mermaid + Excalidraw
+├── core/    # @contextdeck/core   — Plain-file BoardStore, Zod schemas, drift/catch-up engine, Context Pack, worker config
+├── server/  # @contextdeck/server — Hono REST/SSE API, Range media streaming, auth/CSP, MCP (stdio + Streamable HTTP)
+├── cli/     # @contextdeck/cli    — `cdeck` / `contextdeck` CLI, harness setup/hooks, local refresh worker
+└── web/     # @contextdeck/web    — React 19 + Vite + Tailwind v4 (lazy React Flow, Mermaid, Excalidraw)
 ```
 
-## Development & Tests
+## Development & Verification
 
 ```bash
-pnpm test       # Run Vitest unit & API/MCP integration tests
-pnpm build      # Build all TypeScript packages & production web UI bundle
-pnpm typecheck  # Strict TypeScript check across all packages
+pnpm typecheck   # Strict TypeScript check across all packages
+pnpm test        # Unit, storage/concurrency, server/MCP, CLI/hook, and web security tests
+pnpm build       # Build all packages and production web UI bundle
+pnpm test:e2e    # Playwright end-to-end smoke, 390px layout, and browser isolation tests
+pnpm pack:check  # Pack core/server/cli tarballs and verify isolated install + `cdeck serve`
 ```
 
 ## License

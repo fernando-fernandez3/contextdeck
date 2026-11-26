@@ -1,6 +1,17 @@
 {
   "name": "@contextdeck/cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "license": "MIT",
+  "description": "ContextDeck CLI (`cdeck` / `contextdeck`) for local shared context boards, harness setup/hooks, MCP stdio, and refresh workers.",
+  "keywords": [
+    "contextdeck",
+    "cli",
+    "mcp",
+    "claude-code",
+    "codex",
+    "cursor",
+    "ai-agents"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -8,8 +19,18 @@
     "contextdeck": "./dist/index.js",
     "cdeck": "./dist/index.js"
   },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json && chmod +x dist/index.js",
+    "prepack": "pnpm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },

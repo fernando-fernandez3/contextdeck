@@ -1,6 +1,15 @@
 {
   "name": "@contextdeck/server",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "license": "MIT",
+  "description": "Local Hono REST/SSE API, Streamable HTTP and stdio MCP server, and bundled Web UI server for ContextDeck.",
+  "keywords": [
+    "contextdeck",
+    "mcp",
+    "hono",
+    "ai-agents",
+    "local-first"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -10,8 +19,19 @@
       "import": "./dist/index.js"
     }
   },
+  "files": [
+    "dist",
+    "web-dist"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepack": "pnpm run build && node ./scripts/copy-web-dist.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },

@@ -1,13 +1,15 @@
 {
   "name": "contextdeck-monorepo",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
+  "license": "MIT",
   "description": "Local-first, Git-backed shared context board for humans and multiple AI coding agent harnesses.",
   "scripts": {
     "build": "pnpm -r --filter ./packages/core --filter ./packages/server --filter ./packages/cli --filter ./packages/web build",
     "build:backend": "pnpm --filter @contextdeck/core build && pnpm --filter @contextdeck/server build && pnpm --filter @contextdeck/cli build",
     "build:web": "pnpm --filter @contextdeck/web build",
     "dev:web": "pnpm --filter @contextdeck/web dev",
+    "pack:check": "node scripts/check-pack.mjs",
     "test": "pnpm build:backend && pnpm -r test",
     "test:e2e": "playwright test --workers=1",
     "typecheck": "pnpm --filter @contextdeck/core build && pnpm --filter @contextdeck/server build && pnpm -r typecheck"
