@@ -5,7 +5,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { ResourceUpdatedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
-import { ContextDeckStore } from '@contextdeck/core';
+import {
+  ContextDeckStore,
+  initGlobalWorkspacePointer,
+  resolveWorkspace,
+  updateGlobalWorkspacePointerBoard,
+} from '@contextdeck/core';
 import { createApp } from '../src/app.js';
 import { createContextDeckMcpServer, attachMcpResourceWatcher } from '../src/mcp.js';
 
@@ -271,6 +276,72 @@ describe('AC5.8 + AC6.1 + D10 MCP live sync, resource subscriptions, and session
       expect(body.result?.capabilities?.resources?.subscribe).not.toBe(true);
     } finally {
       await close();
+    }
+  });
+
+  it('R2-7: long-running global-mode MCP server reflects cdeck board use in board_list while explicit defaultBoard stays pinned', async () => {
+    const base = await makeTempDir('cdeck-r2-7-mcp-');
+    const fakeHome = path.join(base, 'home');
+    const repo = path.join(base, 'repo');
+    await fs.mkdir(repo, { recursive: true });
+    const env = { CONTEXTDECK_HOME: fakeHome };
+
+    await initGlobalWorkspacePointer({
+      projectRoot: repo,
+      workspaceName: 'mcp-r2-7',
+      boardSlug: 'main',
+      env,
+    });
+
+    const resolved = resolveWorkspace({ cwd: repo, env });
+    const store = new ContextDeckStore(resolved);
+    await store.createBoard({ title: 'Main Board', slug: 'main', setAsDefault: true });
+    await store.createBoard({ title: 'Web Board', slug: 'web' });
+
+    const mcpServer = createContextDeckMcpServer(store);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'r2-7-client', version: '0.1.0' });
+
+    // Also create an explicitly pinned MCP server (`cdeck mcp --board main`)
+    const pinnedServer = createContextDeckMcpServer(store, { defaultBoard: 'main' });
+    const [pinnedClientTransport, pinnedServerTransport] = InMemoryTransport.createLinkedPair();
+    const pinnedClient = new Client({ name: 'r2-7-pinned', version: '0.1.0' });
+
+    await Promise.all([
+      mcpServer.connect(serverTransport),
+      client.connect(clientTransport),
+      pinnedServer.connect(pinnedServerTransport),
+      pinnedClient.connect(pinnedClientTransport),
+    ]);
+
+    try {
+      const before = await client.callTool({ name: 'board_list', arguments: {} });
+      const beforeJson = JSON.parse(
+        (before.content as Array<{ text: string }>)[0].text,
+      ) as { defaultBoard: string };
+      expect(beforeJson.defaultBoard).toBe('main');
+
+      // Another process switches default board via `cdeck board use web`
+      const otherStore = new ContextDeckStore(resolveWorkspace({ cwd: repo, env }));
+      await otherStore.setDefaultBoard('web');
+      await updateGlobalWorkspacePointerBoard(resolved.pointerPath!, 'web');
+
+      const after = await client.callTool({ name: 'board_list', arguments: {} });
+      const afterJson = JSON.parse(
+        (after.content as Array<{ text: string }>)[0].text,
+      ) as { defaultBoard: string };
+      expect(afterJson.defaultBoard).toBe('web');
+
+      // Pinned `--board main` server still serves `main` on board_get_brief
+      const pinnedBrief = await pinnedClient.callTool({ name: 'board_get_brief', arguments: {} });
+      expect((pinnedBrief.content as Array<{ text: string }>)[0].text).toContain('Board: `main`');
+    } finally {
+      await Promise.all([
+        client.close(),
+        mcpServer.close(),
+        pinnedClient.close(),
+        pinnedServer.close(),
+      ]);
     }
   });
 });

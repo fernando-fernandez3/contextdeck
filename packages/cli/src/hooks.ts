@@ -448,6 +448,7 @@ export async function runHookCli(
       deckDir: workspace.deckDir,
       projectRoot: workspace.projectRoot,
       defaultBoard: workspace.defaultBoard,
+      pointerPath: workspace.pointerPath,
     });
     if (!store.isInitialized()) {
       return;

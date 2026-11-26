@@ -84,7 +84,7 @@ import {
   canonicalizePath,
   canonicalizePathSync,
 } from './paths.js';
-import { CONTEXTDECK_DIR_NAME } from './workspace.js';
+import { CONTEXTDECK_DIR_NAME, readGlobalWorkspacePointerBoard } from './workspace.js';
 import { routeBoardForCwd, validateBoardParentHierarchy } from './routing.js';
 import { parseFrontmatter, stringifyFrontmatter } from './markdown.js';
 import {
@@ -114,6 +114,8 @@ export interface ContextDeckStoreOptions {
   deckDir: string;
   projectRoot?: string;
   defaultBoard?: string;
+  /** Path to `.contextdeck.yaml` pointer in global mode so default board changes are observed dynamically (R2-7). */
+  pointerPath?: string;
   maxMediaBytes?: number;
 }
 
@@ -294,6 +296,7 @@ export class ContextDeckStore {
   public readonly boardsDir: string;
   public readonly sessionsDir: string;
   public readonly cursorsDir: string;
+  public readonly pointerPath?: string;
   private _defaultBoardHint?: string;
   public readonly maxMediaBytes: number;
 
@@ -314,6 +317,9 @@ export class ContextDeckStore {
         ? canonicalizePathSync(path.resolve(rootDirOrOptions.projectRoot))
         : undefined;
       this.rootDir = this.projectRoot ?? path.dirname(this.deckDir);
+      this.pointerPath = rootDirOrOptions.pointerPath
+        ? canonicalizePathSync(path.resolve(rootDirOrOptions.pointerPath))
+        : undefined;
       this._defaultBoardHint = rootDirOrOptions.defaultBoard
         ? validateBoardSlug(rootDirOrOptions.defaultBoard, 'defaultBoard')
         : undefined;
@@ -735,7 +741,14 @@ export class ContextDeckStore {
   }
 
   public async getDefaultBoardSlug(): Promise<string> {
-    if (this.defaultBoardHint && existsSync(this.boardPath(this.defaultBoardHint))) {
+    if (this.pointerPath) {
+      // R2-7: Re-read global `.contextdeck.yaml` pointer dynamically so long-running
+      // MCP/serve processes immediately observe `cdeck board use <slug>`.
+      const pointerBoard = await readGlobalWorkspacePointerBoard(this.pointerPath);
+      if (pointerBoard && existsSync(this.boardPath(pointerBoard))) {
+        return pointerBoard;
+      }
+    } else if (this.defaultBoardHint && existsSync(this.boardPath(this.defaultBoardHint))) {
       return this.defaultBoardHint;
     }
     const meta = await readYamlStrict<WorkspaceMeta>(this.workspaceMetaPath());

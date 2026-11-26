@@ -68,7 +68,7 @@ Then open **http://127.0.0.1:4310** in your browser!
 
 ## Connecting Any Agent Harness
 
-All generated project configs (`cdeck setup <target>`) merge idempotently into existing files, never write absolute machine paths (the workspace resolver automatically locates `.contextdeck/`, `.contextdeck.yaml`, and linked git worktrees), and support `--uninstall` to remove only ContextDeck-managed entries.
+All generated project configs (`cdeck setup <target>`) merge idempotently into existing files, never write absolute machine paths (the workspace resolver automatically locates `.contextdeck/`, `.contextdeck.yaml`, and linked git worktrees), and support `--uninstall` to remove only ContextDeck-managed entries. Setup ownership is determined by shape: an entry identical to what `cdeck setup` writes (or a legacy v0.1 `--dir <repo>` MCP entry) is treated as ContextDeck-managed and removed by `--uninstall`, while customized entries (extra fields, custom flags, or other servers/hooks) are left alone.
 
 > **Team prerequisite:** Committed project hook configs (`.claude/settings.json`, `.codex/hooks.json`, `.cursor/hooks.json`) invoke `cdeck` directly, so `cdeck` must be available on every teammate's `PATH` (a missing binary will surface a hook error in the host harness).
 
@@ -139,6 +139,7 @@ Merges a marker-bounded ContextDeck protocol block into `AGENTS.md` instructing 
   cdeck board use <slug>
   cdeck board use <slug> --session <sessionId>
   ```
+- In `--global` mode, `cdeck board use <slug>` rewrites the project's `.contextdeck.yaml` pointer (in addition to the global workspace's `workspace.yaml`), which shows up as a working-tree change if `.contextdeck.yaml` is committed; each linked git worktree has its own copy of `.contextdeck.yaml`.
 
 ### Grok / ChatGPT Web / Claude Web
 Click **Copy Context Pack** in the top bar and paste it into any browser chat. When the chat reaches new decisions or tasks, copy its fenced JSON update block and click **Paste Update** in ContextDeck.

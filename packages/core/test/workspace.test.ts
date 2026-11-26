@@ -455,4 +455,46 @@ describe('E4 workspace resolution, worktrees, global pointer, and watcher', () =
       await watcher.close();
     }
   });
+
+  it('R2-7: long-running global-mode store re-reads .contextdeck.yaml pointer dynamically after board use while explicit defaultBoard without pointerPath stays pinned', async () => {
+    const base = await makeTempDir('cdeck-r2-7-');
+    const fakeHome = path.join(base, 'home');
+    const repo = path.join(base, 'repo');
+    await fs.mkdir(repo, { recursive: true });
+    const env = { CONTEXTDECK_HOME: fakeHome };
+
+    await core.initGlobalWorkspacePointer({
+      projectRoot: repo,
+      workspaceName: 'r2-7-ws',
+      boardSlug: 'main',
+      env,
+    });
+
+    const resolved = core.resolveWorkspace({ cwd: repo, env });
+    expect(resolved.mode).toBe('global');
+    expect(resolved.pointerPath).toBeDefined();
+
+    // Long-lived store simulating a running `cdeck mcp` or `cdeck serve`
+    const longLivedStore = new core.ContextDeckStore(resolved);
+    await longLivedStore.createBoard({ title: 'Main', slug: 'main', setAsDefault: true });
+    await longLivedStore.createBoard({ title: 'Web', slug: 'web' });
+    expect(await longLivedStore.getDefaultBoardSlug()).toBe('main');
+
+    // Explicit pinned store (simulating explicit --board override with no pointerPath)
+    const pinnedStore = new core.ContextDeckStore({
+      deckDir: resolved.deckDir,
+      projectRoot: resolved.projectRoot,
+      defaultBoard: 'main',
+    });
+
+    // Separate process / store performs `cdeck board use web`
+    const cliStore = new core.ContextDeckStore(core.resolveWorkspace({ cwd: repo, env }));
+    await cliStore.setDefaultBoard('web');
+    await core.updateGlobalWorkspacePointerBoard(resolved.pointerPath!, 'web');
+
+    // Long-lived global-mode store MUST immediately observe 'web'
+    expect(await longLivedStore.getDefaultBoardSlug()).toBe('web');
+    // Explicit override without pointerPath stays pinned to 'main'
+    expect(await pinnedStore.getDefaultBoardSlug()).toBe('main');
+  });
 });

@@ -65,6 +65,7 @@ function resolveStore(dir?: string): { store: ContextDeckStore; resolved: Resolv
       deckDir: resolved.deckDir,
       projectRoot: resolved.projectRoot,
       defaultBoard: resolved.defaultBoard,
+      pointerPath: resolved.pointerPath,
     }),
     resolved,
   };
@@ -112,6 +113,7 @@ program
         deckDir: resolved.deckDir,
         projectRoot: resolved.projectRoot,
         defaultBoard: resolved.defaultBoard,
+        pointerPath: resolved.pointerPath,
       });
       if (opts.demo) {
         const demoSlug = await seedDemoBoard(store);
@@ -162,11 +164,13 @@ program
   .action(async (opts) => {
     let store: ContextDeckStore;
     let defaultBoard: string | undefined;
+    let pointerPath: string | undefined;
 
     try {
       const { store: resolvedStore, resolved } = resolveStore(opts.dir);
       store = resolvedStore;
       defaultBoard = resolved.defaultBoard;
+      pointerPath = resolved.pointerPath;
     } catch (err) {
       if (opts.demo && err instanceof WorkspaceNotFoundError) {
         const targetDir = opts.dir ? path.resolve(opts.dir) : process.cwd();
@@ -197,6 +201,7 @@ program
       deckDir: store.deckDir,
       projectRoot: store.projectRoot,
       defaultBoard,
+      pointerPath,
       port: Number.parseInt(opts.port, 10),
       host: opts.host,
       allowRemote: Boolean(opts.allowRemote),

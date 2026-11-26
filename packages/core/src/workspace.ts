@@ -456,6 +456,42 @@ export async function initGlobalWorkspacePointer(options: {
 }
 
 /**
+ * Strictly read the `board:` field of a `.contextdeck.yaml` pointer file (R2-7).
+ * Returns `undefined` if the file no longer exists or omits `board:`; throws `CorruptDataError`
+ * if the pointer file is malformed.
+ */
+export async function readGlobalWorkspacePointerBoard(
+  pointerPath: string,
+): Promise<string | undefined> {
+  let raw: string;
+  try {
+    raw = await fs.readFile(pointerPath, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return undefined;
+    }
+    throw err;
+  }
+  let loaded: unknown;
+  try {
+    loaded = yaml.load(raw);
+  } catch (err) {
+    throw new CorruptDataError(
+      `Corrupt ${CONTEXTDECK_POINTER_FILE} at ${pointerPath}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  const parsed = WorkspacePointerSchema.safeParse(loaded);
+  if (!parsed.success) {
+    throw new CorruptDataError(
+      `Invalid ${CONTEXTDECK_POINTER_FILE} at ${pointerPath}: ${parsed.error.message}`,
+    );
+  }
+  return parsed.data.board
+    ? validateBoardSlug(parsed.data.board, 'pointer board slug')
+    : undefined;
+}
+
+/**
  * Atomically update the `board:` field of an existing `.contextdeck.yaml` pointer file
  * while preserving all other keys (H5 / AC6.4).
  */

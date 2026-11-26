@@ -10,6 +10,7 @@ export interface StartServerOptions {
   deckDir?: string;
   projectRoot?: string;
   defaultBoard?: string;
+  pointerPath?: string;
   rootDir?: string;
   port?: number;
   host?: string;
@@ -56,6 +57,7 @@ export async function startServer(options: StartServerOptions): Promise<{
         deckDir: options.deckDir,
         projectRoot: options.projectRoot,
         defaultBoard: options.defaultBoard,
+        pointerPath: options.pointerPath,
         maxMediaBytes: options.maxMediaBytes,
       })
     : new ContextDeckStore(options.rootDir ?? process.cwd());
