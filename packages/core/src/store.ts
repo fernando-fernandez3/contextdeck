@@ -1204,62 +1204,103 @@ export class ContextDeckStore {
     return quizParsed.data;
   }
 
+  private async txnJournalExists(txnPath: string): Promise<boolean> {
+    try {
+      await fs.access(txnPath);
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return false;
+      }
+      throw err;
+    }
+  }
+
+  private async readSnapshotOnce(slug: string): Promise<BoardSnapshot> {
+    const config = await this.readBoardConfig(slug);
+    const briefPath = await this.safeBoardFilePath(slug, 'brief.md');
+    const brief = (await readFileStrict(briefPath)) ?? '';
+
+    const [sessions, decisions, tasks, diagrams, media, quizzes, events] = await Promise.all([
+      this.listSessions(slug),
+      this.listDecisions(slug),
+      this.listTasks(slug),
+      this.listDiagrams(slug),
+      this.listMedia(slug),
+      this.listQuizzes(slug),
+      this.readEvents(slug, config.revision),
+    ]);
+
+    const drift = computeDriftReport({
+      config,
+      sessions,
+      decisions,
+      tasks,
+      diagrams,
+      media,
+      quizzes,
+      events,
+    });
+
+    return {
+      config,
+      brief,
+      sessions,
+      decisions,
+      tasks,
+      diagrams,
+      media,
+      quizzes,
+      events,
+      drift,
+    };
+  }
+
   /**
-   * Consistent snapshot reader (E1 + D1):
-   * reads board.yaml revision first and last; retries up to 3 times if revision changed;
-   * ignores events with revision > config.revision.
+   * Consistent snapshot reader (E1 + D1 + R3-7):
+   * treats any in-flight `.runtime/txn.json` (checked at start and end of each attempt)
+   * or revision mismatch as unstable and retries with short backoff; when retries are
+   * exhausted, acquires the workspace lock (running recovery if needed) and reads once
+   * under the lock. Never returns an unverified snapshot.
    */
   public async getSnapshot(boardSlug?: string): Promise<BoardSnapshot> {
     const slug = await this.resolveBoardSlug(boardSlug);
-    const maxRetries = 3;
+    const txnPath = path.join(this.runtimeDir, TXN_FILENAME);
+    const maxRetries = 4;
 
-    let lastSnapshot: BoardSnapshot | null = null;
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
-      const config = await this.readBoardConfig(slug);
-      const briefPath = await this.safeBoardFilePath(slug, 'brief.md');
-      const brief = (await readFileStrict(briefPath)) ?? '';
+      const txnBefore = await this.txnJournalExists(txnPath);
+      if (txnBefore) {
+        if (attempt < maxRetries) {
+          await new Promise((r) => setTimeout(r, 15 * (attempt + 1)));
+          continue;
+        }
+        break;
+      }
 
-      const [sessions, decisions, tasks, diagrams, media, quizzes, events] = await Promise.all([
-        this.listSessions(slug),
-        this.listDecisions(slug),
-        this.listTasks(slug),
-        this.listDiagrams(slug),
-        this.listMedia(slug),
-        this.listQuizzes(slug),
-        this.readEvents(slug, config.revision),
+      const snapshot = await this.readSnapshotOnce(slug);
+      const [configAfter, txnAfter] = await Promise.all([
+        this.readBoardConfig(slug),
+        this.txnJournalExists(txnPath),
       ]);
 
-      const configAfter = await this.readBoardConfig(slug);
-      const drift = computeDriftReport({
-        config,
-        sessions,
-        decisions,
-        tasks,
-        diagrams,
-        media,
-        quizzes,
-        events,
-      });
+      if (!txnAfter && configAfter.revision === snapshot.config.revision) {
+        return snapshot;
+      }
 
-      lastSnapshot = {
-        config,
-        brief,
-        sessions,
-        decisions,
-        tasks,
-        diagrams,
-        media,
-        quizzes,
-        events,
-        drift,
-      };
-
-      if (configAfter.revision === config.revision) {
-        return lastSnapshot;
+      if (attempt < maxRetries) {
+        await new Promise((r) => setTimeout(r, 15 * (attempt + 1)));
       }
     }
 
-    return lastSnapshot!;
+    return withWorkspaceLock(
+      this.runtimeDir,
+      async (assertActive) => {
+        assertActive();
+        return this.readSnapshotOnce(slug);
+      },
+      this.deckDir,
+    );
   }
 
   // ---------------------------------------------------------------------------

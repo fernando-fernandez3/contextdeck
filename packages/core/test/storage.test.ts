@@ -223,17 +223,33 @@ describe('E1 safe concurrent storage engine', () => {
     ).rejects.toThrow(/fault/i);
     delete process.env.CONTEXTDECK_FAULT;
 
-    // Reader must ignore uncommitted event with revision > config.revision (D1)
-    const midSnap = await store.getSnapshot('main');
-    expect(midSnap.config.revision).toBe(4);
-    expect(midSnap.events.every((e) => e.revision <= 4)).toBe(true);
+    // Raw event reader with maxRevision=4 ignores uncommitted event rev 5 (D1),
+    // while board.yaml is still at rev 4 before recovery runs.
+    expect((await store.readBoardConfig('main')).revision).toBe(4);
+    const cappedEvents = await store.readEvents('main', 4);
+    expect(cappedEvents).toHaveLength(4);
+    expect(cappedEvents.every((e) => e.revision <= 4)).toBe(true);
 
-    // Next write rolls forward WITHOUT duplicating the event
+    // Next write rolls forward WITHOUT duplicating event rev 5
     await store.upsertTask('main', { title: 'Task after after-event fault' });
     const finalSnap = await store.getSnapshot('main');
     expect(finalSnap.config.revision).toBe(6);
     expect(finalSnap.events.map((e) => e.revision)).toEqual([1, 2, 3, 4, 5, 6]);
     expect(new Set(finalSnap.events.map((e) => e.id)).size).toBe(6);
+
+    // And if getSnapshot runs directly while an after-event txn.json is pending (R3-7),
+    // it rolls forward under lock instead of returning a torn old-revision snapshot.
+    process.env.CONTEXTDECK_FAULT = 'after-event';
+    await expect(
+      store.recordDecision('main', { title: 'Fourth Decision' }),
+    ).rejects.toThrow(/fault/i);
+    delete process.env.CONTEXTDECK_FAULT;
+
+    const recoveredSnap = await store.getSnapshot('main');
+    expect(recoveredSnap.config.revision).toBe(7);
+    expect(recoveredSnap.decisions).toHaveLength(4);
+    expect(recoveredSnap.events.map((e) => e.revision)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(new Set(recoveredSnap.events.map((e) => e.id)).size).toBe(7);
   }, FSYNC_TEST_TIMEOUT_MS);
 
   it('aborts mutation without writing when lock is compromised', async () => {
@@ -901,5 +917,77 @@ describe('E1 safe concurrent storage engine', () => {
     const delEvt = events.find((e) => e.kind === 'task.deleted' && e.entityId === 'task_bad');
     expect(delEvt).toBeDefined();
     expect(delEvt?.details).toEqual({ before: null, after: null });
+  }, FSYNC_TEST_TIMEOUT_MS);
+
+  it('R3-7: getSnapshot never pairs an uncommitted renamed brief with the old revision and recovers consistently after retries', async () => {
+    const dir = await makeTempDir('cdeck-r3-7-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main', brief: '# V1\n' });
+
+    // Scenario 1: Deterministic pause between brief.md rename and board.yaml commit
+    let onBriefRenamed!: () => void;
+    const briefRenamed = new Promise<void>((resolve) => {
+      onBriefRenamed = resolve;
+    });
+    let releaseWriter!: () => void;
+    const writerGate = new Promise<void>((resolve) => {
+      releaseWriter = resolve;
+    });
+
+    const origRename = fs.rename.bind(fs);
+    const renameSpy = vi.spyOn(fs, 'rename').mockImplementation(async (oldPath, newPath) => {
+      const result = await origRename(oldPath, newPath);
+      if (String(newPath).endsWith(`${path.sep}brief.md`)) {
+        onBriefRenamed();
+        await writerGate;
+      }
+      return result;
+    });
+
+    try {
+      const writerPromise = store.updateBrief('main', '# V2\n', undefined, { baseRevision: 1 });
+      await briefRenamed;
+
+      // At this exact point: brief.md is already '# V2\n', board.yaml is still rev 1, txn.json exists
+      let settledEarly: core.BoardSnapshot | null = null;
+      const snapPromise = store.getSnapshot('main').then((s) => {
+        settledEarly = s;
+        return s;
+      });
+
+      await new Promise((r) => setTimeout(r, 80));
+      if (settledEarly) {
+        // If it settled while paused, it MUST NOT pair the new brief with old revision 1
+        const s = settledEarly as core.BoardSnapshot;
+        expect(s.brief === '# V2\n' && s.config.revision === 1).toBe(false);
+      }
+
+      releaseWriter();
+      await writerPromise;
+      const snap = await snapPromise;
+      expect(snap.brief === '# V2\n' && snap.config.revision === 1).toBe(false);
+      expect(snap.config.revision).toBe(2);
+      expect(snap.brief).toBe('# V2\n');
+    } finally {
+      renameSpy.mockRestore();
+    }
+
+    // Scenario 2: Crashed writer leaves txn.json + already-renamed brief on disk -> post-retry lock + recovery
+    process.env.CONTEXTDECK_FAULT = 'after-renames';
+    await expect(
+      store.updateBrief('main', '# V3\n', undefined, { baseRevision: 2 }),
+    ).rejects.toThrow(/fault/i);
+    delete process.env.CONTEXTDECK_FAULT;
+
+    const txnPath = path.join(store.runtimeDir, 'txn.json');
+    expect(await fs.stat(txnPath)).toBeTruthy();
+
+    const recoveredSnap = await store.getSnapshot('main');
+    expect(recoveredSnap.config.revision).toBe(3);
+    expect(recoveredSnap.brief).toBe('# V3\n');
+    expect(recoveredSnap.events.some((e) => e.revision === 3 && e.kind === 'brief.updated')).toBe(
+      true,
+    );
+    await expect(fs.stat(txnPath)).rejects.toThrow();
   }, FSYNC_TEST_TIMEOUT_MS);
 });
