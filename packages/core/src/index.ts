@@ -3,6 +3,7 @@ export * from './schemas.js';
 export * from './ids.js';
 export * from './paths.js';
 export * from './workspace.js';
+export * from './txn.js';
 export * from './markdown.js';
 export * from './drift.js';
 export * from './context-pack.js';
