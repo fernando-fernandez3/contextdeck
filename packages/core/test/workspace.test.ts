@@ -254,6 +254,116 @@ describe('E4 workspace resolution, worktrees, global pointer, and watcher', () =
     await expect(fs.stat(pwnedPath)).rejects.toThrow();
   });
 
+  it('R3-1: supports full workflow and resolveWorkspace through a symlinked workspace root and cleans up failed createBoard', async () => {
+    const base = await makeTempDir('cdeck-r3-1-');
+    const realWs = path.join(base, 'real-ws');
+    const symWs = path.join(base, 'sym-ws');
+    await fs.mkdir(realWs, { recursive: true });
+    await fs.symlink(realWs, symWs);
+
+    const store = new core.ContextDeckStore(symWs);
+    await store.createBoard({ title: 'Main', slug: 'main', setAsDefault: true });
+    const task = await store.upsertTask('main', { title: 'Task via symlink' });
+    const dec = await store.recordDecision('main', { title: 'Decision via symlink', summary: 'Works' });
+    const media = await store.addMedia('main', {
+      title: 'Doc via symlink',
+      kind: 'doc',
+      content: 'hello via symlink',
+    });
+    const snap = await store.getSnapshot('main');
+
+    expect(snap.config.slug).toBe('main');
+    expect(snap.tasks.some((t) => t.id === task.id)).toBe(true);
+    expect(snap.decisions.some((d) => d.id === dec.id)).toBe(true);
+    expect(snap.media.some((m) => m.id === media.id)).toBe(true);
+
+    // resolveWorkspace from symlinked root must resolve cleanly and work with ContextDeckStore
+    const resolved = core.resolveWorkspace({ cwd: symWs, env: {} });
+    const resolvedStore = new core.ContextDeckStore(resolved);
+    const snap2 = await resolvedStore.getSnapshot('main');
+    expect(snap2.config.revision).toBe(snap.config.revision);
+
+    // Pre-existing staged upload cleanup on error must not leak .tmp-upload-* on symlinked workspace
+    const { tmpPath } = await store.createUploadTempFilePath('main');
+    await fs.writeFile(tmpPath, 'temp-bytes', 'utf8');
+    await expect(
+      store.addMedia('main', {
+        title: 'Bad URL',
+        kind: 'video',
+        stagedTempPath: tmpPath,
+        externalUrl: 'javascript:alert(1)',
+      }),
+    ).rejects.toThrow();
+    await expect(fs.stat(tmpPath)).rejects.toThrow();
+
+    // Failed createBoard before txn.json commit must not leave empty boards/<slug>/ behind
+    const origOpen = fs.open.bind(fs);
+    let failNextTmp = true;
+    const openSpy = (await import('vitest')).vi
+      .spyOn(fs, 'open')
+      .mockImplementation(async (p, ...rest) => {
+        if (failNextTmp && String(p).includes(`${path.sep}boards${path.sep}failed-board${path.sep}.tmp-`)) {
+          failNextTmp = false;
+          throw new Error('simulated disk error during createBoard staging');
+        }
+        return origOpen(p, ...rest);
+      });
+    try {
+      await expect(
+        store.createBoard({ title: 'Failed Board', slug: 'failed-board' }),
+      ).rejects.toThrow(/simulated disk error/);
+    } finally {
+      openSpy.mockRestore();
+    }
+    await expect(fs.stat(path.join(store.boardsDir, 'failed-board'))).rejects.toThrow();
+    // Retry must succeed without ConflictError
+    const retried = await store.createBoard({ title: 'Failed Board', slug: 'failed-board' });
+    expect(retried.slug).toBe('failed-board');
+  }, 20_000);
+
+  it('R3-2: rejects relative dangling symlink under a symlinked ancestor and rejects symlinked board dirs outside boards/', async () => {
+    const root = await makeTempDir('cdeck-r3-2-');
+    const deck = path.join(root, 'repo', '.contextdeck');
+    const outDir = path.join(root, 'outside', 'dir');
+    await fs.mkdir(path.join(deck, 'boards'), { recursive: true });
+    await fs.mkdir(path.join(deck, '.runtime'), { recursive: true });
+    await fs.mkdir(outDir, { recursive: true });
+    await fs.symlink(outDir, path.join(deck, 'boards', 'evil'));
+    await fs.symlink('../pwned.jsonl', path.join(outDir, 'events.jsonl'));
+
+    const target = path.join(deck, 'boards', 'evil', 'events.jsonl');
+    await expect(core.assertContainedPath(deck, target)).rejects.toBeInstanceOf(core.SecurityError);
+    expect(() => core.assertContainedPathSync(deck, target)).toThrow(core.SecurityError);
+
+    const store = new core.ContextDeckStore({ deckDir: deck, projectRoot: path.join(root, 'repo') });
+    expect(() => store.boardPath('evil')).toThrow(core.SecurityError);
+
+    const txnPath = path.join(deck, '.runtime', 'txn.json');
+    await fs.writeFile(
+      txnPath,
+      JSON.stringify({
+        id: 't_r3_2',
+        boardSlug: 'evil',
+        ops: [],
+        events: [
+          {
+            eventsPath: 'boards/evil/events.jsonl',
+            eventId: 'evt_1',
+            line: '{"id":"evt_1"}\n',
+          },
+        ],
+      }),
+      'utf8',
+    );
+
+    await expect(
+      core.recoverPendingTxn(path.join(deck, '.runtime'), undefined, deck),
+    ).rejects.toBeInstanceOf(core.CorruptDataError);
+    await expect(fs.stat(path.join(deck, 'boards', 'pwned.jsonl'))).rejects.toThrow();
+    await expect(fs.stat(path.join(root, 'outside', 'pwned.jsonl'))).rejects.toThrow();
+    await expect(fs.stat(txnPath)).resolves.toBeTruthy();
+  });
+
   it('watcher ignores .runtime, .lock, and temp files and debounces per board', async () => {
     const base = await makeTempDir();
     const store = new core.ContextDeckStore({

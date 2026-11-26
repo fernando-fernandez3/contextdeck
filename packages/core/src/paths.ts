@@ -37,7 +37,8 @@ export async function canonicalizePath(targetPath: string): Promise<string> {
             throw new SecurityError('Access denied: too many symbolic link hops while resolving path.');
           }
           const linkTarget = await fs.readlink(current);
-          const resolvedLink = path.resolve(path.dirname(current), linkTarget);
+          const realParent = await fs.realpath(path.dirname(current));
+          const resolvedLink = path.resolve(realParent, linkTarget);
           current = tail.length > 0 ? path.join(resolvedLink, ...tail.reverse()) : resolvedLink;
           tail.length = 0;
           continue;
@@ -47,6 +48,9 @@ export async function canonicalizePath(targetPath: string): Promise<string> {
           throw lstatErr;
         }
         const lstatCode = (lstatErr as NodeJS.ErrnoException).code;
+        if (lstatCode === 'ELOOP') {
+          throw new SecurityError('Access denied: symlink loop detected while resolving path.');
+        }
         if (lstatCode !== 'ENOENT' && lstatCode !== 'ENOTDIR') {
           throw lstatErr;
         }
@@ -88,7 +92,8 @@ export function canonicalizePathSync(targetPath: string): string {
             throw new SecurityError('Access denied: too many symbolic link hops while resolving path.');
           }
           const linkTarget = fsSync.readlinkSync(current);
-          const resolvedLink = path.resolve(path.dirname(current), linkTarget);
+          const realParent = fsSync.realpathSync(path.dirname(current));
+          const resolvedLink = path.resolve(realParent, linkTarget);
           current = tail.length > 0 ? path.join(resolvedLink, ...tail.reverse()) : resolvedLink;
           tail.length = 0;
           continue;
@@ -98,6 +103,9 @@ export function canonicalizePathSync(targetPath: string): string {
           throw lstatErr;
         }
         const lstatCode = (lstatErr as NodeJS.ErrnoException).code;
+        if (lstatCode === 'ELOOP') {
+          throw new SecurityError('Access denied: symlink loop detected while resolving path.');
+        }
         if (lstatCode !== 'ENOENT' && lstatCode !== 'ENOTDIR') {
           throw lstatErr;
         }

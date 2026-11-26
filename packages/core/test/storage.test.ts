@@ -364,6 +364,47 @@ describe('E1 safe concurrent storage engine', () => {
     await expect(fs.stat(txnPath)).resolves.toBeTruthy();
   }, FSYNC_TEST_TIMEOUT_MS);
 
+  it('R3-3: rejects txn.json when in-deck symlink aliases another board config and executes zero ops', async () => {
+    const root = await makeTempDir('cdeck-r3-3-');
+    const store = new core.ContextDeckStore(root);
+    await store.createBoard({ title: 'Main', slug: 'main' });
+    await store.createBoard({ title: 'Other', slug: 'other' });
+
+    const otherBoardYaml = path.join(store.boardPath('other'), 'board.yaml');
+    const otherBefore = await fs.readFile(otherBoardYaml, 'utf8');
+
+    // Real in-deck symlink: boards/main/media/art_test.mp4 -> ../../other/board.yaml
+    const aliasLink = path.join(store.boardPath('main'), 'media', 'art_test.mp4');
+    await fs.symlink(path.join('..', '..', 'other', 'board.yaml'), aliasLink);
+
+    // Also include a legitimate task file in op 0 to prove ZERO ops run when op 1 is an alias
+    const legitTask = await store.upsertTask('main', { title: 'Survive rejected txn' });
+    const legitTaskPath = path.join(store.boardPath('main'), 'tasks', `${legitTask.id}.md`);
+
+    const txnPath = path.join(store.runtimeDir, 'txn.json');
+    await fs.writeFile(
+      txnPath,
+      JSON.stringify({
+        id: 'txn_r3_3_alias',
+        boardSlug: 'main',
+        ops: [
+          { kind: 'unlink', finalPath: `boards/main/tasks/${legitTask.id}.md` },
+          { kind: 'unlink', finalPath: 'boards/main/media/art_test.mp4' },
+        ],
+        events: [],
+      }),
+      'utf8',
+    );
+
+    await expect(
+      core.recoverPendingTxn(store.runtimeDir, undefined, store.deckDir),
+    ).rejects.toBeInstanceOf(core.CorruptDataError);
+
+    expect(await fs.readFile(otherBoardYaml, 'utf8')).toBe(otherBefore);
+    expect(await fs.stat(legitTaskPath)).toBeTruthy();
+    expect(await fs.stat(txnPath)).toBeTruthy();
+  }, FSYNC_TEST_TIMEOUT_MS);
+
   it('H1: stores relative paths inside txn.json during faulted writes', async () => {
     const dir = await makeTempDir('cdeck-h1-rel-');
     const store = new core.ContextDeckStore(dir);

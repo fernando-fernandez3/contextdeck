@@ -260,13 +260,11 @@ function isFileSync(p: string): boolean {
   }
 }
 
-function resolveFromStartDir(
-  startDir: string,
+function resolveFromSingleStartDir(
+  absStart: string,
   home: string,
   allowDirectDeckDir: boolean,
 ): ResolvedWorkspace | null {
-  const absStart = path.resolve(startDir);
-
   // 1. Direct explicit .contextdeck dir (only when caller explicitly passed --dir or CONTEXTDECK_DIR)
   if (
     allowDirectDeckDir &&
@@ -274,10 +272,13 @@ function resolveFromStartDir(
     (path.basename(absStart) === CONTEXTDECK_DIR_NAME ||
       (isDirSync(path.join(absStart, 'boards')) && isFileSync(path.join(absStart, 'workspace.yaml'))))
   ) {
+    const canonicalDeckDir = canonicalizePathSync(absStart);
     const projectRoot =
-      path.basename(absStart) === CONTEXTDECK_DIR_NAME ? path.dirname(absStart) : undefined;
+      path.basename(canonicalDeckDir) === CONTEXTDECK_DIR_NAME
+        ? path.dirname(canonicalDeckDir)
+        : undefined;
     return {
-      deckDir: absStart,
+      deckDir: canonicalDeckDir,
       projectRoot,
       mode: 'explicit',
     };
@@ -290,11 +291,11 @@ function resolveFromStartDir(
       const ptr = readPointerFileSync(pointerPath, home);
       return {
         deckDir: ptr.deckDir,
-        projectRoot: dir,
+        projectRoot: canonicalizePathSync(dir),
         defaultBoard: ptr.defaultBoard,
         mode: 'global',
         workspaceName: ptr.workspaceName,
-        pointerPath,
+        pointerPath: canonicalizePathSync(pointerPath),
       };
     }
   }
@@ -311,12 +312,12 @@ function resolveFromStartDir(
         const ptr = readPointerFileSync(pointerPath, home);
         return {
           deckDir: ptr.deckDir,
-          projectRoot: worktreeRoot,
-          mainWorktreeRoot,
+          projectRoot: canonicalizePathSync(worktreeRoot),
+          mainWorktreeRoot: canonicalizePathSync(mainWorktreeRoot),
           defaultBoard: ptr.defaultBoard,
           mode: 'global',
           workspaceName: ptr.workspaceName,
-          pointerPath,
+          pointerPath: canonicalizePathSync(pointerPath),
         };
       }
     }
@@ -326,9 +327,9 @@ function resolveFromStartDir(
       const candidate = path.join(dir, CONTEXTDECK_DIR_NAME);
       if (isDirSync(candidate)) {
         return {
-          deckDir: candidate,
-          projectRoot: worktreeRoot,
-          mainWorktreeRoot: dir,
+          deckDir: canonicalizePathSync(candidate),
+          projectRoot: canonicalizePathSync(worktreeRoot),
+          mainWorktreeRoot: canonicalizePathSync(dir),
           mode: 'in-repo',
         };
       }
@@ -340,13 +341,29 @@ function resolveFromStartDir(
     const candidate = path.join(dir, CONTEXTDECK_DIR_NAME);
     if (isDirSync(candidate)) {
       return {
-        deckDir: candidate,
-        projectRoot: dir,
+        deckDir: canonicalizePathSync(candidate),
+        projectRoot: canonicalizePathSync(dir),
         mode: 'in-repo',
       };
     }
   }
 
+  return null;
+}
+
+function resolveFromStartDir(
+  startDir: string,
+  home: string,
+  allowDirectDeckDir: boolean,
+): ResolvedWorkspace | null {
+  const absStart = path.resolve(startDir);
+  const direct = resolveFromSingleStartDir(absStart, home, allowDirectDeckDir);
+  if (direct) return direct;
+
+  const canonicalStart = canonicalizePathSync(absStart);
+  if (canonicalStart !== absStart) {
+    return resolveFromSingleStartDir(canonicalStart, home, allowDirectDeckDir);
+  }
   return null;
 }
 

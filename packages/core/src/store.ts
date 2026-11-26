@@ -56,6 +56,7 @@ import {
   ConflictError,
   CorruptDataError,
   NotFoundError,
+  SecurityError,
   ValidationError,
 } from './errors.js';
 import {
@@ -67,7 +68,12 @@ import {
   validateEntityId,
   validateHttpUrl,
 } from './ids.js';
-import { assertContainedPath, assertContainedPathSync } from './paths.js';
+import {
+  assertContainedPath,
+  assertContainedPathSync,
+  canonicalizePath,
+  canonicalizePathSync,
+} from './paths.js';
 import { CONTEXTDECK_DIR_NAME } from './workspace.js';
 import { parseFrontmatter, stringifyFrontmatter } from './markdown.js';
 import {
@@ -256,14 +262,15 @@ export class ContextDeckStore {
 
   constructor(rootDirOrOptions: string | ContextDeckStoreOptions) {
     if (typeof rootDirOrOptions === 'string') {
-      this.projectRoot = path.resolve(rootDirOrOptions);
-      this.rootDir = this.projectRoot;
-      this.deckDir = path.join(this.projectRoot, CONTEXTDECK_DIR_NAME);
+      const canonicalRoot = canonicalizePathSync(path.resolve(rootDirOrOptions));
+      this.projectRoot = canonicalRoot;
+      this.rootDir = canonicalRoot;
+      this.deckDir = canonicalizePathSync(path.join(canonicalRoot, CONTEXTDECK_DIR_NAME));
       this.maxMediaBytes = DEFAULT_MAX_MEDIA_BYTES;
     } else {
-      this.deckDir = path.resolve(rootDirOrOptions.deckDir);
+      this.deckDir = canonicalizePathSync(path.resolve(rootDirOrOptions.deckDir));
       this.projectRoot = rootDirOrOptions.projectRoot
-        ? path.resolve(rootDirOrOptions.projectRoot)
+        ? canonicalizePathSync(path.resolve(rootDirOrOptions.projectRoot))
         : undefined;
       this.rootDir = this.projectRoot ?? path.dirname(this.deckDir);
       this.defaultBoardHint = rootDirOrOptions.defaultBoard
@@ -281,10 +288,15 @@ export class ContextDeckStore {
 
   public boardPath(slug: string): string {
     const validSlug = validateBoardSlug(slug);
-    const candidate = path.join(this.boardsDir, validSlug);
-    return assertContainedPathSync(this.boardsDir, candidate, {
+    const canonicalBoardsDir = canonicalizePathSync(this.boardsDir);
+    const candidate = path.join(canonicalBoardsDir, validSlug);
+    const realBoardDir = assertContainedPathSync(canonicalBoardsDir, candidate, {
       label: `board "${validSlug}"`,
     });
+    if (realBoardDir !== path.join(canonicalBoardsDir, validSlug)) {
+      throw new SecurityError(`Access denied: board "${validSlug}" resolves to an aliased directory.`);
+    }
+    return realBoardDir;
   }
 
   private async safeBoardFilePath(slug: string, ...segments: string[]): Promise<string> {
@@ -409,7 +421,6 @@ export class ContextDeckStore {
         throw new ConflictError(`Board "${slug}" already exists.`);
       }
 
-      await this.ensureBoardDirs(slug);
       const now = nowIso();
       const config: BoardConfig = BoardConfigSchema.parse({
         id: shortId('brd'),
@@ -438,7 +449,11 @@ export class ContextDeckStore {
 
       const eventsPath = path.join(dir, 'events.jsonl');
       const stagedTmpPaths: string[] = [];
+      let createdBoardDir = false;
       try {
+        assertActive();
+        createdBoardDir = true;
+        await this.ensureBoardDirs(slug);
         assertActive();
         const stagedResults = await Promise.allSettled([
           writeTempFileFsync(dir, initialBrief),
@@ -487,6 +502,9 @@ export class ContextDeckStore {
       } catch (err) {
         if (!existsSync(path.join(this.runtimeDir, TXN_FILENAME))) {
           await Promise.all(stagedTmpPaths.map((p) => fs.rm(p, { force: true }).catch(() => {})));
+          if (createdBoardDir) {
+            await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+          }
         }
         throw err;
       }
@@ -2212,7 +2230,8 @@ export class ContextDeckStore {
         storedFileName = `${id}${ext}`;
         // Ensure stagedTempPath lives inside mediaDir (same filesystem for atomic rename);
         // once validated, addMedia owns temp cleanup on every path (H2).
-        const verifiedTmp = await assertContainedPath(mediaDir, input.stagedTempPath, {
+        const canonicalStagedTmp = await canonicalizePath(input.stagedTempPath);
+        const verifiedTmp = await assertContainedPath(mediaDir, canonicalStagedTmp, {
           label: 'staged upload file',
         });
         preStagedTmp = verifiedTmp;
@@ -2302,10 +2321,20 @@ export class ContextDeckStore {
           // If an error occurred before mediaDir verification, safely clean up if contained under boardsDir
           const base = path.basename(input.stagedTempPath);
           if (base.startsWith('.tmp-')) {
-            await assertContainedPath(this.boardsDir, input.stagedTempPath, {
-              label: 'staged upload cleanup',
-            })
-              .then((verified) => fs.rm(verified, { force: true }))
+            await Promise.all([
+              canonicalizePath(this.boardsDir),
+              canonicalizePath(input.stagedTempPath),
+            ])
+              .then(([canonicalBoardsDir, canonicalStaged]) =>
+                assertContainedPath(canonicalBoardsDir, canonicalStaged, {
+                  label: 'staged upload cleanup',
+                }),
+              )
+              .then((verified) =>
+                path.basename(verified).startsWith('.tmp-')
+                  ? fs.rm(verified, { force: true })
+                  : undefined,
+              )
               .catch(() => {});
           }
         }

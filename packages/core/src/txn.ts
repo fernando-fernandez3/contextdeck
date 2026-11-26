@@ -7,7 +7,7 @@ import lockfile from 'proper-lockfile';
 import { z } from 'zod';
 import { CorruptDataError, LockCompromisedError, PayloadTooLargeError } from './errors.js';
 import { BOARD_SLUG_REGEX, ENTITY_ID_REGEX } from './ids.js';
-import { assertContainedPath } from './paths.js';
+import { assertContainedPath, canonicalizePath, canonicalizePathSync } from './paths.js';
 
 export const TXN_FILENAME = 'txn.json';
 export const LOCK_SENTINEL_NAME = 'lock';
@@ -307,7 +307,9 @@ const TMP_BASENAME_REGEX = /^\.tmp-[A-Za-z0-9._-]+$/;
 const MEDIA_BLOB_FILENAME_REGEX = /^([A-Za-z0-9][A-Za-z0-9_-]{0,80})(?:\.[a-z0-9]{1,12})?$/;
 
 export function toDeckRelativePath(deckDir: string, targetPath: string): string {
-  const rel = path.relative(path.resolve(deckDir), path.resolve(targetPath));
+  const canonicalDeck = canonicalizePathSync(path.resolve(deckDir));
+  const canonicalTarget = canonicalizePathSync(path.resolve(targetPath));
+  const rel = path.relative(canonicalDeck, canonicalTarget);
   if (!rel || rel === '.' || rel.startsWith('..') || path.isAbsolute(rel)) {
     throw new CorruptDataError(`Transaction path "${targetPath}" is outside deckDir "${deckDir}".`);
   }
@@ -434,35 +436,103 @@ async function validateAndResolveTxnJournal(
   deckDir: string,
   txn: TxnJournal,
 ): Promise<ResolvedTxnJournal> {
-  const resolvedDeckDir = path.resolve(deckDir);
-  if (txn.boardSlug !== undefined && !BOARD_SLUG_REGEX.test(txn.boardSlug)) {
-    throw new CorruptDataError(`Invalid transaction journal boardSlug "${txn.boardSlug}".`);
+  let canonicalDeckDir: string;
+  try {
+    canonicalDeckDir = await canonicalizePath(path.resolve(deckDir));
+  } catch (err) {
+    throw new CorruptDataError(
+      `Invalid transaction journal deckDir "${deckDir}": ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  const canonicalBoardsDir = path.join(canonicalDeckDir, 'boards');
+
+  const checkedBoardSlugs = new Set<string>();
+  const assertBoardDirSafe = async (slug: string, label: string): Promise<void> => {
+    if (!BOARD_SLUG_REGEX.test(slug)) {
+      throw new CorruptDataError(`Invalid transaction journal ${label} board slug "${slug}".`);
+    }
+    if (checkedBoardSlugs.has(slug)) return;
+    const candidateBoardDir = path.join(canonicalBoardsDir, slug);
+    let realBoardDir: string;
+    try {
+      realBoardDir = await assertContainedPath(canonicalBoardsDir, candidateBoardDir, {
+        allowEqual: false,
+        label: `${label} board "${slug}"`,
+      });
+    } catch (err) {
+      throw new CorruptDataError(
+        `Invalid transaction journal ${label} board "${slug}": ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (realBoardDir !== candidateBoardDir) {
+      throw new CorruptDataError(
+        `Invalid transaction journal ${label}: board directory "boards/${slug}" is a symlink alias.`,
+      );
+    }
+    checkedBoardSlugs.add(slug);
+  };
+
+  if (txn.boardSlug !== undefined) {
+    await assertBoardDirSafe(txn.boardSlug, 'boardSlug');
   }
 
   const resolveContained = async (
     rawPath: string,
     label: string,
-  ): Promise<{ segments: string[]; absPath: string }> => {
+  ): Promise<{ segments: string[]; canonicalSegments: string[]; absPath: string }> => {
     const segments = parseStrictRelativeSegments(rawPath, label);
-    const candidate = path.resolve(resolvedDeckDir, ...segments);
+    const candidate = path.resolve(canonicalDeckDir, ...segments);
+    let absPath: string;
     try {
-      const absPath = await assertContainedPath(resolvedDeckDir, candidate, {
+      absPath = await assertContainedPath(canonicalDeckDir, candidate, {
         allowEqual: false,
         label,
       });
-      return { segments, absPath };
     } catch (err) {
       throw new CorruptDataError(
         `Invalid transaction journal ${label} "${rawPath}": ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+    const canonicalRel = path.relative(canonicalDeckDir, absPath);
+    if (
+      !canonicalRel ||
+      canonicalRel === '.' ||
+      canonicalRel.startsWith('..') ||
+      path.isAbsolute(canonicalRel)
+    ) {
+      throw new CorruptDataError(
+        `Invalid transaction journal ${label} "${rawPath}": canonical path escapes deckDir.`,
+      );
+    }
+    const canonicalSegments = canonicalRel.split(path.sep);
+    if (canonicalSegments.join('/') !== segments.join('/')) {
+      throw new CorruptDataError(
+        `Invalid transaction journal ${label} "${rawPath}": canonical target "${canonicalSegments.join('/')}" aliases a different path.`,
+      );
+    }
+    return { segments, canonicalSegments, absPath };
   };
 
   const resolvedOps: ResolvedTxnOp[] = [];
   for (let i = 0; i < txn.ops.length; i += 1) {
     const op = txn.ops[i];
     const finalInfo = await resolveContained(op.finalPath, `ops[${i}].finalPath`);
-    const entityInfo = validateEntitySegments(finalInfo.segments, op.kind, txn.boardSlug);
+    const lexicalInfo = validateEntitySegments(finalInfo.segments, op.kind, txn.boardSlug);
+    await assertBoardDirSafe(lexicalInfo.boardSlug, `ops[${i}].finalPath`);
+    const canonicalInfo = validateEntitySegments(
+      finalInfo.canonicalSegments,
+      op.kind,
+      txn.boardSlug ?? lexicalInfo.boardSlug,
+    );
+    if (
+      canonicalInfo.boardSlug !== lexicalInfo.boardSlug ||
+      canonicalInfo.isMediaBlob !== lexicalInfo.isMediaBlob ||
+      canonicalInfo.mediaId !== lexicalInfo.mediaId
+    ) {
+      throw new CorruptDataError(
+        `Invalid transaction journal ops[${i}].finalPath "${op.finalPath}": canonical target does not match lexical entity.`,
+      );
+    }
 
     if (op.kind === 'unlink') {
       resolvedOps.push({
@@ -472,14 +542,14 @@ async function validateAndResolveTxnJournal(
       });
     } else {
       const tmpInfo = await resolveContained(op.tmpPath, `ops[${i}].tmpPath`);
-      const tmpBase = tmpInfo.segments[tmpInfo.segments.length - 1];
+      const tmpBase = tmpInfo.canonicalSegments[tmpInfo.canonicalSegments.length - 1];
       if (!TMP_BASENAME_REGEX.test(tmpBase)) {
         throw new CorruptDataError(
           `Invalid transaction journal ops[${i}].tmpPath "${op.tmpPath}": temp file must use .tmp- prefix.`,
         );
       }
-      const tmpDirRel = tmpInfo.segments.slice(0, -1).join('/');
-      const finalDirRel = finalInfo.segments.slice(0, -1).join('/');
+      const tmpDirRel = tmpInfo.canonicalSegments.slice(0, -1).join('/');
+      const finalDirRel = finalInfo.canonicalSegments.slice(0, -1).join('/');
       if (tmpDirRel !== finalDirRel || path.dirname(tmpInfo.absPath) !== path.dirname(finalInfo.absPath)) {
         throw new CorruptDataError(
           `Invalid transaction journal ops[${i}]: temp file "${op.tmpPath}" must reside in the same directory as "${op.finalPath}".`,
@@ -491,8 +561,8 @@ async function validateAndResolveTxnJournal(
         rawFinalPath: op.finalPath,
         tmpPath: tmpInfo.absPath,
         finalPath: finalInfo.absPath,
-        isMediaBlob: entityInfo.isMediaBlob,
-        mediaId: entityInfo.mediaId,
+        isMediaBlob: canonicalInfo.isMediaBlob,
+        mediaId: canonicalInfo.mediaId,
       });
     }
   }
@@ -501,21 +571,24 @@ async function validateAndResolveTxnJournal(
   for (let i = 0; i < txn.events.length; i += 1) {
     const ev = txn.events[i];
     const evInfo = await resolveContained(ev.eventsPath, `events[${i}].eventsPath`);
-    if (
-      evInfo.segments.length !== 3 ||
-      evInfo.segments[0] !== 'boards' ||
-      !BOARD_SLUG_REGEX.test(evInfo.segments[1]) ||
-      evInfo.segments[2] !== 'events.jsonl'
-    ) {
-      throw new CorruptDataError(
-        `Invalid transaction journal events[${i}].eventsPath "${ev.eventsPath}": must be boards/<slug>/events.jsonl.`,
-      );
+    for (const segs of [evInfo.segments, evInfo.canonicalSegments]) {
+      if (
+        segs.length !== 3 ||
+        segs[0] !== 'boards' ||
+        !BOARD_SLUG_REGEX.test(segs[1]) ||
+        segs[2] !== 'events.jsonl'
+      ) {
+        throw new CorruptDataError(
+          `Invalid transaction journal events[${i}].eventsPath "${ev.eventsPath}": must be boards/<slug>/events.jsonl.`,
+        );
+      }
+      if (txn.boardSlug && segs[1] !== txn.boardSlug) {
+        throw new CorruptDataError(
+          `Invalid transaction journal events[${i}].eventsPath "${ev.eventsPath}": board slug mismatch.`,
+        );
+      }
     }
-    if (txn.boardSlug && evInfo.segments[1] !== txn.boardSlug) {
-      throw new CorruptDataError(
-        `Invalid transaction journal events[${i}].eventsPath "${ev.eventsPath}": board slug mismatch.`,
-      );
-    }
+    await assertBoardDirSafe(evInfo.canonicalSegments[1], `events[${i}].eventsPath`);
     resolvedEvents.push({
       eventsPath: evInfo.absPath,
       eventId: ev.eventId,
@@ -526,30 +599,33 @@ async function validateAndResolveTxnJournal(
   let resolvedBoardCommit: ResolvedTxnJournal['boardCommit'];
   if (txn.boardCommit) {
     const finalInfo = await resolveContained(txn.boardCommit.finalPath, 'boardCommit.finalPath');
-    if (
-      finalInfo.segments.length !== 3 ||
-      finalInfo.segments[0] !== 'boards' ||
-      !BOARD_SLUG_REGEX.test(finalInfo.segments[1]) ||
-      finalInfo.segments[2] !== 'board.yaml'
-    ) {
-      throw new CorruptDataError(
-        `Invalid transaction journal boardCommit.finalPath "${txn.boardCommit.finalPath}": must be boards/<slug>/board.yaml.`,
-      );
+    for (const segs of [finalInfo.segments, finalInfo.canonicalSegments]) {
+      if (
+        segs.length !== 3 ||
+        segs[0] !== 'boards' ||
+        !BOARD_SLUG_REGEX.test(segs[1]) ||
+        segs[2] !== 'board.yaml'
+      ) {
+        throw new CorruptDataError(
+          `Invalid transaction journal boardCommit.finalPath "${txn.boardCommit.finalPath}": must be boards/<slug>/board.yaml.`,
+        );
+      }
+      if (txn.boardSlug && segs[1] !== txn.boardSlug) {
+        throw new CorruptDataError(
+          `Invalid transaction journal boardCommit.finalPath "${txn.boardCommit.finalPath}": board slug mismatch.`,
+        );
+      }
     }
-    if (txn.boardSlug && finalInfo.segments[1] !== txn.boardSlug) {
-      throw new CorruptDataError(
-        `Invalid transaction journal boardCommit.finalPath "${txn.boardCommit.finalPath}": board slug mismatch.`,
-      );
-    }
+    await assertBoardDirSafe(finalInfo.canonicalSegments[1], 'boardCommit.finalPath');
     const tmpInfo = await resolveContained(txn.boardCommit.tmpPath, 'boardCommit.tmpPath');
-    const tmpBase = tmpInfo.segments[tmpInfo.segments.length - 1];
+    const tmpBase = tmpInfo.canonicalSegments[tmpInfo.canonicalSegments.length - 1];
     if (!TMP_BASENAME_REGEX.test(tmpBase)) {
       throw new CorruptDataError(
         `Invalid transaction journal boardCommit.tmpPath "${txn.boardCommit.tmpPath}": temp file must use .tmp- prefix.`,
       );
     }
-    const tmpDirRel = tmpInfo.segments.slice(0, -1).join('/');
-    const finalDirRel = finalInfo.segments.slice(0, -1).join('/');
+    const tmpDirRel = tmpInfo.canonicalSegments.slice(0, -1).join('/');
+    const finalDirRel = finalInfo.canonicalSegments.slice(0, -1).join('/');
     if (tmpDirRel !== finalDirRel || path.dirname(tmpInfo.absPath) !== path.dirname(finalInfo.absPath)) {
       throw new CorruptDataError(
         `Invalid transaction journal boardCommit: temp file must reside in the same directory as board.yaml.`,
