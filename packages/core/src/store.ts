@@ -717,10 +717,10 @@ export class ContextDeckStore {
     const fromRevision = cursor?.lastReviewedRevision ?? 0;
 
     // H13: Fast short-circuit when already caught up at the board's current revision:
-    // skip events, decisions, tasks, diagrams, media, quizzes, jobs, and per-session drift,
-    // checking ONLY sessions (for hook-created sessions newer than lastReviewedAt).
+    // skip events, decisions, tasks, diagrams, media, quizzes, jobs, session cursors, and drift,
+    // reading ONLY raw session metadata (for hook-created sessions newer than lastReviewedAt).
     if (cursor !== null && fromRevision >= config.revision) {
-      const sessions = await this.listSessions(slug);
+      const sessions = (await this.listAllRawSessions()).filter((s) => s.board === slug);
       return computeCatchUp(
         {
           config,
@@ -740,10 +740,10 @@ export class ContextDeckStore {
     }
 
     // H13: Lightweight delta read — readEventsSince (tail only), loadContent: false,
-    // and computeStaleArtifacts only (no 40x5000 per-session drift).
-    const [events, sessions, decisions, tasks, diagrams, media, quizzes, jobs] = await Promise.all([
+    // raw session metadata (no per-session cursors), and computeStaleArtifacts only (no 40x5000 drift).
+    const [events, rawSessions, decisions, tasks, diagrams, media, quizzes, jobs] = await Promise.all([
       this.readEventsSince(slug, fromRevision, config.revision),
-      this.listSessions(slug),
+      this.listAllRawSessions(),
       this.listDecisions(slug),
       this.listTasks(slug),
       this.listDiagrams(slug, { loadContent: false }),
@@ -751,6 +751,7 @@ export class ContextDeckStore {
       this.listQuizzes(slug),
       this.listJobs(slug),
     ]);
+    const sessions = rawSessions.filter((s) => s.board === slug);
 
     const staleArtifacts = computeStaleArtifacts({
       decisions,
@@ -1868,14 +1869,28 @@ export class ContextDeckStore {
 
     // 1. Workspace-scoped sessions in `<deck>/sessions/*.yaml` (canonical D11 location), read in parallel (H13)
     const canonicalSessionsDir = await this.assertSessionsDirSafe();
-    const wsFiles = await listFilesStrict(canonicalSessionsDir, '.yaml');
+    let wsEntries: Dirent[] = [];
+    try {
+      wsEntries = await fs.readdir(canonicalSessionsDir, { withFileTypes: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw err;
+      }
+    }
+    const wsYamlEntries = wsEntries
+      .filter((e) => e.name.endsWith('.yaml') && !e.name.startsWith('.'))
+      .sort((a, b) => a.name.localeCompare(b.name));
     const wsResults = await Promise.all(
-      wsFiles.map(async (file) => {
-        const filePath = await assertContainedPath(
-          canonicalSessionsDir,
-          path.join(canonicalSessionsDir, file),
-          { label: `session ${file}` },
-        );
+      wsYamlEntries.map(async (entry) => {
+        const candidatePath = path.join(canonicalSessionsDir, entry.name);
+        // Fast path for non-symlink regular files inside already-canonicalized sessions dir;
+        // any symlink or unusual entry still goes through full assertContainedPath!
+        const filePath =
+          entry.isFile() && !entry.isSymbolicLink()
+            ? candidatePath
+            : await assertContainedPath(canonicalSessionsDir, candidatePath, {
+                label: `session ${entry.name}`,
+              });
         try {
           return await readYamlStrict(filePath, LegacySessionFileSchema);
         } catch (err) {

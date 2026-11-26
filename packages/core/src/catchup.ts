@@ -131,7 +131,7 @@ function parseTaskColumn(value: unknown): TaskColumn | null {
 
 export interface CatchUpSourceData {
   config: Pick<BoardConfig, 'revision'>;
-  sessions: Session[];
+  sessions: Array<Pick<Session, 'id' | 'title' | 'harness' | 'createdAt'>>;
   decisions: Decision[];
   tasks: Task[];
   diagrams: Array<Pick<Diagram, 'id' | 'version' | 'boardRevisionAtUpdate'>>;
