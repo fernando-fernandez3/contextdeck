@@ -19,10 +19,12 @@
     "@contextdeck/core": "workspace:*",
     "@hono/node-server": "^1.19.9",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "busboy": "^1.6.0",
     "hono": "^4.13.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
+    "@types/busboy": "^1.5.5",
     "@types/node": "^22.15.0",
     "typescript": "^5.8.3",
     "vitest": "^3.2.4"

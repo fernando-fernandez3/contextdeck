@@ -35,11 +35,29 @@ import {
   type TaskColumn,
   type TaskPriority,
 } from './schemas.js';
-import { nextSequentialId, nowIso, shortId, slugify } from './ids.js';
+import {
+  nextSequentialId,
+  nowIso,
+  shortId,
+  slugify,
+  validateBoardSlug,
+  validateEntityId,
+} from './ids.js';
+import { assertContainedPath, assertContainedPathSync } from './paths.js';
+import { CONTEXTDECK_DIR_NAME } from './workspace.js';
 import { parseFrontmatter, stringifyFrontmatter } from './markdown.js';
 import { computeDriftReport } from './drift.js';
 
-export const CONTEXTDECK_DIR_NAME = '.contextdeck';
+export interface ContextDeckStoreOptions {
+  deckDir: string;
+  projectRoot?: string;
+  defaultBoard?: string;
+}
+
+export interface WatchOptions {
+  scope?: 'all' | 'board-configs';
+  debounceMs?: number;
+}
 
 interface WorkspaceMeta {
   defaultBoard: string;
@@ -80,12 +98,28 @@ async function listFiles(dirPath: string, suffix?: string): Promise<string[]> {
 
 export class ContextDeckStore {
   public readonly rootDir: string;
+  public readonly projectRoot?: string;
   public readonly deckDir: string;
+  public readonly runtimeDir: string;
   public readonly boardsDir: string;
+  public readonly defaultBoardHint?: string;
 
-  constructor(rootDir: string) {
-    this.rootDir = path.resolve(rootDir);
-    this.deckDir = path.join(this.rootDir, CONTEXTDECK_DIR_NAME);
+  constructor(rootDirOrOptions: string | ContextDeckStoreOptions) {
+    if (typeof rootDirOrOptions === 'string') {
+      this.projectRoot = path.resolve(rootDirOrOptions);
+      this.rootDir = this.projectRoot;
+      this.deckDir = path.join(this.projectRoot, CONTEXTDECK_DIR_NAME);
+    } else {
+      this.deckDir = path.resolve(rootDirOrOptions.deckDir);
+      this.projectRoot = rootDirOrOptions.projectRoot
+        ? path.resolve(rootDirOrOptions.projectRoot)
+        : undefined;
+      this.rootDir = this.projectRoot ?? path.dirname(this.deckDir);
+      this.defaultBoardHint = rootDirOrOptions.defaultBoard
+        ? validateBoardSlug(rootDirOrOptions.defaultBoard, 'defaultBoard')
+        : undefined;
+    }
+    this.runtimeDir = path.join(this.deckDir, '.runtime');
     this.boardsDir = path.join(this.deckDir, 'boards');
   }
 
@@ -94,8 +128,19 @@ export class ContextDeckStore {
   }
 
   public boardPath(slug: string): string {
-    const safeSlug = slugify(slug);
-    return path.join(this.boardsDir, safeSlug);
+    const validSlug = validateBoardSlug(slug);
+    const candidate = path.join(this.boardsDir, validSlug);
+    return assertContainedPathSync(this.boardsDir, candidate, {
+      label: `board "${validSlug}"`,
+    });
+  }
+
+  private async safeBoardFilePath(slug: string, ...segments: string[]): Promise<string> {
+    const boardDir = this.boardPath(slug);
+    const target = path.join(boardDir, ...segments);
+    return assertContainedPath(boardDir, target, {
+      label: segments.join('/'),
+    });
   }
 
   private async ensureBoardDirs(slug: string): Promise<string> {
@@ -117,28 +162,35 @@ export class ContextDeckStore {
   }
 
   public async getDefaultBoardSlug(): Promise<string> {
+    if (this.defaultBoardHint && existsSync(this.boardPath(this.defaultBoardHint))) {
+      return this.defaultBoardHint;
+    }
     const meta = await readYamlFile<WorkspaceMeta>(this.workspaceMetaPath());
-    if (meta?.defaultBoard && existsSync(this.boardPath(meta.defaultBoard))) {
-      return meta.defaultBoard;
+    if (meta?.defaultBoard) {
+      const valid = validateBoardSlug(meta.defaultBoard, 'defaultBoard');
+      if (existsSync(this.boardPath(valid))) {
+        return valid;
+      }
     }
     const boards = await this.listBoards();
     if (boards.length > 0) {
       return boards[0].slug;
     }
-    return 'main';
+    return this.defaultBoardHint ?? 'main';
   }
 
   public async setDefaultBoard(slug: string): Promise<void> {
+    const validSlug = validateBoardSlug(slug);
     await ensureDir(this.deckDir);
     await writeYamlFile(this.workspaceMetaPath(), {
-      defaultBoard: slugify(slug),
+      defaultBoard: validSlug,
       updatedAt: nowIso(),
     });
   }
 
   public async resolveBoardSlug(boardSlug?: string): Promise<string> {
-    if (boardSlug && boardSlug.trim()) {
-      return slugify(boardSlug);
+    if (boardSlug !== undefined && boardSlug !== '') {
+      return validateBoardSlug(boardSlug);
     }
     return this.getDefaultBoardSlug();
   }
@@ -580,7 +632,8 @@ export class ContextDeckStore {
     actor: Actor = DEFAULT_ACTOR,
   ): Promise<void> {
     const slug = await this.resolveBoardSlug(boardSlug);
-    const filePath = path.join(this.boardPath(slug), 'sessions', `${sessionId}.yaml`);
+    validateEntityId(sessionId, 'sessionId');
+    const filePath = await this.safeBoardFilePath(slug, 'sessions', `${sessionId}.yaml`);
     await fs.rm(filePath, { force: true });
     const nextCfg = await this.bumpRevision(slug);
     await this.appendEvent(slug, {
@@ -1015,10 +1068,15 @@ export class ContextDeckStore {
     mediaId: string,
   ): Promise<{ absolutePath: string; artifact: MediaArtifact } | null> {
     const slug = await this.resolveBoardSlug(boardSlug);
+    validateEntityId(mediaId, 'mediaId');
     const list = await this.listMedia(slug);
     const artifact = list.find((m) => m.id === mediaId);
     if (!artifact?.filePath) return null;
-    const absolutePath = path.join(this.boardPath(slug), 'media', artifact.filePath);
+    const mediaDir = await this.safeBoardFilePath(slug, 'media');
+    const candidate = path.join(mediaDir, artifact.filePath);
+    const absolutePath = await assertContainedPath(mediaDir, candidate, {
+      label: `media file for "${mediaId}"`,
+    });
     if (!existsSync(absolutePath)) return null;
     return { absolutePath, artifact };
   }
@@ -1307,24 +1365,70 @@ export class ContextDeckStore {
     return { appliedCount, sessionId: activeSessionId, snapshot };
   }
 
-  public watch(onChange: (boardSlug: string | null, changedPath: string) => void): FSWatcher {
-    let timer: NodeJS.Timeout | null = null;
-    const watcher = chokidar.watch(this.deckDir, {
+  public watch(
+    onChange: (boardSlug: string | null, changedPath: string) => void,
+    options: WatchOptions = {},
+  ): FSWatcher {
+    const { scope = 'all', debounceMs = 150 } = options;
+    const timers = new Map<string, NodeJS.Timeout>();
+
+    const isIgnoredPath = (filePath: string): boolean => {
+      const rel = path.relative(this.deckDir, filePath);
+      const segments = rel.split(path.sep);
+      for (const seg of segments) {
+        if (
+          seg === '.runtime' ||
+          seg === '.cache' ||
+          seg.startsWith('.lock') ||
+          seg.includes('.tmp')
+        ) {
+          return true;
+        }
+      }
+      if (scope === 'board-configs') {
+        const boardsRel = path.relative(this.boardsDir, filePath);
+        if (boardsRel.startsWith('..') || path.isAbsolute(boardsRel)) {
+          return filePath !== this.boardsDir && filePath !== this.deckDir;
+        }
+        const parts = boardsRel.split(path.sep).filter(Boolean);
+        if (parts.length === 1) return false; // board directory itself
+        if (parts.length === 2 && parts[1] === 'board.yaml') return false;
+        if (parts.length > 0) return true;
+      }
+      return false;
+    };
+
+    const watchRoot = scope === 'board-configs' ? this.boardsDir : this.deckDir;
+    const watcher = chokidar.watch(watchRoot, {
       ignoreInitial: true,
-      ignored: /(^|[/\\])\.cache([/\\]|$)/,
+      depth: scope === 'board-configs' ? 2 : undefined,
+      ignored: isIgnoredPath,
     });
 
     const trigger = (filePath: string) => {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(() => {
-        const rel = path.relative(this.boardsDir, filePath);
-        const parts = rel.split(path.sep);
-        const slug = parts.length > 0 && !parts[0].startsWith('..') ? parts[0] : null;
-        onChange(slug, filePath);
-      }, 150);
+      if (isIgnoredPath(filePath)) return;
+      const rel = path.relative(this.boardsDir, filePath);
+      const parts = rel.split(path.sep);
+      const slug = parts.length > 0 && parts[0] && !parts[0].startsWith('..') ? parts[0] : null;
+      const key = slug ?? '__workspace__';
+      const existing = timers.get(key);
+      if (existing) clearTimeout(existing);
+      timers.set(
+        key,
+        setTimeout(() => {
+          timers.delete(key);
+          onChange(slug, filePath);
+        }, debounceMs),
+      );
     };
 
     watcher.on('add', trigger).on('change', trigger).on('unlink', trigger);
+    const origClose = watcher.close.bind(watcher);
+    watcher.close = async () => {
+      for (const t of timers.values()) clearTimeout(t);
+      timers.clear();
+      await origClose();
+    };
     return watcher;
   }
 }
