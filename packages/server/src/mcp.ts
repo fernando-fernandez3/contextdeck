@@ -268,12 +268,23 @@ export function createContextDeckMcpServer(
         .strict(),
     },
     async ({ board, ...input }) => {
-      const slug = await resolveSlug(board);
+      // H9: When board is omitted and an existing session matches externalRef or id, keep existing.board
+      let targetBoard = board;
+      if (targetBoard === undefined) {
+        if (input.externalRef) {
+          const existing = await store.findSessionByExternalRef(input.externalRef);
+          if (existing?.board) targetBoard = existing.board;
+        } else if (input.id) {
+          const existing = await store.getSession(input.id);
+          if (existing?.board) targetBoard = existing.board;
+        }
+      }
+      const slug = await resolveSlug(targetBoard);
       const session = await store.registerSession(slug, input, {
         type: 'agent',
         harness: input.harness,
       });
-      onMutate?.(slug);
+      onMutate?.(session.board ?? slug);
       return {
         content: [{ type: 'text', text: JSON.stringify(session, null, 2) }],
       };

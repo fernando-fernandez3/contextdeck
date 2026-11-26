@@ -919,4 +919,67 @@ describe('AC5.1-AC5.4 + AC5.9 + D11/D12/D14 cdeck hook contract fixtures and cro
     expect(parsedSlow.hookSpecificOutput.hookEventName).toBe('SessionStart');
     expect(parsedSlow.hookSpecificOutput.additionalContext).toContain('H1 SessionStart Decision');
   });
+
+  it('H11: activity via UserPromptSubmit after SessionEnd restores session status from idle to active and restores drift reporting', async () => {
+    const repo = await makeTempDir('cdeck-h11-');
+    const store = new ContextDeckStore(repo);
+    await store.createBoard({ title: 'Reactivate Board', slug: 'main' });
+
+    // SessionStart -> active
+    const startRes = await runCliWithStdin(['hook', 'claude-code', 'SessionStart'], {
+      cwd: repo,
+      stdin: JSON.stringify({
+        session_id: 'h11-sess',
+        cwd: repo,
+        hook_event_name: 'SessionStart',
+        source: 'startup',
+      }),
+    });
+    expect(startRes.code).toBe(0);
+    const sess = await store.findSessionByExternalRef('claude-code:h11-sess');
+    expect(sess?.status).toBe('active');
+
+    // SessionEnd -> idle
+    const endRes = await runCliWithStdin(['hook', 'claude-code', 'SessionEnd'], {
+      cwd: repo,
+      stdin: JSON.stringify({
+        session_id: 'h11-sess',
+        cwd: repo,
+        hook_event_name: 'SessionEnd',
+        reason: 'other',
+      }),
+    });
+    expect(endRes.code).toBe(0);
+    expect((await store.findSessionByExternalRef('claude-code:h11-sess'))?.status).toBe('idle');
+
+    // Another session records decision 1 -> UserPromptSubmit delivers digest and MUST reactivate status -> active
+    await store.recordDecision(
+      'main',
+      { title: 'H11 Decision 1' },
+      { type: 'agent', sessionId: 'sess_other' },
+    );
+    const promptRes = await runCliWithStdin(['hook', 'claude-code', 'UserPromptSubmit'], {
+      cwd: repo,
+      stdin: JSON.stringify({
+        session_id: 'h11-sess',
+        cwd: repo,
+        hook_event_name: 'UserPromptSubmit',
+        prompt: 'back from idle',
+      }),
+    });
+    expect(promptRes.code).toBe(0);
+    expect(JSON.parse(promptRes.stdout).hookSpecificOutput.additionalContext).toContain(
+      'H11 Decision 1',
+    );
+    expect((await store.findSessionByExternalRef('claude-code:h11-sess'))?.status).toBe('active');
+
+    // Record decision 2 -> drift report MUST include this reactivated session
+    await store.recordDecision(
+      'main',
+      { title: 'H11 Decision 2' },
+      { type: 'agent', sessionId: 'sess_other' },
+    );
+    const snap = await store.getSnapshot('main');
+    expect(snap.drift.driftedSessions.some((d) => d.sessionId === sess!.id)).toBe(true);
+  });
 });

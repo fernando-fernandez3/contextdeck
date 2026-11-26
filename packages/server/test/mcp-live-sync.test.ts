@@ -117,6 +117,22 @@ describe('AC5.8 + AC6.1 + D10 MCP live sync, resource subscriptions, and session
       const sess2 = JSON.parse((reg2.content as Array<{ text: string }>)[0].text) as { id: string };
       expect(sess2.id).toBe(sess1.id);
 
+      // H9: Repeating session_register with same externalRef and OMITTED board must keep existing 'frontend' binding (not rebind to 'main')
+      const reg3 = await client.callTool({
+        name: 'session_register',
+        arguments: {
+          title: 'Frontend Agent Resumed',
+          harness: 'antigravity',
+          externalRef: 'antigravity:conv-1',
+        },
+      });
+      const sess3 = JSON.parse((reg3.content as Array<{ text: string }>)[0].text) as {
+        id: string;
+        board: string;
+      };
+      expect(sess3.id).toBe(sess1.id);
+      expect(sess3.board).toBe('frontend');
+
       // Call board_get_brief with sessionId and NO board -> must return Frontend board!
       const briefRes = await client.callTool({
         name: 'board_get_brief',

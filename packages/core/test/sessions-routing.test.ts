@@ -216,6 +216,211 @@ describe('D11 workspace-scoped sessions, runtime cursors, externalRef dedupe, an
     // Rebinding to a non-existent board throws NotFoundError
     await expect(store.rebindSession(sess.id, 'nonexistent')).rejects.toThrow(core.NotFoundError);
   });
+
+  it('H3: legacy session migration fails closed on colliding IDs preserving both originals, and dedupes identical duplicates', async () => {
+    const dir = await makeTempDir('cdeck-h3-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Board A', slug: 'board-a' });
+    await store.createBoard({ title: 'Board B', slug: 'board-b' });
+
+    const legDirA = path.join(store.boardPath('board-a'), 'sessions');
+    const legDirB = path.join(store.boardPath('board-b'), 'sessions');
+    await fs.mkdir(legDirA, { recursive: true });
+    await fs.mkdir(legDirB, { recursive: true });
+
+    const now = new Date().toISOString();
+    const legA = path.join(legDirA, 'sess_shared.yaml');
+    const legB = path.join(legDirB, 'sess_shared.yaml');
+    const legNonConflict = path.join(legDirA, 'sess_unique.yaml');
+
+    await fs.writeFile(
+      legA,
+      yaml.dump({
+        id: 'sess_shared',
+        title: 'Session on A',
+        harness: 'codex',
+        parentSessionId: null,
+        relatedSessionIds: [],
+        status: 'active',
+        summary: 'Metadata A',
+        focusFiles: ['a.ts'],
+        lastSyncedRevision: 1,
+        createdAt: now,
+        updatedAt: now,
+      }),
+      'utf8',
+    );
+    await fs.writeFile(
+      legB,
+      yaml.dump({
+        id: 'sess_shared',
+        title: 'Session on B',
+        harness: 'cursor',
+        parentSessionId: null,
+        relatedSessionIds: [],
+        status: 'active',
+        summary: 'Metadata B',
+        focusFiles: ['b.ts'],
+        lastSyncedRevision: 2,
+        createdAt: now,
+        updatedAt: now,
+      }),
+      'utf8',
+    );
+    await fs.writeFile(
+      legNonConflict,
+      yaml.dump({
+        id: 'sess_unique',
+        title: 'Non-conflicting session',
+        harness: 'claude-code',
+        parentSessionId: null,
+        relatedSessionIds: [],
+        status: 'active',
+        summary: 'Should still migrate',
+        focusFiles: [],
+        lastSyncedRevision: 1,
+        createdAt: now,
+        updatedAt: now,
+      }),
+      'utf8',
+    );
+
+    // Colliding IDs must fail closed with CorruptDataError naming both paths, keeping BOTH originals intact
+    let caughtErr: unknown;
+    try {
+      await store.recordDecision('board-a', { title: 'Trigger migration' });
+    } catch (err) {
+      caughtErr = err;
+    }
+    expect(caughtErr).toBeInstanceOf(core.CorruptDataError);
+    expect((caughtErr as Error).message).toContain(legA);
+    expect((caughtErr as Error).message).toContain(legB);
+    await expect(fs.stat(legA)).resolves.toBeDefined();
+    await expect(fs.stat(legB)).resolves.toBeDefined();
+    expect(await fs.readFile(legA, 'utf8')).toContain('Metadata A');
+    expect(await fs.readFile(legB, 'utf8')).toContain('Metadata B');
+    // Non-conflicting session still migrated cleanly
+    await expect(fs.stat(path.join(store.sessionsDir, 'sess_unique.yaml'))).resolves.toBeDefined();
+    await expect(fs.stat(legNonConflict)).rejects.toThrow();
+
+    // Separate workspace: identical duplicates (same id, board, content) -> deduped cleanly, both legacy files removed
+    const dir2 = await makeTempDir('cdeck-h3-dup-');
+    const store2 = new core.ContextDeckStore(dir2);
+    await store2.createBoard({ title: 'Board A', slug: 'board-a' });
+    await store2.createBoard({ title: 'Board B', slug: 'board-b' });
+    const dupDirA = path.join(store2.boardPath('board-a'), 'sessions');
+    const dupDirB = path.join(store2.boardPath('board-b'), 'sessions');
+    await fs.mkdir(dupDirA, { recursive: true });
+    await fs.mkdir(dupDirB, { recursive: true });
+    const identicalYaml = yaml.dump({
+      id: 'sess_identical',
+      title: 'Same Session',
+      harness: 'codex',
+      board: 'board-a',
+      parentSessionId: null,
+      relatedSessionIds: [],
+      status: 'active',
+      summary: 'Identical metadata',
+      focusFiles: ['x.ts'],
+      lastSyncedRevision: 1,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const dupA = path.join(dupDirA, 'sess_identical.yaml');
+    const dupB = path.join(dupDirB, 'sess_identical.yaml');
+    await fs.writeFile(dupA, identicalYaml, 'utf8');
+    await fs.writeFile(dupB, identicalYaml, 'utf8');
+
+    await store2.recordDecision('board-a', { title: 'Trigger identical dedupe' });
+    await expect(fs.stat(dupA)).rejects.toThrow();
+    await expect(fs.stat(dupB)).rejects.toThrow();
+    const migrated = await store2.getSession('sess_identical');
+    expect(migrated?.title).toBe('Same Session');
+    expect(migrated?.board).toBe('board-a');
+  });
+
+  it('H12: ignores stray non-slug dirs under boards/ and removes empty legacy sessions/ dirs after migration', async () => {
+    const dir = await makeTempDir('cdeck-h12-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main' });
+
+    // Create stray non-slug dir `boards/Backup/sessions/x.yaml` AND a valid legacy session under main
+    const strayDir = path.join(store.boardsDir, 'Backup', 'sessions');
+    await fs.mkdir(strayDir, { recursive: true });
+    await fs.writeFile(path.join(strayDir, 'x.yaml'), 'not-even: relevant\n', 'utf8');
+
+    const mainLegDir = path.join(store.boardPath('main'), 'sessions');
+    await fs.mkdir(mainLegDir, { recursive: true });
+    const now = new Date().toISOString();
+    await fs.writeFile(
+      path.join(mainLegDir, 'sess_leg1.yaml'),
+      yaml.dump({
+        id: 'sess_leg1',
+        title: 'Legacy 1',
+        harness: 'claude-code',
+        parentSessionId: null,
+        relatedSessionIds: [],
+        status: 'active',
+        summary: '',
+        focusFiles: [],
+        lastSyncedRevision: 1,
+        createdAt: now,
+        updatedAt: now,
+      }),
+      'utf8',
+    );
+
+    // Writes and reads on main must NOT be wedged by `boards/Backup/`
+    const dec = await store.recordDecision('main', { title: 'Works despite stray Backup dir' });
+    expect(dec.title).toBe('Works despite stray Backup dir');
+    expect((await store.listBoards()).map((b) => b.slug)).toEqual(['main']);
+
+    // Empty legacy `boards/main/sessions/` directory must be cleaned up after migration
+    await expect(fs.stat(mainLegDir)).rejects.toThrow();
+    expect((await store.getSession('sess_leg1'))?.title).toBe('Legacy 1');
+  });
+
+  it('H6: rejects symlinked .runtime/cursors directory and aliased cursor files with CorruptDataError without touching outside files', async () => {
+    const dir = await makeTempDir('cdeck-h6-');
+    const outsideDir = await makeTempDir('cdeck-h6-outside-');
+    const outsideSentinel = path.join(outsideDir, 'sess_victim.json');
+    await fs.writeFile(outsideSentinel, '{"untouched":true}\n', 'utf8');
+
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main' });
+
+    // Replace .contextdeck/.runtime/cursors with a real symlink to outsideDir
+    await fs.mkdir(store.runtimeDir, { recursive: true });
+    await fs.rm(store.cursorsDir, { recursive: true, force: true });
+    await fs.symlink(outsideDir, store.cursorsDir);
+
+    await expect(store.readSessionCursor('sess_victim')).rejects.toThrow(core.CorruptDataError);
+    await expect(
+      store.writeSessionCursor({
+        sessionId: 'sess_victim',
+        syncedRevisions: { main: 1 },
+        lastActiveAt: new Date().toISOString(),
+      }),
+    ).rejects.toThrow(core.CorruptDataError);
+
+    // Outside file must remain completely untouched
+    expect(await fs.readFile(outsideSentinel, 'utf8')).toBe('{"untouched":true}\n');
+
+    // Also test an individual symlinked cursor file inside a legitimate cursors dir
+    await fs.rm(store.cursorsDir, { force: true });
+    await fs.mkdir(store.cursorsDir, { recursive: true });
+    await fs.symlink(outsideSentinel, path.join(store.cursorsDir, 'sess_victim.json'));
+
+    await expect(store.readSessionCursor('sess_victim')).rejects.toThrow(core.CorruptDataError);
+    await expect(
+      store.writeSessionCursor({
+        sessionId: 'sess_victim',
+        syncedRevisions: { main: 2 },
+        lastActiveAt: new Date().toISOString(),
+      }),
+    ).rejects.toThrow(core.CorruptDataError);
+    expect(await fs.readFile(outsideSentinel, 'utf8')).toBe('{"untouched":true}\n');
+  });
 });
 
 describe('E6 + D15 board path routing and parentBoard hierarchy', () => {
