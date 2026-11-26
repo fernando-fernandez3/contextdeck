@@ -228,4 +228,92 @@ describe('@contextdeck/cli B1 commands', () => {
       await srv.close();
     }
   });
+
+  it('AC5.8: cdeck mcp stdio resolves workspace via cwd (no --dir), advertises resources.subscribe, and sends notifications/resources/updated on board changes', async () => {
+    const repo = await makeTempDir('cdeck-mcp-stdio-');
+    expect((await runCli(['init', '--title', 'Stdio MCP', '--slug', 'main'], { cwd: repo })).code).toBe(
+      0,
+    );
+
+    const child = spawn(process.execPath, [CLI_BIN, 'mcp'], {
+      cwd: repo,
+      env: { ...process.env, CONTEXTDECK_DIR: undefined, CLAUDE_PROJECT_DIR: undefined },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    const messages: Array<Record<string, unknown>> = [];
+    let buffer = '';
+    child.stdout.on('data', (chunk) => {
+      buffer += String(chunk);
+      let idx: number;
+      while ((idx = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        if (line) {
+          try {
+            messages.push(JSON.parse(line) as Record<string, unknown>);
+          } catch {
+            // ignore non-JSON
+          }
+        }
+      }
+    });
+
+    const waitForMsg = async (
+      pred: (m: Record<string, unknown>) => boolean,
+      timeoutMs = 3000,
+    ): Promise<Record<string, unknown>> => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const found = messages.find(pred);
+        if (found) return found;
+        await new Promise((r) => setTimeout(r, 30));
+      }
+      throw new Error(`Timed out waiting for MCP message. Saw: ${JSON.stringify(messages)}`);
+    };
+
+    try {
+      child.stdin.write(
+        `${JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: {
+            protocolVersion: '2025-03-26',
+            capabilities: {},
+            clientInfo: { name: 'cli-test', version: '0.1.0' },
+          },
+        })}\n`,
+      );
+      const initResp = await waitForMsg((m) => m.id === 1);
+      const result = initResp.result as { capabilities?: { resources?: { subscribe?: boolean } } };
+      expect(result.capabilities?.resources?.subscribe).toBe(true);
+
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
+      child.stdin.write(
+        `${JSON.stringify({
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'resources/subscribe',
+          params: { uri: 'contextdeck://brief' },
+        })}\n`,
+      );
+      await waitForMsg((m) => m.id === 2);
+
+      // Give watcher a moment to be ready, then mutate via a separate CLI process
+      await new Promise((r) => setTimeout(r, 250));
+      expect((await runCli(['decision', 'add', 'Stdio Watch Decision'], { cwd: repo })).code).toBe(0);
+
+      const notif = await waitForMsg(
+        (m) =>
+          m.method === 'notifications/resources/updated' &&
+          (m.params as { uri?: string } | undefined)?.uri === 'contextdeck://brief',
+        3000,
+      );
+      expect(notif).toBeDefined();
+    } finally {
+      child.stdin.end();
+      child.kill('SIGTERM');
+    }
+  });
 });

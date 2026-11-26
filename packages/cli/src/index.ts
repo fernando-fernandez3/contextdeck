@@ -20,7 +20,7 @@ import {
   type TaskPriority,
 } from '@contextdeck/core';
 import { runHookCli } from './hooks.js';
-import { setupHarness, type HarnessTarget } from './setup.js';
+import { HARNESS_TARGETS, setupHarness, type HarnessTarget } from './setup.js';
 
 // Fast-path hook execution: avoids Commander error output and lazy-loads server deps,
 // guaranteeing silent exit 0 on unknown harness/event or any runtime failure (C5, D12).
@@ -604,19 +604,27 @@ quizCmd
 // Setup harness adapters
 program
   .command('setup <harness>')
-  .description('Configure harness integration (claude-code | cursor | codex | agents-md)')
-  .option('-d, --dir <path>', 'Workspace directory')
-  .option('--cli <cmd>', 'CLI command name for MCP config', 'cdeck')
+  .description(
+    'Configure or remove harness integration (claude-code | cursor | codex | grok | antigravity | agents-md)',
+  )
+  .option('-d, --dir <path>', 'Project root directory')
+  .option('--uninstall', 'Remove only ContextDeck-managed entries from target config files', false)
+  .option('--apply', 'Execute external CLI registration commands (used by antigravity)', false)
   .action(async (harness: string, opts) => {
-    const valid: HarnessTarget[] = ['claude-code', 'cursor', 'codex', 'agents-md'];
-    if (!valid.includes(harness as HarnessTarget)) {
-      console.error(`Unknown harness "${harness}". Choose one of: ${valid.join(', ')}`);
+    if (!HARNESS_TARGETS.includes(harness as HarnessTarget)) {
+      console.error(
+        `Unknown harness "${harness}". Choose one of: ${HARNESS_TARGETS.join(', ')}`,
+      );
       process.exit(1);
     }
     const rootDir = opts.dir ? path.resolve(opts.dir) : process.cwd();
-    const res = await setupHarness(rootDir, harness as HarnessTarget, { cliCommand: opts.cli });
-    console.log(`Configured ${harness}:`);
+    const res = await setupHarness(rootDir, harness as HarnessTarget, {
+      uninstall: Boolean(opts.uninstall),
+      apply: Boolean(opts.apply),
+    });
+    console.log(`${opts.uninstall ? 'Uninstalled' : 'Configured'} ${harness}:`);
     for (const f of res.filesWritten) console.log(`  wrote ${f}`);
+    for (const f of res.filesRemoved) console.log(`  removed ${f}`);
     for (const n of res.notes) console.log(`  note: ${n}`);
   });
 

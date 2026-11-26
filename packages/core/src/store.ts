@@ -2736,35 +2736,40 @@ export class ContextDeckStore {
     );
     if (fastMatch) {
       const boardSlug = fastMatch.board;
-      const [config, cursor] = await Promise.all([
-        this.readBoardConfig(boardSlug),
-        this.readSessionCursor(fastMatch.id),
-      ]);
-      const lastSynced =
-        cursor?.syncedRevisions[boardSlug] ?? fastMatch.lastSyncedRevision ?? 0;
-
-      if (lastSynced >= config.revision) {
-        return { action: 'noop' };
+      let config: BoardConfig | null = null;
+      try {
+        config = await this.readBoardConfig(boardSlug);
+      } catch (err) {
+        if (!(err instanceof NotFoundError)) throw err;
       }
+      if (config) {
+        const cursor = await this.readSessionCursor(fastMatch.id);
+        const lastSynced =
+          cursor?.syncedRevisions[boardSlug] ?? fastMatch.lastSyncedRevision ?? 0;
 
-      const tailEvents = await this.readEventsSince(boardSlug, lastSynced, config.revision);
-      const fastDigest = buildSessionDriftDigest({
-        sessionId: fastMatch.id,
-        lastSyncedRevision: lastSynced,
-        currentRevision: config.revision,
-        events: tailEvents,
-        maxLines: params.maxDigestLines,
-      });
+        if (lastSynced >= config.revision) {
+          return { action: 'noop' };
+        }
 
-      if (fastDigest.behindBy === 0 || fastDigest.digest.length === 0) {
-        return { action: 'noop' };
-      }
+        const tailEvents = await this.readEventsSince(boardSlug, lastSynced, config.revision);
+        const fastDigest = buildSessionDriftDigest({
+          sessionId: fastMatch.id,
+          lastSyncedRevision: lastSynced,
+          currentRevision: config.revision,
+          events: tailEvents,
+          maxLines: params.maxDigestLines,
+        });
 
-      if (params.throttleMs !== undefined && cursor?.lastCursorInjectAt) {
-        const lastInjectMs = Date.parse(cursor.lastCursorInjectAt);
-        if (Number.isFinite(lastInjectMs) && nowMs - lastInjectMs < params.throttleMs) {
-          // D12: Never advance cursor when throttled
-          return { action: 'throttled' };
+        if (fastDigest.behindBy === 0 || fastDigest.digest.length === 0) {
+          return { action: 'noop' };
+        }
+
+        if (params.throttleMs !== undefined && cursor?.lastCursorInjectAt) {
+          const lastInjectMs = Date.parse(cursor.lastCursorInjectAt);
+          if (Number.isFinite(lastInjectMs) && nowMs - lastInjectMs < params.throttleMs) {
+            // D12: Never advance cursor when throttled
+            return { action: 'throttled' };
+          }
         }
       }
     }

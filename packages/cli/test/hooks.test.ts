@@ -528,6 +528,36 @@ describe('AC5.1-AC5.4 + AC5.9 + D11/D12/D14 cdeck hook contract fixtures and cro
       releaseLock();
     }
 
+    // Uninitialized directory -> silent exit 0 and does NOT auto-create .contextdeck
+    const emptyDir = await makeTempDir('cdeck-uninit-');
+    const uninitRes = await runCliWithStdin(['hook', 'claude-code', 'SessionStart'], {
+      cwd: emptyDir,
+      stdin: JSON.stringify({
+        session_id: 'no-ws',
+        cwd: emptyDir,
+        hook_event_name: 'SessionStart',
+        source: 'startup',
+      }),
+    });
+    expect(uninitRes.code).toBe(0);
+    expect(uninitRes.stdout).toBe('');
+    await expect(fs.stat(path.join(emptyDir, '.contextdeck'))).rejects.toThrow();
+
+    // Oversized stdin (>256 KB) -> silent exit 0 within 2s
+    const hugeStdin = JSON.stringify({
+      session_id: 'huge-sess',
+      cwd: repo,
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'x'.repeat(270 * 1024),
+    });
+    const hugeRes = await runCliWithStdin(['hook', 'claude-code', 'UserPromptSubmit'], {
+      cwd: repo,
+      stdin: hugeStdin,
+    });
+    expect(hugeRes.code).toBe(0);
+    expect(hugeRes.stdout).toBe('');
+    expect(hugeRes.elapsedMs).toBeLessThan(2000);
+
     // Corrupt workspace -> empty stdout, exit 0, logged to .runtime/hooks.log
     await fs.writeFile(path.join(store.boardPath('main'), 'board.yaml'), ':::not valid yaml[[[', 'utf8');
     const corruptRes = await runCliWithStdin(['hook', 'claude-code', 'SessionStart'], {
