@@ -46,6 +46,7 @@ export function sanitizeMermaidSvg(svg: string): string {
   return DOMPurify.sanitize(svg || '', {
     USE_PROFILES: { svg: true, svgFilters: true, html: true },
     ADD_TAGS: ['foreignObject'],
+    HTML_INTEGRATION_POINTS: { foreignobject: true },
     FORBID_TAGS: ['script', 'iframe', 'object', 'embed'],
     FORBID_ATTR: [
       'onload',
@@ -56,7 +57,9 @@ export function sanitizeMermaidSvg(svg: string): string {
       'onblur',
       'onmouseenter',
     ],
-    ALLOWED_URI_REGEXP: /^(?:https?:\/\/|#)/i,
+    // Allow https?:// URIs and non-scheme SVG attribute values (viewBox, transform, d, url(#id), etc.)
+    // while strictly rejecting javascript:, data:, vbscript:, file:, etc.
+    ALLOWED_URI_REGEXP: /^(?:https?:\/\/|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
   });
 }
 

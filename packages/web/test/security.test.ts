@@ -33,14 +33,19 @@ describe('@contextdeck/web content security (Bug 7, AC2.7, AC2.9, D5)', () => {
     expect(MERMAID_CONFIG.startOnLoad).toBe(false);
   });
 
-  it('sanitizes Mermaid rendered SVG to neutralize script tags, event handlers, and javascript: hrefs (D5)', () => {
+  it('sanitizes Mermaid rendered SVG to neutralize script tags, event handlers, and javascript: hrefs while preserving diagram geometry and foreignObject labels (D5)', () => {
     const evilSvg =
-      '<svg xmlns="http://www.w3.org/2000/svg"><g onload="alert(1)"><script>alert(2)</script><a href="javascript:alert(3)"><text>Node</text></a></g></svg>';
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100" width="100%"><g transform="translate(10,10)" onload="alert(1)"><path d="M10,10L50,50" marker-end="url(#arrow)"></path><rect x="-10" y="-10" width="120" height="40"></rect><foreignObject width="120" height="40"><div xmlns="http://www.w3.org/1999/xhtml"><span>Server Node</span><img src="x" onerror="alert(4)"/></div></foreignObject><script>alert(2)</script><a href="javascript:alert(3)"><text>Node</text></a></g></svg>';
     const cleaned = sanitizeMermaidSvg(evilSvg);
     expect(cleaned).toContain('<svg');
+    expect(cleaned).toContain('viewBox="0 0 200 100"');
+    expect(cleaned).toContain('d="M10,10L50,50"');
+    expect(cleaned).toContain('width="120"');
+    expect(cleaned).toContain('Server Node');
     expect(cleaned).toContain('Node');
     expect(cleaned.toLowerCase()).not.toContain('<script');
     expect(cleaned.toLowerCase()).not.toContain('onload');
+    expect(cleaned.toLowerCase()).not.toContain('onerror');
     expect(cleaned.toLowerCase()).not.toContain('javascript:');
   });
 

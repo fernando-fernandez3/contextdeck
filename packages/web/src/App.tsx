@@ -69,8 +69,14 @@ export function App() {
   const [newBoardDesc, setNewBoardDesc] = useState('');
   const [newBoardParent, setNewBoardParent] = useState('');
 
-  // Track which board slug we already auto-chose the landing lens for so SSE refreshes don't fight user clicks
+  // Track which board slug we already auto-chose the landing lens for so SSE refreshes or late loads don't fight user clicks
   const autoLandedSlugRef = useRef<string | null>(null);
+  const userPickedLensRef = useRef<boolean>(false);
+
+  const selectLens = useCallback((lensId: string) => {
+    userPickedLensRef.current = true;
+    setActiveLens(lensId);
+  }, []);
 
   useEffect(() => {
     document.documentElement.classList.toggle('light', theme === 'light');
@@ -101,7 +107,9 @@ export function App() {
           setCatchUp(cu);
           if (autoLandedSlugRef.current !== slug) {
             autoLandedSlugRef.current = slug;
-            setActiveLens(cu.hasUnseen ? 'catchup' : 'brief');
+            if (!userPickedLensRef.current) {
+              setActiveLens(cu.hasUnseen ? 'catchup' : 'brief');
+            }
           }
         } else {
           setSnapshot(null);
@@ -147,11 +155,14 @@ export function App() {
   const handleSelectBoard = async (slug: string) => {
     setActiveSlug(slug);
     autoLandedSlugRef.current = null;
+    userPickedLensRef.current = false;
     const [snap, cu] = await Promise.all([api.getBoard(slug), api.getCatchUp(slug)]);
     setSnapshot(snap);
     setCatchUp(cu);
     autoLandedSlugRef.current = slug;
-    setActiveLens(cu.hasUnseen ? 'catchup' : 'brief');
+    if (!userPickedLensRef.current) {
+      setActiveLens(cu.hasUnseen ? 'catchup' : 'brief');
+    }
   };
 
   const handleCreateBoard = async (e: React.FormEvent) => {
@@ -247,7 +258,7 @@ export function App() {
             {unseenCount > 0 && (
               <button
                 type="button"
-                onClick={() => setActiveLens('catchup')}
+                onClick={() => selectLens('catchup')}
                 aria-label={`${unseenCount} unseen updates`}
                 className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-[11px] font-medium text-amber-300"
               >
@@ -383,7 +394,7 @@ export function App() {
                 key={tab.id}
                 type="button"
                 data-lens={tab.id}
-                onClick={() => setActiveLens(tab.id)}
+                onClick={() => selectLens(tab.id)}
                 className={`inline-flex items-center gap-1.5 px-3 py-2.5 text-xs font-medium border-b-2 transition whitespace-nowrap shrink-0 ${
                   active
                     ? 'border-indigo-500 text-zinc-100'
@@ -450,7 +461,7 @@ export function App() {
               <BriefLens
                 snapshot={snapshot}
                 onRefresh={() => void loadBoardsAndSnapshot(activeSlug)}
-                onNavigateLens={setActiveLens}
+                onNavigateLens={selectLens}
               />
             )}
             {activeLens === 'sessions' && (

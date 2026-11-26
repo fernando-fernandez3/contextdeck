@@ -41,6 +41,7 @@ export default function MermaidDiagram({ code }: { code: string }) {
 
   return (
     <div
+      data-mermaid-rendered={svg ? 'true' : 'false'}
       className="w-full max-w-full overflow-x-auto rounded-lg border border-zinc-800 bg-zinc-950 p-4 flex items-center justify-center min-h-[280px] sm:min-h-[340px]"
       dangerouslySetInnerHTML={{ __html: svg }}
     />

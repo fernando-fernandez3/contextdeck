@@ -9,6 +9,7 @@
     "build:web": "pnpm --filter @contextdeck/web build",
     "dev:web": "pnpm --filter @contextdeck/web dev",
     "test": "pnpm build:backend && pnpm -r test",
+    "test:e2e": "playwright test --workers=1",
     "typecheck": "pnpm --filter @contextdeck/core build && pnpm --filter @contextdeck/server build && pnpm -r typecheck"
   },
   "engines": {
@@ -18,5 +19,8 @@
     "overrides": {
       "jsdom": "^29.1.1"
     }
+  },
+  "devDependencies": {
+    "@playwright/test": "1.58.2"
   }
 }
