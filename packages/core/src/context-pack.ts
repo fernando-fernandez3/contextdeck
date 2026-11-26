@@ -169,16 +169,17 @@ export function generateContextPack(
     remaining = appendSectionWithinBudget(bodySections, lines.join('\n'), remaining, true);
   }
 
-  // Priority 2: Queued Jobs (forward-compatible hook for B3 if present on snapshot)
-  const queuedJobs = (snapshot as BoardSnapshot & {
-    jobs?: Array<{ id: string; status: string; artifactType: string; artifactId: string; reason?: string }>;
-  }).jobs?.filter((j) => j.status === 'queued');
-  if (queuedJobs && queuedJobs.length > 0) {
+  // Priority 2: Queued Refresh Jobs (AC7.4, D4, D19)
+  const queuedJobs = (snapshot.jobs ?? []).filter((j) => j.status === 'queued');
+  if (queuedJobs.length > 0) {
     const lines = ['## Queued Refresh Jobs'];
     for (const job of queuedJobs) {
-      lines.push(
-        `- **${job.id}** [${job.artifactType}] \`${job.artifactId}\`${job.reason ? `: ${capSingleLine(job.reason, MAX_SUMMARY_CHARS)}` : ''}`,
-      );
+      const targetKind = job.mediaKind ?? job.diagramKind ?? job.artifactType;
+      const titlePart = job.artifactTitle
+        ? ` "${capSingleLine(job.artifactTitle, MAX_TITLE_CHARS)}"`
+        : '';
+      const reasonPart = job.reason ? `: ${capSingleLine(job.reason, MAX_SUMMARY_CHARS)}` : '';
+      lines.push(`- **${job.id}** [${targetKind}] \`${job.artifactId}\`${titlePart}${reasonPart}`);
     }
     remaining = appendSectionWithinBudget(bodySections, lines.join('\n'), remaining, true);
   }

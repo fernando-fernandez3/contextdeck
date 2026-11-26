@@ -47,7 +47,7 @@ export const KnownHarnessSchema = z.enum([
 export const LensConfigSchema = z.object({
   id: EntityIdSchema,
   title: z.string().min(1).max(200),
-  kind: z.enum(['brief', 'sessions', 'decisions_canvas', 'tasks', 'media_mastery', 'custom']),
+  kind: z.enum(['catchup', 'brief', 'sessions', 'decisions_canvas', 'tasks', 'media_mastery', 'custom']),
   enabled: z.boolean().default(true),
   icon: z.string().max(80).optional(),
   artifactKinds: z.array(z.string().max(80)).optional(),
@@ -56,6 +56,7 @@ export const LensConfigSchema = z.object({
 export type LensConfig = z.infer<typeof LensConfigSchema>;
 
 export const DEFAULT_LENSES: LensConfig[] = [
+  { id: 'catchup', title: 'Catch up', kind: 'catchup', enabled: true, icon: 'inbox' },
   { id: 'brief', title: 'Brief', kind: 'brief', enabled: true, icon: 'compass' },
   { id: 'sessions', title: 'Sessions', kind: 'sessions', enabled: true, icon: 'git-branch' },
   { id: 'decisions', title: 'Architecture & Decisions', kind: 'decisions_canvas', enabled: true, icon: 'network' },
@@ -209,6 +210,44 @@ export const TaskSchema = z.object({
 
 export type Task = z.infer<typeof TaskSchema>;
 
+export const ActorSchema = z
+  .object({
+    type: z.enum(['human', 'agent', 'system']).default('agent'),
+    harness: z.string().max(100).optional(),
+    sessionId: EntityIdSchema.optional(),
+    label: z.string().max(120).optional(),
+  })
+  .strict();
+
+export type Actor = z.infer<typeof ActorSchema>;
+
+export const ArtifactConfirmationSchema = z
+  .object({
+    againstDecisionId: EntityIdSchema,
+    confirmedBy: z.string().min(1).max(120),
+    actorType: z.enum(['human', 'agent']),
+    confirmedAt: IsoDateTimeSchema,
+    note: z.string().max(1000).default(''),
+  })
+  .strict();
+
+export type ArtifactConfirmation = z.infer<typeof ArtifactConfirmationSchema>;
+
+export const ArtifactVersionEntrySchema = z
+  .object({
+    version: z.number().int().min(1),
+    updatedAt: IsoDateTimeSchema,
+    boardRevision: z.number().int().min(1),
+    actor: ActorSchema.optional(),
+    basedOnDecisions: z.array(EntityIdSchema).default([]),
+    filePath: z.string().optional(),
+    createdByJob: EntityIdSchema.optional(),
+    note: z.string().max(500).optional(),
+  })
+  .strict();
+
+export type ArtifactVersionEntry = z.infer<typeof ArtifactVersionEntrySchema>;
+
 export const DiagramKindSchema = z.enum(['mermaid', 'excalidraw']);
 export type DiagramKind = z.infer<typeof DiagramKindSchema>;
 
@@ -219,6 +258,9 @@ export const DiagramSchema = z.object({
   content: z.string(),
   description: z.string().default(''),
   basedOnDecisions: z.array(EntityIdSchema).default([]),
+  version: z.number().int().min(1).default(1),
+  history: z.array(ArtifactVersionEntrySchema).max(10).default([]),
+  confirmations: z.record(EntityIdSchema, ArtifactConfirmationSchema).default({}),
   sessionId: EntityIdSchema.nullable().optional(),
   boardRevisionAtUpdate: z.number().int().min(1).default(1),
   createdAt: IsoDateTimeSchema,
@@ -262,6 +304,9 @@ export const QuizSchema = z.object({
   questions: z.array(QuizQuestionSchema).min(1),
   attempts: z.array(QuizAttemptSchema).default([]),
   basedOnDecisions: z.array(EntityIdSchema).default([]),
+  version: z.number().int().min(1).default(1),
+  history: z.array(ArtifactVersionEntrySchema).max(10).default([]),
+  confirmations: z.record(EntityIdSchema, ArtifactConfirmationSchema).default({}),
   sessionId: EntityIdSchema.nullable().optional(),
   boardRevisionAtUpdate: z.number().int().min(1).default(1),
   createdAt: IsoDateTimeSchema,
@@ -293,6 +338,9 @@ export const MediaArtifactSchema = z.object({
   durationSec: z.number().nonnegative().optional(),
   tags: z.array(z.string()).default([]),
   basedOnDecisions: z.array(EntityIdSchema).default([]),
+  version: z.number().int().min(1).default(1),
+  history: z.array(ArtifactVersionEntrySchema).max(10).default([]),
+  confirmations: z.record(EntityIdSchema, ArtifactConfirmationSchema).default({}),
   sessionId: EntityIdSchema.nullable().optional(),
   boardRevisionAtUpdate: z.number().int().min(1).default(1),
   customLensId: EntityIdSchema.optional(),
@@ -303,16 +351,64 @@ export const MediaArtifactSchema = z.object({
 
 export type MediaArtifact = z.infer<typeof MediaArtifactSchema>;
 
-export const ActorSchema = z
+export const RefreshJobArtifactTypeSchema = z.enum(['diagram', 'media', 'quiz']);
+export type RefreshJobArtifactType = z.infer<typeof RefreshJobArtifactTypeSchema>;
+
+export const RefreshJobStatusSchema = z.enum(['queued', 'claimed', 'done', 'failed']);
+export type RefreshJobStatus = z.infer<typeof RefreshJobStatusSchema>;
+
+export const RefreshJobResultSchema = z
   .object({
-    type: z.enum(['human', 'agent', 'system']).default('agent'),
-    harness: z.string().max(100).optional(),
-    sessionId: EntityIdSchema.optional(),
-    label: z.string().max(120).optional(),
+    artifactVersion: z.number().int().min(1).optional(),
+    summary: z.string().max(2000).optional(),
+    error: z.string().max(2000).optional(),
   })
   .strict();
 
-export type Actor = z.infer<typeof ActorSchema>;
+export type RefreshJobResult = z.infer<typeof RefreshJobResultSchema>;
+
+export const RefreshJobSchema = z.object({
+  id: EntityIdSchema,
+  kind: z.literal('refresh').default('refresh'),
+  artifactType: RefreshJobArtifactTypeSchema,
+  artifactId: EntityIdSchema,
+  artifactTitle: z.string().max(300).default(''),
+  mediaKind: MediaKindSchema.optional(),
+  diagramKind: DiagramKindSchema.optional(),
+  reason: z.string().max(2000).default(''),
+  decisionsBefore: z.array(EntityIdSchema).default([]),
+  decisionsNow: z.array(EntityIdSchema).default([]),
+  baseVersion: z.number().int().min(1).default(1),
+  status: RefreshJobStatusSchema.default('queued'),
+  claimedBy: z.string().max(200).nullable().default(null),
+  leaseToken: z.string().max(128).nullable().default(null),
+  claimedAt: IsoDateTimeSchema.nullable().default(null),
+  leaseExpiresAt: IsoDateTimeSchema.nullable().default(null),
+  result: RefreshJobResultSchema.nullable().default(null),
+  createdAt: IsoDateTimeSchema,
+  updatedAt: IsoDateTimeSchema,
+});
+
+export type RefreshJob = z.infer<typeof RefreshJobSchema>;
+
+export const ReaderBoardCursorSchema = z
+  .object({
+    lastReviewedRevision: z.number().int().min(0),
+    lastReviewedAt: IsoDateTimeSchema,
+  })
+  .strict();
+
+export type ReaderBoardCursor = z.infer<typeof ReaderBoardCursorSchema>;
+
+export const ReaderCursorFileSchema = z
+  .object({
+    readerId: EntityIdSchema,
+    boards: z.record(BoardSlugSchema, ReaderBoardCursorSchema).default({}),
+    updatedAt: IsoDateTimeSchema,
+  })
+  .strict();
+
+export type ReaderCursorFile = z.infer<typeof ReaderCursorFileSchema>;
 
 export const BoardEventSchema = z.object({
   id: EntityIdSchema,
@@ -466,6 +562,8 @@ export const UpsertDiagramInputSchema = z
     description: z.string().max(20 * 1024).optional(),
     basedOnDecisions: z.array(EntityIdSchema).max(100).optional(),
     sessionId: EntityIdSchema.nullable().optional(),
+    jobId: EntityIdSchema.optional(),
+    note: z.string().max(500).optional(),
     actor: ActorSchema.optional(),
   })
   .strict();
@@ -498,10 +596,13 @@ export const UpdateMediaPatchSchema = z
     content: z.string().max(512 * 1024).optional(),
     transcript: z.string().max(200 * 1024).optional(),
     chapters: z.array(MediaChapterSchema).max(200).optional(),
+    durationSec: z.number().nonnegative().optional(),
     tags: z.array(z.string().max(100)).max(50).optional(),
     basedOnDecisions: z.array(EntityIdSchema).max(100).optional(),
     externalUrl: HttpUrlSchema.optional(),
     metadata: z.record(z.string(), z.unknown()).optional(),
+    jobId: EntityIdSchema.optional(),
+    note: z.string().max(500).optional(),
     actor: ActorSchema.optional(),
   })
   .strict();
@@ -519,11 +620,86 @@ export const CreateQuizInputSchema = z
   })
   .strict();
 
+export const UpdateQuizPatchSchema = z
+  .object({
+    title: z.string().min(1).max(300).optional(),
+    topic: z.string().max(300).optional(),
+    description: z.string().max(20 * 1024).optional(),
+    questions: z.array(QuizQuestionSchema).min(1).max(100).optional(),
+    basedOnDecisions: z.array(EntityIdSchema).max(100).optional(),
+    jobId: EntityIdSchema.optional(),
+    note: z.string().max(500).optional(),
+    actor: ActorSchema.optional(),
+  })
+  .strict();
+
 export const SubmitQuizAttemptInputSchema = z
   .object({
     answers: z.record(z.string(), z.union([z.number(), z.string(), z.boolean()])),
     confidence: z.number().min(1).max(5).optional(),
     actor: ActorSchema.optional(),
+  })
+  .strict();
+
+export const ConfirmArtifactInputSchema = z
+  .object({
+    note: z.string().max(1000).optional(),
+    decisionIds: z.array(EntityIdSchema).max(100).optional(),
+    actor: ActorSchema.optional(),
+  })
+  .strict();
+
+export const CreateRefreshJobInputSchema = z
+  .object({
+    artifactType: RefreshJobArtifactTypeSchema,
+    artifactId: EntityIdSchema,
+    reason: z.string().max(2000).optional(),
+    actor: ActorSchema.optional(),
+  })
+  .strict();
+
+export const ClaimJobInputSchema = z
+  .object({
+    jobId: EntityIdSchema.optional(),
+    artifactType: RefreshJobArtifactTypeSchema.optional(),
+    mediaKind: MediaKindSchema.optional(),
+    claimedBy: z.string().min(1).max(200),
+    ttlMs: z.number().int().min(1000).max(24 * 60 * 60 * 1000).optional(),
+    actor: ActorSchema.optional(),
+  })
+  .strict();
+
+export const RenewJobInputSchema = z
+  .object({
+    leaseToken: z.string().min(1).max(128),
+    ttlMs: z.number().int().min(1000).max(24 * 60 * 60 * 1000).optional(),
+    actor: ActorSchema.optional(),
+  })
+  .strict();
+
+export const ReleaseJobInputSchema = z
+  .object({
+    leaseToken: z.string().min(1).max(128),
+    reason: z.string().max(1000).optional(),
+    actor: ActorSchema.optional(),
+  })
+  .strict();
+
+export const CompleteJobInputSchema = z
+  .object({
+    leaseToken: z.string().min(1).max(128),
+    status: z.enum(['done', 'failed']).optional(),
+    artifactVersion: z.number().int().min(1).optional(),
+    summary: z.string().max(2000).optional(),
+    error: z.string().max(2000).optional(),
+    actor: ActorSchema.optional(),
+  })
+  .strict();
+
+export const AckReaderCursorInputSchema = z
+  .object({
+    revision: z.number().int().min(0),
+    readerId: EntityIdSchema.optional(),
   })
   .strict();
 
@@ -572,6 +748,58 @@ export interface DriftReport {
   evaluatedAt?: string;
 }
 
+export interface CatchUpDecisionChange {
+  decisionId: string;
+  title: string;
+  status: DecisionStatus;
+  summary: string;
+  rationaleLine: string;
+  previousDecisionId?: string;
+  previousTitle?: string;
+  revision: number;
+  timestamp: string;
+}
+
+export interface CatchUpStaleArtifact {
+  artifactType: RefreshJobArtifactType;
+  artifactId: string;
+  title: string;
+  staleDecisionIds: string[];
+  reasons: string[];
+  activeJob: {
+    id: string;
+    status: RefreshJobStatus;
+    claimedBy: string | null;
+  } | null;
+}
+
+export interface CatchUpTaskMove {
+  taskId: string;
+  title: string;
+  fromColumn: TaskColumn | null;
+  toColumn: TaskColumn;
+  revision: number;
+}
+
+export interface CatchUpNewSession {
+  sessionId: string;
+  title: string;
+  harness: string;
+  createdAt: string;
+}
+
+export interface CatchUpReport {
+  fromRevision: number;
+  toRevision: number;
+  lastReviewedAt: string | null;
+  unseenCount: number;
+  hasUnseen: boolean;
+  decisionsChanged: CatchUpDecisionChange[];
+  staleArtifacts: CatchUpStaleArtifact[];
+  tasksMoved: CatchUpTaskMove[];
+  newSessions: CatchUpNewSession[];
+}
+
 export interface BoardSnapshot {
   config: BoardConfig;
   brief: string;
@@ -581,6 +809,7 @@ export interface BoardSnapshot {
   diagrams: Diagram[];
   media: MediaArtifact[];
   quizzes: Quiz[];
+  jobs: RefreshJob[];
   events: BoardEvent[];
   drift: DriftReport;
 }

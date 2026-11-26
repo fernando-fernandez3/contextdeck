@@ -7,11 +7,17 @@ import chokidar, { type FSWatcher } from 'chokidar';
 import type { ZodType, ZodTypeDef } from 'zod';
 import {
   ActorSchema,
+  ArtifactConfirmationSchema,
+  ArtifactVersionEntrySchema,
   BoardConfigSchema,
   BoardEventSchema,
+  ClaimJobInputSchema,
+  CompleteJobInputSchema,
+  ConfirmArtifactInputSchema,
   ContextUpdatePayloadSchema,
   CreateBoardInputSchema,
   CreateQuizInputSchema,
+  CreateRefreshJobInputSchema,
   DEFAULT_LENSES,
   DecisionSchema,
   DiagramSchema,
@@ -20,8 +26,13 @@ import {
   PatchTaskInputSchema,
   QuizAttemptSchema,
   QuizSchema,
+  ReaderCursorFileSchema,
   RecordDecisionInputSchema,
+  RefreshJobArtifactTypeSchema,
+  RefreshJobSchema,
   RegisterSessionInputSchema,
+  ReleaseJobInputSchema,
+  RenewJobInputSchema,
   SessionCursorSchema,
   SessionMetadataSchema,
   SessionSchema,
@@ -32,13 +43,17 @@ import {
   UpdateBriefInputSchema,
   UpdateDecisionPatchSchema,
   UpdateMediaPatchSchema,
+  UpdateQuizPatchSchema,
   UpdateSessionPatchSchema,
   UpsertDiagramInputSchema,
   UpsertTaskInputSchema,
   type Actor,
+  type ArtifactConfirmation,
+  type ArtifactVersionEntry,
   type BoardConfig,
   type BoardEvent,
   type BoardSnapshot,
+  type CatchUpReport,
   type ContextUpdatePayload,
   type Decision,
   type DecisionStatus,
@@ -51,6 +66,11 @@ import {
   type Quiz,
   type QuizAttempt,
   type QuizQuestion,
+  type ReaderBoardCursor,
+  type ReaderCursorFile,
+  type RefreshJob,
+  type RefreshJobArtifactType,
+  type RefreshJobStatus,
   type Session,
   type SessionCursor,
   type SessionMetadata,
@@ -90,9 +110,12 @@ import { parseFrontmatter, stringifyFrontmatter } from './markdown.js';
 import {
   buildSessionDriftDigest,
   computeDriftReport,
+  evaluateDecisionStaleness,
   isMeaningfulEvent,
+  resolveLatestDecision,
   type SessionDigestResult,
 } from './drift.js';
+import { computeCatchUp, resolveDefaultReaderId } from './catchup.js';
 import {
   TXN_FILENAME,
   atomicWriteFile,
@@ -109,6 +132,47 @@ import {
 } from './txn.js';
 
 export const DEFAULT_MAX_MEDIA_BYTES = 500 * 1024 * 1024; // 500 MB
+export const DEFAULT_JOB_LEASE_TTL_MS = 15 * 60 * 1000; // 15 minutes (D19)
+const MAX_ARTIFACT_HISTORY = 10; // AC7.6
+
+function appendArtifactHistory(
+  existing: {
+    version: number;
+    updatedAt: string;
+    boardRevisionAtUpdate: number;
+    basedOnDecisions: string[];
+    filePath?: string;
+    history: ArtifactVersionEntry[];
+  },
+  nextEntry: ArtifactVersionEntry,
+): ArtifactVersionEntry[] {
+  const base: ArtifactVersionEntry[] =
+    existing.history.length > 0
+      ? [...existing.history]
+      : [
+          ArtifactVersionEntrySchema.parse({
+            version: existing.version,
+            updatedAt: existing.updatedAt,
+            boardRevision: existing.boardRevisionAtUpdate,
+            basedOnDecisions: existing.basedOnDecisions,
+            ...(existing.filePath ? { filePath: existing.filePath } : {}),
+          }),
+        ];
+  base.push(ArtifactVersionEntrySchema.parse(nextEntry));
+  return base.slice(-MAX_ARTIFACT_HISTORY);
+}
+
+function retainRelevantConfirmations(
+  confirmations: Record<string, ArtifactConfirmation>,
+  basedOnDecisions: string[],
+): Record<string, ArtifactConfirmation> {
+  const allowed = new Set(basedOnDecisions);
+  const out: Record<string, ArtifactConfirmation> = {};
+  for (const [k, v] of Object.entries(confirmations)) {
+    if (allowed.has(k)) out[k] = v;
+  }
+  return out;
+}
 
 export interface ContextDeckStoreOptions {
   deckDir: string;
@@ -296,6 +360,7 @@ export class ContextDeckStore {
   public readonly boardsDir: string;
   public readonly sessionsDir: string;
   public readonly cursorsDir: string;
+  public readonly readersDir: string;
   public readonly pointerPath?: string;
   private _defaultBoardHint?: string;
   public readonly maxMediaBytes: number;
@@ -329,6 +394,7 @@ export class ContextDeckStore {
     this.boardsDir = path.join(this.deckDir, 'boards');
     this.sessionsDir = path.join(this.deckDir, 'sessions');
     this.cursorsDir = path.join(this.runtimeDir, 'cursors');
+    this.readersDir = path.join(this.runtimeDir, 'readers');
   }
 
   public isInitialized(): boolean {
@@ -493,6 +559,139 @@ export class ContextDeckStore {
   private async deleteSessionCursor(sessionId: string): Promise<void> {
     const cursorPath = await this.safeCursorFilePath(sessionId);
     await fs.rm(cursorPath, { force: true });
+  }
+
+  private async assertReadersDirSafe(): Promise<string> {
+    let canonicalDeckDir: string;
+    let canonicalRuntimeDir: string;
+    let canonicalReadersDir: string;
+    try {
+      [canonicalDeckDir, canonicalRuntimeDir, canonicalReadersDir] = await Promise.all([
+        canonicalizePath(this.deckDir),
+        canonicalizePath(this.runtimeDir),
+        canonicalizePath(this.readersDir),
+      ]);
+    } catch (err) {
+      if (err instanceof SecurityError) {
+        throw new CorruptDataError(err.message);
+      }
+      throw err;
+    }
+    const expectedRuntimeDir = path.join(canonicalDeckDir, '.runtime');
+    if (canonicalRuntimeDir !== expectedRuntimeDir) {
+      throw new CorruptDataError(
+        `Unsafe runtime directory "${this.runtimeDir}": resolves outside workspace deck.`,
+      );
+    }
+    const expectedReadersDir = path.join(expectedRuntimeDir, 'readers');
+    if (canonicalReadersDir !== expectedReadersDir) {
+      throw new CorruptDataError(
+        `Unsafe readers directory "${this.readersDir}": resolves outside workspace deck.`,
+      );
+    }
+    return canonicalReadersDir;
+  }
+
+  private async safeReaderFilePath(readerId: string): Promise<string> {
+    const validId = validateEntityId(readerId, 'readerId');
+    const canonicalReadersDir = await this.assertReadersDirSafe();
+    const candidate = path.join(canonicalReadersDir, `${validId}.yaml`);
+    let resolved: string;
+    try {
+      resolved = await assertContainedPath(canonicalReadersDir, candidate, {
+        label: `reader "${validId}"`,
+      });
+    } catch (err) {
+      if (err instanceof SecurityError) {
+        throw new CorruptDataError(err.message);
+      }
+      throw err;
+    }
+    if (resolved !== candidate) {
+      throw new CorruptDataError(`Unsafe reader file: reader "${validId}" resolves to an aliased file.`);
+    }
+    return resolved;
+  }
+
+  public async readReaderCursorFile(readerId?: string): Promise<ReaderCursorFile | null> {
+    const id = readerId
+      ? validateEntityId(readerId, 'readerId')
+      : resolveDefaultReaderId({ projectRoot: this.projectRoot });
+    const filePath = await this.safeReaderFilePath(id);
+    return readYamlStrict(filePath, ReaderCursorFileSchema);
+  }
+
+  /**
+   * Read per-human, per-board reader cursor from `.runtime/readers/<readerId>.yaml` (AC7.1, D16).
+   */
+  public async getReaderCursor(
+    boardSlug?: string,
+    readerId?: string,
+  ): Promise<ReaderBoardCursor | null> {
+    const slug = await this.resolveBoardSlug(boardSlug);
+    const file = await this.readReaderCursorFile(readerId);
+    return file?.boards[slug] ?? null;
+  }
+
+  /**
+   * Acknowledge a displayed board revision for a human reader (AC7.1, AC7.2, D16).
+   * Writes ONLY `.runtime/readers/<readerId>.yaml` (never appends reader events to events.jsonl
+   * and never bumps board.yaml). Monotonically advances via max().
+   */
+  public async ackReaderCursor(
+    boardSlug: string | undefined,
+    ackRevision: number,
+    options: { readerId?: string; now?: string } = {},
+  ): Promise<ReaderBoardCursor> {
+    if (!Number.isInteger(ackRevision) || ackRevision < 0) {
+      throw new ValidationError('ackRevision must be a non-negative integer.');
+    }
+    const id = options.readerId
+      ? validateEntityId(options.readerId, 'readerId')
+      : resolveDefaultReaderId({ projectRoot: this.projectRoot });
+    const slug = await this.resolveBoardSlug(boardSlug);
+
+    return withWorkspaceLock(
+      this.runtimeDir,
+      async (assertActive) => {
+        const config = await this.readBoardConfig(slug);
+        const existingFile = await this.readReaderCursorFile(id);
+        const prev = existingFile?.boards[slug];
+        const clamped = Math.min(ackRevision, config.revision);
+        const nextRev = Math.max(prev?.lastReviewedRevision ?? 0, clamped);
+        const nowStr = options.now ?? nowIso();
+        const nextEntry: ReaderBoardCursor = {
+          lastReviewedRevision: nextRev,
+          lastReviewedAt: nowStr,
+        };
+        const nextFile: ReaderCursorFile = ReaderCursorFileSchema.parse({
+          readerId: id,
+          boards: {
+            ...(existingFile?.boards ?? {}),
+            [slug]: nextEntry,
+          },
+          updatedAt: nowStr,
+        });
+        const filePath = await this.safeReaderFilePath(id);
+        await ensureDir(path.dirname(filePath));
+        assertActive();
+        await atomicWriteFile(filePath, dumpYaml(nextFile));
+        return nextEntry;
+      },
+      this.deckDir,
+    );
+  }
+
+  public async getCatchUp(
+    boardSlug?: string,
+    options: { readerId?: string } = {},
+  ): Promise<CatchUpReport> {
+    const slug = await this.resolveBoardSlug(boardSlug);
+    const [snapshot, cursor] = await Promise.all([
+      this.getSnapshot(slug),
+      this.getReaderCursor(slug, options.readerId),
+    ]);
+    return computeCatchUp(snapshot, cursor);
   }
 
   private sessionMetadataFingerprint(meta: SessionMetadata): string {
@@ -732,6 +931,7 @@ export class ContextDeckStore {
       ensureDir(path.join(dir, 'diagrams')),
       ensureDir(path.join(dir, 'media')),
       ensureDir(path.join(dir, 'quizzes')),
+      ensureDir(path.join(dir, 'jobs')),
     ]);
     return dir;
   }
@@ -2012,6 +2212,36 @@ export class ContextDeckStore {
     return quizParsed.data;
   }
 
+  public async listJobs(
+    boardSlug?: string,
+    filter?: { status?: RefreshJobStatus; artifactType?: RefreshJobArtifactType },
+  ): Promise<RefreshJob[]> {
+    const slug = await this.resolveBoardSlug(boardSlug);
+    const dir = await this.safeBoardFilePath(slug, 'jobs');
+    const files = await listFilesStrict(dir, '.yaml');
+    const out: RefreshJob[] = [];
+    for (const file of files) {
+      const filePath = await assertContainedPath(dir, path.join(dir, file), { label: `job ${file}` });
+      const parsed = await readYamlStrict(filePath, RefreshJobSchema);
+      if (!parsed) continue;
+      if (filter?.status && parsed.status !== filter.status) continue;
+      if (filter?.artifactType && parsed.artifactType !== filter.artifactType) continue;
+      out.push(parsed);
+    }
+    return out.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  private async readJobById(slug: string, jobId: string): Promise<RefreshJob | null> {
+    const validId = validateEntityId(jobId, 'jobId');
+    const jobPath = await this.safeBoardFilePath(slug, 'jobs', `${validId}.yaml`);
+    return readYamlStrict(jobPath, RefreshJobSchema);
+  }
+
+  public async getJob(boardSlug: string | undefined, jobId: string): Promise<RefreshJob | null> {
+    const slug = await this.resolveBoardSlug(boardSlug);
+    return this.readJobById(slug, jobId);
+  }
+
   private async txnJournalExists(txnPath: string): Promise<boolean> {
     try {
       await fs.access(txnPath);
@@ -2029,13 +2259,14 @@ export class ContextDeckStore {
     const briefPath = await this.safeBoardFilePath(slug, 'brief.md');
     const brief = (await readFileStrict(briefPath)) ?? '';
 
-    const [sessions, decisions, tasks, diagrams, media, quizzes, events] = await Promise.all([
+    const [sessions, decisions, tasks, diagrams, media, quizzes, jobs, events] = await Promise.all([
       this.listSessions(slug),
       this.listDecisions(slug),
       this.listTasks(slug),
       this.listDiagrams(slug),
       this.listMedia(slug),
       this.listQuizzes(slug),
+      this.listJobs(slug),
       this.readEvents(slug, config.revision),
     ]);
 
@@ -2059,6 +2290,7 @@ export class ContextDeckStore {
       diagrams,
       media,
       quizzes,
+      jobs,
       events,
       drift,
     };
@@ -2108,13 +2340,14 @@ export class ContextDeckStore {
       );
     };
 
-    const [sessions, decisions, tasks, diagrams, media, quizzes, events] = await Promise.all([
+    const [sessions, decisions, tasks, diagrams, media, quizzes, jobs, events] = await Promise.all([
       loadLightweightSessions(),
       this.listDecisions(validSlug),
       this.listTasks(validSlug),
       this.listDiagrams(validSlug, { loadContent: false }),
       this.listMedia(validSlug, { loadContent: false }),
       this.listQuizzes(validSlug),
+      this.listJobs(validSlug),
       this.readRecentEvents(validSlug, options.maxRecentEvents ?? 16, config.revision),
     ]);
 
@@ -2142,6 +2375,7 @@ export class ContextDeckStore {
       diagrams,
       media,
       quizzes,
+      jobs,
       events,
       drift,
     };
@@ -2807,6 +3041,8 @@ export class ContextDeckStore {
       description?: string;
       basedOnDecisions?: string[];
       sessionId?: string | null;
+      jobId?: string;
+      note?: string;
     },
     actorOverride?: Actor,
   ): Promise<Diagram> {
@@ -2819,18 +3055,57 @@ export class ContextDeckStore {
     const id = existing?.id ?? input.id ?? `diag_${slugify(input.title)}_${shortId('x').slice(2, 6)}`;
     validateEntityId(id, 'diagramId');
 
+    if (input.jobId) {
+      const job = await this.readJobById(tx.slug, input.jobId);
+      if (!job) {
+        throw new NotFoundError(`Refresh job "${input.jobId}" not found on board "${tx.slug}".`);
+      }
+      if (job.artifactType !== 'diagram' || job.artifactId !== id) {
+        throw new ValidationError(
+          `Refresh job "${input.jobId}" targets ${job.artifactType}/${job.artifactId}, not diagram/${id}.`,
+        );
+      }
+      if (existing && input.content.trim() === existing.content.trim()) {
+        throw new ValidationError(
+          'Cannot record refresh job version without changing diagram content.',
+        );
+      }
+    }
+
     // H10: Attribute the event ONLY to the actual caller's sessionId (never existing.sessionId),
     // while keeping existing.sessionId preserved as diagram metadata.
     const actorSessionId = input.sessionId ?? effActor.sessionId ?? undefined;
     const diagramSessionId =
       input.sessionId !== undefined ? input.sessionId : (effActor.sessionId ?? existing?.sessionId ?? null);
     const eventActor: Actor = actorSessionId ? { ...effActor, sessionId: actorSessionId } : effActor;
+    const nextVersion = existing ? existing.version + 1 : 1;
+    const nextBasedOn = input.basedOnDecisions ?? existing?.basedOnDecisions ?? [];
     const ev = tx.addEvent({
       kind: existing ? 'diagram.updated' : 'diagram.created',
       entityId: id,
-      summary: `${existing ? 'Updated' : 'Created'} ${kind} diagram "${input.title}"`,
+      summary: `${existing ? 'Updated' : 'Created'} ${kind} diagram "${input.title}" (v${nextVersion})`,
       actor: eventActor,
     });
+
+    const versionEntry: ArtifactVersionEntry = ArtifactVersionEntrySchema.parse({
+      version: nextVersion,
+      updatedAt: now,
+      boardRevision: ev.revision,
+      actor: eventActor,
+      basedOnDecisions: nextBasedOn,
+      ...(input.jobId ? { createdByJob: input.jobId } : {}),
+      ...(input.note ? { note: input.note } : {}),
+    });
+
+    const nextHistory = existing
+      ? appendArtifactHistory(existing, versionEntry)
+      : [versionEntry];
+
+    const contentChanged = !existing || input.content !== existing.content;
+    const nextConfirmations =
+      existing && !contentChanged
+        ? retainRelevantConfirmations(existing.confirmations, nextBasedOn)
+        : {};
 
     const diagram = DiagramSchema.parse({
       id,
@@ -2838,7 +3113,10 @@ export class ContextDeckStore {
       kind,
       content: input.content,
       description: input.description ?? existing?.description ?? '',
-      basedOnDecisions: input.basedOnDecisions ?? existing?.basedOnDecisions ?? [],
+      basedOnDecisions: nextBasedOn,
+      version: nextVersion,
+      history: nextHistory,
+      confirmations: nextConfirmations,
       sessionId: diagramSessionId,
       boardRevisionAtUpdate: ev.revision,
       createdAt: existing?.createdAt ?? now,
@@ -2860,6 +3138,7 @@ export class ContextDeckStore {
     mediaId: string,
     rawPatch: Record<string, unknown>,
     actorOverride?: Actor,
+    stagedBinary?: { tmpPath: string; ext: string; mimeType?: string },
   ): Promise<MediaArtifact> {
     validateEntityId(mediaId, 'mediaId');
     const patch = parseStrict(UpdateMediaPatchSchema.omit({ actor: true }), rawPatch, 'media patch');
@@ -2870,12 +3149,108 @@ export class ContextDeckStore {
       throw new NotFoundError(`Media artifact "${mediaId}" not found on board "${tx.slug}".`);
     }
 
+    if (patch.jobId) {
+      const job = await this.readJobById(tx.slug, patch.jobId);
+      if (!job) {
+        throw new NotFoundError(`Refresh job "${patch.jobId}" not found on board "${tx.slug}".`);
+      }
+      if (job.artifactType !== 'media' || job.artifactId !== existing.id) {
+        throw new ValidationError(
+          `Refresh job "${patch.jobId}" targets ${job.artifactType}/${job.artifactId}, not media/${existing.id}.`,
+        );
+      }
+      const hasNewBinary = Boolean(stagedBinary);
+      const hasNewContent = patch.content !== undefined && patch.content !== existing.content;
+      const hasNewTranscript =
+        patch.transcript !== undefined && patch.transcript !== existing.transcript;
+      const hasNewUrl =
+        patch.externalUrl !== undefined && patch.externalUrl !== existing.externalUrl;
+      if (
+        (existing.kind === 'video' || existing.kind === 'audio') &&
+        !hasNewBinary &&
+        !hasNewUrl &&
+        !hasNewTranscript
+      ) {
+        throw new ValidationError(
+          'Cannot record refresh job version for video/audio without a new media file, URL, or transcript.',
+        );
+      }
+      if (
+        (existing.kind === 'doc' || existing.kind === 'html' || existing.kind === 'json') &&
+        !hasNewBinary &&
+        !hasNewContent
+      ) {
+        throw new ValidationError(
+          'Cannot record refresh job version for document/html/json without changed content or a new file.',
+        );
+      }
+      if (!hasNewBinary && !hasNewContent && !hasNewTranscript && !hasNewUrl) {
+        throw new ValidationError(
+          'Cannot record refresh job version without updated media content or file.',
+        );
+      }
+    }
+
+    const nextVersion = existing.version + 1;
+    const now = nowIso();
+    const mediaDir = await this.safeBoardFilePath(tx.slug, 'media');
+    let nextFilePath = existing.filePath;
+    let nextMimeType = stagedBinary?.mimeType ?? existing.mimeType;
+
+    // D19: Immutable versioned media files `<id>.v<N>.<ext>` (keep previous versions on disk!)
+    if (stagedBinary) {
+      nextFilePath = `${existing.id}.v${nextVersion}${stagedBinary.ext}`;
+      const finalFilePath = await assertContainedPath(
+        mediaDir,
+        path.join(mediaDir, nextFilePath),
+        { label: `media file "${nextFilePath}"` },
+      );
+      if (existsSync(finalFilePath)) {
+        throw new ConflictError(`Immutable media version "${nextFilePath}" already exists.`);
+      }
+      tx.stagePreStagedFile(stagedBinary.tmpPath, finalFilePath);
+    } else if (
+      patch.content !== undefined &&
+      (existing.kind === 'doc' || existing.kind === 'html' || existing.kind === 'json')
+    ) {
+      const ext = existing.kind === 'html' ? '.html' : existing.kind === 'json' ? '.json' : '.md';
+      nextFilePath = `${existing.id}.v${nextVersion}${ext}`;
+      const targetContentPath = await assertContainedPath(
+        mediaDir,
+        path.join(mediaDir, nextFilePath),
+        { label: `media file "${nextFilePath}"` },
+      );
+      if (existsSync(targetContentPath)) {
+        throw new ConflictError(`Immutable media version "${nextFilePath}" already exists.`);
+      }
+      tx.stageFile(targetContentPath, patch.content);
+    }
+
+    const nextBasedOn = patch.basedOnDecisions ?? existing.basedOnDecisions;
     const ev = tx.addEvent({
       kind: 'media.updated',
       entityId: existing.id,
-      summary: `Updated ${existing.kind} artifact "${patch.title ?? existing.title}"`,
+      summary: `Updated ${existing.kind} artifact "${patch.title ?? existing.title}" (v${nextVersion})`,
       actor: effActor,
     });
+
+    const versionEntry: ArtifactVersionEntry = ArtifactVersionEntrySchema.parse({
+      version: nextVersion,
+      updatedAt: now,
+      boardRevision: ev.revision,
+      actor: effActor,
+      basedOnDecisions: nextBasedOn,
+      ...(nextFilePath ? { filePath: nextFilePath } : {}),
+      ...(patch.jobId ? { createdByJob: patch.jobId } : {}),
+      ...(patch.note ? { note: patch.note } : {}),
+    });
+
+    const nextHistory = appendArtifactHistory(existing, versionEntry);
+    const substantiveChange =
+      Boolean(stagedBinary) ||
+      patch.content !== undefined ||
+      patch.transcript !== undefined ||
+      patch.externalUrl !== undefined;
 
     const updated = MediaArtifactSchema.parse({
       ...existing,
@@ -2883,27 +3258,23 @@ export class ContextDeckStore {
       ...(patch.content !== undefined ? { content: patch.content } : {}),
       ...(patch.transcript !== undefined ? { transcript: patch.transcript } : {}),
       ...(patch.chapters !== undefined ? { chapters: patch.chapters } : {}),
+      ...(patch.durationSec !== undefined ? { durationSec: patch.durationSec } : {}),
       ...(patch.tags !== undefined ? { tags: patch.tags } : {}),
       ...(patch.basedOnDecisions !== undefined ? { basedOnDecisions: patch.basedOnDecisions } : {}),
       ...(patch.externalUrl !== undefined ? { externalUrl: patch.externalUrl } : {}),
       ...(patch.metadata !== undefined ? { metadata: patch.metadata } : {}),
-      // Never allow storage-managed fields to be overwritten by patch
       id: existing.id,
-      filePath: existing.filePath,
+      mimeType: nextMimeType,
+      filePath: nextFilePath,
+      version: nextVersion,
+      history: nextHistory,
+      confirmations: substantiveChange
+        ? {}
+        : retainRelevantConfirmations(existing.confirmations, nextBasedOn),
       createdAt: existing.createdAt,
       boardRevisionAtUpdate: ev.revision,
-      updatedAt: nowIso(),
+      updatedAt: now,
     });
-
-    const mediaDir = await this.safeBoardFilePath(tx.slug, 'media');
-    if (patch.content !== undefined && updated.filePath) {
-      const targetContentPath = await assertContainedPath(
-        mediaDir,
-        path.join(mediaDir, updated.filePath),
-        { label: `media file for "${updated.id}"` },
-      );
-      tx.stageFile(targetContentPath, patch.content);
-    }
 
     const metaPath = await assertContainedPath(
       mediaDir,
@@ -2943,6 +3314,15 @@ export class ContextDeckStore {
     });
 
     const now = nowIso();
+    const basedOnDecisions = input.basedOnDecisions ?? [];
+    const versionEntry = ArtifactVersionEntrySchema.parse({
+      version: 1,
+      updatedAt: now,
+      boardRevision: ev.revision,
+      actor: eventActor,
+      basedOnDecisions,
+    });
+
     const quiz = QuizSchema.parse({
       id,
       title: input.title,
@@ -2950,7 +3330,10 @@ export class ContextDeckStore {
       description: input.description ?? '',
       questions: input.questions,
       attempts: [],
-      basedOnDecisions: input.basedOnDecisions ?? [],
+      basedOnDecisions,
+      version: 1,
+      history: [versionEntry],
+      confirmations: {},
       sessionId,
       boardRevisionAtUpdate: ev.revision,
       createdAt: now,
@@ -3958,6 +4341,8 @@ export class ContextDeckStore {
       description?: string;
       basedOnDecisions?: string[];
       sessionId?: string | null;
+      jobId?: string;
+      note?: string;
     },
     actor: Actor = DEFAULT_ACTOR,
   ): Promise<Diagram> {
@@ -4038,10 +4423,10 @@ export class ContextDeckStore {
       const mediaDir = await this.safeBoardFilePath(slug, 'media');
       await ensureDir(mediaDir);
 
-      // Stage file bytes OUTSIDE the lock (D1)
+      // Stage file bytes OUTSIDE the lock (D1). Immutable `<id>.v1<ext>` naming (D19).
       if (input.stagedTempPath) {
         const ext = input.fileName ? safeExt(input.fileName) : safeExt(input.stagedTempPath);
-        storedFileName = `${id}${ext}`;
+        storedFileName = `${id}.v1${ext}`;
         // Ensure stagedTempPath lives inside mediaDir (same filesystem for atomic rename);
         // once validated, addMedia owns temp cleanup on every path (H2).
         const canonicalStagedTmp = await canonicalizePath(input.stagedTempPath);
@@ -4052,7 +4437,7 @@ export class ContextDeckStore {
         ownPreStagedTmp = true;
       } else if (input.sourceFilePath) {
         const ext = safeExt(input.sourceFilePath);
-        storedFileName = `${id}${ext}`;
+        storedFileName = `${id}.v1${ext}`;
         const staged = await streamFileToTempFsync(input.sourceFilePath, mediaDir, limit);
         preStagedTmp = staged.tmpPath;
         ownPreStagedTmp = true;
@@ -4061,7 +4446,7 @@ export class ContextDeckStore {
           throw new ValidationError(`Uploaded file exceeds limit of ${limit} bytes.`);
         }
         const ext = input.fileName ? safeExt(input.fileName) : '';
-        storedFileName = `${id}${ext}`;
+        storedFileName = `${id}.v1${ext}`;
         preStagedTmp = await writeTempFileFsync(mediaDir, input.fileBuffer, '.tmp-media-');
         ownPreStagedTmp = true;
       } else if (
@@ -4069,7 +4454,7 @@ export class ContextDeckStore {
         (input.kind === 'doc' || input.kind === 'html' || input.kind === 'json')
       ) {
         const ext = input.kind === 'html' ? '.html' : input.kind === 'json' ? '.json' : '.md';
-        storedFileName = `${id}${ext}`;
+        storedFileName = `${id}.v1${ext}`;
         preStagedTmp = await writeTempFileFsync(mediaDir, input.content, '.tmp-media-');
         ownPreStagedTmp = true;
       }
@@ -4085,6 +4470,16 @@ export class ContextDeckStore {
           summary: `Attached ${input.kind} artifact "${input.title}"`,
         });
 
+        const basedOnDecisions = input.basedOnDecisions ?? [];
+        const versionEntry = ArtifactVersionEntrySchema.parse({
+          version: 1,
+          updatedAt: now,
+          boardRevision: ev.revision,
+          actor: eventActor,
+          basedOnDecisions,
+          ...(storedFileName ? { filePath: storedFileName } : {}),
+        });
+
         const artifact = MediaArtifactSchema.parse({
           id,
           title: input.title,
@@ -4097,7 +4492,10 @@ export class ContextDeckStore {
           chapters: input.chapters ?? [],
           durationSec: input.durationSec,
           tags: input.tags ?? [],
-          basedOnDecisions: input.basedOnDecisions ?? [],
+          basedOnDecisions,
+          version: 1,
+          history: [versionEntry],
+          confirmations: {},
           sessionId,
           boardRevisionAtUpdate: ev.revision,
           customLensId: input.customLensId,
@@ -4167,17 +4565,87 @@ export class ContextDeckStore {
         | 'content'
         | 'transcript'
         | 'chapters'
+        | 'durationSec'
         | 'tags'
         | 'basedOnDecisions'
         | 'externalUrl'
         | 'metadata'
       >
-    >,
+    > & {
+      mimeType?: string;
+      sourceFilePath?: string;
+      stagedTempPath?: string;
+      fileBuffer?: Buffer;
+      fileName?: string;
+      maxBytes?: number;
+      jobId?: string;
+      note?: string;
+    },
     actor: Actor = DEFAULT_ACTOR,
   ): Promise<MediaArtifact> {
-    return this.mutate(boardSlug, actor, (tx) =>
-      this.updateMediaUnlocked(tx, mediaId, patch as Record<string, unknown>),
-    );
+    validateEntityId(mediaId, 'mediaId');
+    const {
+      sourceFilePath,
+      stagedTempPath,
+      fileBuffer,
+      fileName,
+      mimeType,
+      maxBytes,
+      ...metadataPatch
+    } = patch;
+    const limit = maxBytes ?? this.maxMediaBytes;
+
+    let preStagedTmp: string | undefined;
+    let stagedExt = '';
+    let ownPreStagedTmp = false;
+
+    const safeExt = (rawName: string): string => {
+      const ext = path.extname(rawName).toLowerCase();
+      return /^\.[a-z0-9]{1,12}$/.test(ext) ? ext : '';
+    };
+
+    try {
+      const slug = await this.resolveBoardSlug(boardSlug);
+      await this.readBoardConfig(slug);
+      const mediaDir = await this.safeBoardFilePath(slug, 'media');
+      await ensureDir(mediaDir);
+
+      // Stage big binary files OUTSIDE the workspace lock (D1, D17, D19)
+      if (stagedTempPath) {
+        stagedExt = fileName ? safeExt(fileName) : safeExt(stagedTempPath);
+        const canonicalStagedTmp = await canonicalizePath(stagedTempPath);
+        preStagedTmp = await assertContainedPath(mediaDir, canonicalStagedTmp, {
+          label: 'staged media update file',
+        });
+        ownPreStagedTmp = true;
+      } else if (sourceFilePath) {
+        stagedExt = safeExt(sourceFilePath);
+        const staged = await streamFileToTempFsync(sourceFilePath, mediaDir, limit);
+        preStagedTmp = staged.tmpPath;
+        ownPreStagedTmp = true;
+      } else if (fileBuffer) {
+        if (fileBuffer.length > limit) {
+          throw new ValidationError(`Uploaded file exceeds limit of ${limit} bytes.`);
+        }
+        stagedExt = fileName ? safeExt(fileName) : '';
+        preStagedTmp = await writeTempFileFsync(mediaDir, fileBuffer, '.tmp-media-');
+        ownPreStagedTmp = true;
+      }
+
+      const stagedBinary = preStagedTmp
+        ? { tmpPath: preStagedTmp, ext: stagedExt, mimeType }
+        : undefined;
+
+      return await this.mutate(slug, actor, (tx) =>
+        this.updateMediaUnlocked(tx, mediaId, metadataPatch as Record<string, unknown>, undefined, stagedBinary),
+      );
+    } catch (err) {
+      const txnExists = existsSync(path.join(this.runtimeDir, TXN_FILENAME));
+      if (!txnExists && ownPreStagedTmp && preStagedTmp) {
+        await fs.rm(preStagedTmp, { force: true }).catch(() => {});
+      }
+      throw err;
+    }
   }
 
   public async deleteMedia(
@@ -4195,20 +4663,133 @@ export class ContextDeckStore {
         { label: `media meta "${mediaId}"` },
       );
       tx.stageDelete(metaPath);
-      if (existing?.filePath) {
-        const assetPath = await assertContainedPath(
-          mediaDir,
-          path.join(mediaDir, existing.filePath),
-          { label: `media file "${mediaId}"` },
-        );
+
+      // D19: Delete removes ALL immutable versions `<id>.v<N>.<ext>` + current filePath + history filePaths
+      const filesToDelete = new Set<string>();
+      if (existing?.filePath) filesToDelete.add(existing.filePath);
+      for (const h of existing?.history ?? []) {
+        if (h.filePath) filesToDelete.add(h.filePath);
+      }
+      const allMediaFiles = await listFilesStrict(mediaDir);
+      const versionRegex = new RegExp(`^${mediaId}\\.v\\d+(?:\\.[a-z0-9]{1,12})?$`);
+      for (const file of allMediaFiles) {
+        if (versionRegex.test(file)) {
+          filesToDelete.add(file);
+        }
+      }
+
+      for (const relFile of filesToDelete) {
+        const assetPath = await assertContainedPath(mediaDir, path.join(mediaDir, relFile), {
+          label: `media file "${relFile}"`,
+        });
         tx.stageDelete(assetPath);
       }
+
       tx.addEvent({
         kind: 'media.deleted',
         entityId: mediaId,
         summary: `Removed media artifact ${mediaId}`,
       });
     });
+  }
+
+  /**
+   * Prune historical `<id>.v<N>.<ext>` media files (AC7.6, D19).
+   * Keeps the active `filePath`, the newest `keepVersions` files per artifact, and
+   * NEVER removes versions referenced by open (`queued` or `claimed`) jobs.
+   */
+  public async pruneMedia(
+    boardSlug?: string,
+    options: { keepVersions?: number; dryRun?: boolean } = {},
+  ): Promise<{ prunedFiles: string[]; keptFiles: string[]; freedBytes: number }> {
+    const keepVersions = Math.max(1, options.keepVersions ?? 1);
+    const dryRun = Boolean(options.dryRun);
+    const slug = await this.resolveBoardSlug(boardSlug);
+
+    return withWorkspaceLock(
+      this.runtimeDir,
+      async (assertActive) => {
+        await this.readBoardConfig(slug);
+        const mediaDir = await this.safeBoardFilePath(slug, 'media');
+        const [artifacts, jobs, allFiles] = await Promise.all([
+          this.listMedia(slug, { loadContent: false }),
+          this.listJobs(slug),
+          listFilesStrict(mediaDir),
+        ]);
+
+        const openJobsByMedia = new Map<string, RefreshJob[]>();
+        for (const job of jobs) {
+          if (job.artifactType !== 'media') continue;
+          if (job.status !== 'queued' && job.status !== 'claimed') continue;
+          const arr = openJobsByMedia.get(job.artifactId) ?? [];
+          arr.push(job);
+          openJobsByMedia.set(job.artifactId, arr);
+        }
+
+        const protectedFiles = new Set<string>();
+        const candidateVersionFiles: Array<{ file: string; mediaId: string; version: number }> = [];
+        const versionPattern = /^([A-Za-z0-9][A-Za-z0-9_-]{0,80})\.v([1-9]\d*)(?:\.[a-z0-9]{1,12})?$/;
+
+        for (const art of artifacts) {
+          if (art.filePath) protectedFiles.add(art.filePath);
+          const openJobs = openJobsByMedia.get(art.id) ?? [];
+          const openJobIds = new Set(openJobs.map((j) => j.id));
+          const minProtectedVer =
+            openJobs.length > 0 ? Math.min(...openJobs.map((j) => j.baseVersion)) : Infinity;
+
+          for (const h of art.history) {
+            if (!h.filePath) continue;
+            if (h.version >= minProtectedVer || (h.createdByJob && openJobIds.has(h.createdByJob))) {
+              protectedFiles.add(h.filePath);
+            }
+          }
+
+          const versionsOnDisk: Array<{ file: string; version: number }> = [];
+          for (const file of allFiles) {
+            if (file.endsWith('.meta.yaml')) continue;
+            const m = file.match(versionPattern);
+            if (!m || m[1] !== art.id) continue;
+            const ver = Number.parseInt(m[2], 10);
+            if (ver >= minProtectedVer) {
+              protectedFiles.add(file);
+            }
+            versionsOnDisk.push({ file, version: ver });
+          }
+
+          versionsOnDisk.sort((a, b) => b.version - a.version);
+          for (const keep of versionsOnDisk.slice(0, keepVersions)) {
+            protectedFiles.add(keep.file);
+          }
+          for (const item of versionsOnDisk) {
+            candidateVersionFiles.push({ file: item.file, mediaId: art.id, version: item.version });
+          }
+        }
+
+        const prunedFiles: string[] = [];
+        const keptFiles: string[] = [];
+        let freedBytes = 0;
+
+        for (const cand of candidateVersionFiles) {
+          if (protectedFiles.has(cand.file)) {
+            keptFiles.push(cand.file);
+            continue;
+          }
+          const absPath = await assertContainedPath(mediaDir, path.join(mediaDir, cand.file), {
+            label: `prune media "${cand.file}"`,
+          });
+          const st = await fs.stat(absPath).catch(() => null);
+          if (!dryRun) {
+            assertActive();
+            await fs.rm(absPath, { force: true });
+          }
+          prunedFiles.push(cand.file);
+          if (st) freedBytes += st.size;
+        }
+
+        return { prunedFiles: prunedFiles.sort(), keptFiles: keptFiles.sort(), freedBytes };
+      },
+      this.deckDir,
+    );
   }
 
   public async resolveMediaFilePath(
@@ -4242,6 +4823,105 @@ export class ContextDeckStore {
     actor: Actor = DEFAULT_ACTOR,
   ): Promise<Quiz> {
     return this.mutate(boardSlug, actor, (tx) => this.createQuizUnlocked(tx, input));
+  }
+
+  /**
+   * Update a quiz while preserving all existing attempts (AC7.6, D17).
+   * Bumps version and records history (capped at 10). Validates jobId if linked to a refresh job.
+   */
+  public async updateQuiz(
+    boardSlug: string | undefined,
+    quizId: string,
+    rawPatch: {
+      title?: string;
+      topic?: string;
+      description?: string;
+      questions?: QuizQuestion[];
+      basedOnDecisions?: string[];
+      jobId?: string;
+      note?: string;
+    },
+    actor: Actor = DEFAULT_ACTOR,
+  ): Promise<Quiz> {
+    validateEntityId(quizId, 'quizId');
+    const patch = parseStrict(UpdateQuizPatchSchema.omit({ actor: true }), rawPatch, 'quiz update');
+
+    return this.mutate(boardSlug, actor, async (tx) => {
+      const existing = await this.readQuizById(tx.slug, quizId);
+      if (!existing) {
+        throw new NotFoundError(`Quiz "${quizId}" not found on board "${tx.slug}".`);
+      }
+
+      if (patch.jobId) {
+        const job = await this.readJobById(tx.slug, patch.jobId);
+        if (!job) {
+          throw new NotFoundError(`Refresh job "${patch.jobId}" not found on board "${tx.slug}".`);
+        }
+        if (job.artifactType !== 'quiz' || job.artifactId !== existing.id) {
+          throw new ValidationError(
+            `Refresh job "${patch.jobId}" targets ${job.artifactType}/${job.artifactId}, not quiz/${existing.id}.`,
+          );
+        }
+        if (
+          !patch.questions ||
+          JSON.stringify(patch.questions) === JSON.stringify(existing.questions)
+        ) {
+          throw new ValidationError(
+            'Cannot record refresh job version for quiz without updated questions.',
+          );
+        }
+      }
+
+      const now = nowIso();
+      const nextVersion = existing.version + 1;
+      const nextQuestions = patch.questions ?? existing.questions;
+      const nextBasedOn = patch.basedOnDecisions ?? existing.basedOnDecisions;
+      const ev = tx.addEvent({
+        kind: 'quiz.updated',
+        entityId: existing.id,
+        summary: `Updated quiz "${patch.title ?? existing.title}" (v${nextVersion})`,
+      });
+
+      const versionEntry = ArtifactVersionEntrySchema.parse({
+        version: nextVersion,
+        updatedAt: now,
+        boardRevision: ev.revision,
+        actor: tx.actor,
+        basedOnDecisions: nextBasedOn,
+        ...(patch.jobId ? { createdByJob: patch.jobId } : {}),
+        ...(patch.note ? { note: patch.note } : {}),
+      });
+
+      const questionsChanged =
+        patch.questions !== undefined &&
+        JSON.stringify(patch.questions) !== JSON.stringify(existing.questions);
+      const allowedConfDecisions = [
+        ...nextBasedOn,
+        ...nextQuestions.flatMap((q) => q.relatedDecisionIds ?? []),
+      ];
+
+      const updated = QuizSchema.parse({
+        ...existing,
+        ...(patch.title !== undefined ? { title: patch.title } : {}),
+        ...(patch.topic !== undefined ? { topic: patch.topic } : {}),
+        ...(patch.description !== undefined ? { description: patch.description } : {}),
+        questions: nextQuestions,
+        // D17: Always preserve attempts across quiz updates
+        attempts: existing.attempts,
+        basedOnDecisions: nextBasedOn,
+        version: nextVersion,
+        history: appendArtifactHistory(existing, versionEntry),
+        confirmations: questionsChanged
+          ? {}
+          : retainRelevantConfirmations(existing.confirmations, allowedConfDecisions),
+        boardRevisionAtUpdate: ev.revision,
+        updatedAt: now,
+      });
+
+      const quizPath = await this.safeBoardFilePath(tx.slug, 'quizzes', `${updated.id}.quiz.json`);
+      tx.stageFile(quizPath, `${JSON.stringify(updated, null, 2)}\n`);
+      return updated;
+    });
   }
 
   public async submitQuizAttempt(
@@ -4290,87 +4970,588 @@ export class ContextDeckStore {
     });
   }
 
-  public async refreshArtifactDecisions(
+  /**
+   * Record a confirmation that a stale artifact (diagram, media, or quiz) is still accurate
+   * against the current superseding decision(s), WITHOUT rewriting `basedOnDecisions` (AC7.3, D14, D17).
+   * Drift clears only while the latest replacement equals `againstDecisionId` (auto re-stale on next supersede).
+   * Tasks are NOT refresh/confirm targets (D17).
+   */
+  public async confirmArtifact(
     boardSlug: string | undefined,
-    artifactType: 'diagram' | 'media' | 'quiz' | 'task',
+    artifactType: RefreshJobArtifactType,
     artifactId: string,
+    rawInput: { note?: string; decisionIds?: string[] } = {},
     actor: Actor = DEFAULT_ACTOR,
-  ): Promise<void> {
+  ): Promise<Diagram | MediaArtifact | Quiz> {
+    const validType = parseStrict(RefreshJobArtifactTypeSchema, artifactType, 'artifactType');
     validateEntityId(artifactId, 'artifactId');
+    const input = parseStrict(ConfirmArtifactInputSchema.omit({ actor: true }), rawInput, 'artifact confirmation');
 
-    await this.mutate(boardSlug, actor, async (tx) => {
+    return this.mutate(boardSlug, actor, async (tx) => {
       const decisions = await this.listDecisions(tx.slug);
-      const map = new Map(decisions.map((d) => [d.id, d]));
+      const decisionMap = new Map(decisions.map((d) => [d.id, d]));
+      const now = nowIso();
+      const actorType: 'human' | 'agent' = tx.actor.type === 'human' ? 'human' : 'agent';
+      const confirmedBy =
+        tx.actor.label ??
+        (tx.actor.harness ? `${tx.actor.harness}${tx.actor.sessionId ? `:${tx.actor.sessionId}` : ''}` : undefined) ??
+        tx.actor.sessionId ??
+        actorType;
 
-      const upgradeDecisionIds = (ids: string[]): string[] => {
-        const next = new Set<string>();
-        for (const id of ids) {
-          let cur = map.get(id);
-          const seen = new Set<string>();
-          while (cur?.supersededBy && !seen.has(cur.id)) {
-            seen.add(cur.id);
-            const replacement = map.get(cur.supersededBy);
-            if (!replacement) break;
-            cur = replacement;
-          }
-          if (cur && cur.status !== 'deprecated') {
-            next.add(cur.id);
-          }
+      const buildConfirmations = (
+        existingConfirmations: Record<string, ArtifactConfirmation>,
+        referencedDecisionIds: string[],
+      ): {
+        nextConfirmations: Record<string, ArtifactConfirmation>;
+        confirmedAgainst: Array<{ staleId: string; againstId: string }>;
+      } => {
+        const { staleIds } = evaluateDecisionStaleness(
+          referencedDecisionIds,
+          decisionMap,
+          existingConfirmations,
+        );
+        const targetIds = input.decisionIds
+          ? staleIds.filter((id) => input.decisionIds!.includes(id))
+          : staleIds;
+
+        const nextConfirmations: Record<string, ArtifactConfirmation> = { ...existingConfirmations };
+        const confirmedAgainst: Array<{ staleId: string; againstId: string }> = [];
+
+        for (const staleId of targetIds) {
+          const dec = decisionMap.get(staleId);
+          if (!dec) continue;
+          const latest =
+            dec.status === 'superseded' ? resolveLatestDecision(dec.id, decisionMap) : dec;
+          const againstId = latest?.id ?? dec.id;
+          nextConfirmations[staleId] = ArtifactConfirmationSchema.parse({
+            againstDecisionId: againstId,
+            confirmedBy,
+            actorType,
+            confirmedAt: now,
+            note: input.note ?? '',
+          });
+          confirmedAgainst.push({ staleId, againstId });
         }
-        return Array.from(next);
+
+        return { nextConfirmations, confirmedAgainst };
       };
 
-      if (artifactType === 'diagram') {
+      if (validType === 'diagram') {
         const item = await this.readDiagramById(tx.slug, artifactId);
         if (!item) throw new NotFoundError(`Diagram "${artifactId}" not found.`);
-        await this.upsertDiagramUnlocked(tx, {
-          id: item.id,
-          title: item.title,
-          kind: item.kind,
-          content: item.content,
-          description: item.description,
-          basedOnDecisions: upgradeDecisionIds(item.basedOnDecisions),
+        const { nextConfirmations, confirmedAgainst } = buildConfirmations(
+          item.confirmations,
+          item.basedOnDecisions,
+        );
+        const updated = DiagramSchema.parse({
+          ...item,
+          confirmations: nextConfirmations,
+          updatedAt: now,
         });
-        return;
+        const { content: _content, ...meta } = updated;
+        const metaPath = await this.safeBoardFilePath(tx.slug, 'diagrams', `${updated.id}.meta.yaml`);
+        tx.stageFile(metaPath, dumpYaml(meta));
+        tx.addEvent({
+          kind: 'artifact.confirmed',
+          entityId: updated.id,
+          summary: `Confirmed diagram "${updated.title}" still accurate (${actorType}: ${confirmedBy})`,
+          details: {
+            artifactType: 'diagram',
+            artifactId: updated.id,
+            actorType,
+            confirmedBy,
+            confirmedAgainst,
+            note: input.note ?? '',
+          },
+        });
+        return updated;
       }
 
-      if (artifactType === 'media') {
-        const item = await this.readMediaById(tx.slug, artifactId, { loadContent: false });
+      if (validType === 'media') {
+        const item = await this.readMediaById(tx.slug, artifactId, { loadContent: true });
         if (!item) throw new NotFoundError(`Media "${artifactId}" not found.`);
-        await this.updateMediaUnlocked(tx, artifactId, {
-          basedOnDecisions: upgradeDecisionIds(item.basedOnDecisions),
+        const { nextConfirmations, confirmedAgainst } = buildConfirmations(
+          item.confirmations,
+          item.basedOnDecisions,
+        );
+        const updated = MediaArtifactSchema.parse({
+          ...item,
+          confirmations: nextConfirmations,
+          updatedAt: now,
         });
-        return;
+        const mediaDir = await this.safeBoardFilePath(tx.slug, 'media');
+        const metaPath = await assertContainedPath(
+          mediaDir,
+          path.join(mediaDir, `${updated.id}.meta.yaml`),
+          { label: `media meta "${updated.id}"` },
+        );
+        const { content: _inlineContent, ...metaOnly } = updated;
+        tx.stageFile(metaPath, dumpYaml(updated.filePath ? metaOnly : updated));
+        tx.addEvent({
+          kind: 'artifact.confirmed',
+          entityId: updated.id,
+          summary: `Confirmed ${updated.kind} "${updated.title}" still accurate (${actorType}: ${confirmedBy})`,
+          details: {
+            artifactType: 'media',
+            artifactId: updated.id,
+            actorType,
+            confirmedBy,
+            confirmedAgainst,
+            note: input.note ?? '',
+          },
+        });
+        return updated;
       }
 
-      if (artifactType === 'task') {
-        const item = await this.readTaskById(tx.slug, artifactId);
-        if (!item) throw new NotFoundError(`Task "${artifactId}" not found.`);
-        await this.upsertTaskUnlocked(tx, {
-          id: item.id,
-          title: item.title,
-          linkedDecisionIds: upgradeDecisionIds(item.linkedDecisionIds),
-        });
-        return;
+      const quiz = await this.readQuizById(tx.slug, artifactId);
+      if (!quiz) throw new NotFoundError(`Quiz "${artifactId}" not found.`);
+      const allQuizDecs = [
+        ...quiz.basedOnDecisions,
+        ...quiz.questions.flatMap((q) => q.relatedDecisionIds ?? []),
+      ];
+      const { nextConfirmations, confirmedAgainst } = buildConfirmations(
+        quiz.confirmations,
+        allQuizDecs,
+      );
+      const updated = QuizSchema.parse({
+        ...quiz,
+        confirmations: nextConfirmations,
+        updatedAt: now,
+      });
+      const quizPath = await this.safeBoardFilePath(tx.slug, 'quizzes', `${updated.id}.quiz.json`);
+      tx.stageFile(quizPath, `${JSON.stringify(updated, null, 2)}\n`);
+      tx.addEvent({
+        kind: 'artifact.confirmed',
+        entityId: updated.id,
+        summary: `Confirmed quiz "${updated.title}" still accurate (${actorType}: ${confirmedBy})`,
+        details: {
+          artifactType: 'quiz',
+          artifactId: updated.id,
+          actorType,
+          confirmedBy,
+          confirmedAgainst,
+          note: input.note ?? '',
+        },
+      });
+      return updated;
+    });
+  }
+
+  /**
+   * Queue a refresh job for a stale artifact (diagram, media, or quiz) with active-job dedupe (AC7.4, D19).
+   */
+  public async createRefreshJob(
+    boardSlug: string | undefined,
+    rawInput: {
+      artifactType: RefreshJobArtifactType;
+      artifactId: string;
+      reason?: string;
+    },
+    actor: Actor = DEFAULT_ACTOR,
+  ): Promise<{ job: RefreshJob; deduplicated: boolean }> {
+    const input = parseStrict(CreateRefreshJobInputSchema.omit({ actor: true }), rawInput, 'refresh job');
+
+    return this.mutate(boardSlug, actor, async (tx) => {
+      // Dedupe active (queued or claimed) jobs per artifact (D19)
+      const existingJobs = await this.listJobs(tx.slug);
+      const active = existingJobs.find(
+        (j) =>
+          j.artifactType === input.artifactType &&
+          j.artifactId === input.artifactId &&
+          (j.status === 'queued' || j.status === 'claimed'),
+      );
+      if (active) {
+        return { job: active, deduplicated: true };
       }
 
-      if (artifactType === 'quiz') {
-        const quiz = await this.readQuizById(tx.slug, artifactId);
-        if (!quiz) throw new NotFoundError(`Quiz "${artifactId}" not found.`);
-        const quizPath = await this.safeBoardFilePath(tx.slug, 'quizzes', `${quiz.id}.quiz.json`);
-        const ev = tx.addEvent({
-          kind: 'artifact.refreshed',
-          entityId: quiz.id,
-          summary: `Marked quiz "${quiz.title}" aligned with latest decisions`,
-        });
-        const updated: Quiz = {
-          ...quiz,
-          basedOnDecisions: upgradeDecisionIds(quiz.basedOnDecisions),
-          boardRevisionAtUpdate: ev.revision,
-          updatedAt: nowIso(),
-        };
-        tx.stageFile(quizPath, `${JSON.stringify(updated, null, 2)}\n`);
+      const decisions = await this.listDecisions(tx.slug);
+      const decisionMap = new Map(decisions.map((d) => [d.id, d]));
+
+      let artifactTitle: string;
+      let baseVersion: number;
+      let basedOnDecisions: string[];
+      let mediaKind: MediaKind | undefined;
+      let diagramKind: DiagramKind | undefined;
+      let kindLabel: string = input.artifactType;
+
+      if (input.artifactType === 'diagram') {
+        const diag = await this.readDiagramById(tx.slug, input.artifactId);
+        if (!diag) throw new NotFoundError(`Diagram "${input.artifactId}" not found.`);
+        artifactTitle = diag.title;
+        baseVersion = diag.version;
+        basedOnDecisions = diag.basedOnDecisions;
+        diagramKind = diag.kind;
+        kindLabel = `${diag.kind} diagram`;
+      } else if (input.artifactType === 'media') {
+        const media = await this.readMediaById(tx.slug, input.artifactId, { loadContent: false });
+        if (!media) throw new NotFoundError(`Media "${input.artifactId}" not found.`);
+        artifactTitle = media.title;
+        baseVersion = media.version;
+        basedOnDecisions = media.basedOnDecisions;
+        mediaKind = media.kind;
+        kindLabel = media.kind;
+      } else {
+        const quiz = await this.readQuizById(tx.slug, input.artifactId);
+        if (!quiz) throw new NotFoundError(`Quiz "${input.artifactId}" not found.`);
+        artifactTitle = quiz.title;
+        baseVersion = quiz.version;
+        basedOnDecisions = [
+          ...quiz.basedOnDecisions,
+          ...quiz.questions.flatMap((q) => q.relatedDecisionIds ?? []),
+        ];
+        kindLabel = 'quiz';
       }
+
+      const { staleIds } = evaluateDecisionStaleness(basedOnDecisions, decisionMap);
+      const decisionsBefore = staleIds.length > 0 ? staleIds : Array.from(new Set(basedOnDecisions));
+      const decisionsNowSet = new Set<string>();
+      for (const decId of decisionsBefore) {
+        const latest = resolveLatestDecision(decId, decisionMap);
+        if (latest) decisionsNowSet.add(latest.id);
+      }
+      const decisionsNow = Array.from(decisionsNowSet);
+
+      const defaultReason =
+        decisionsNow.length > 0
+          ? `regenerate ${kindLabel} "${artifactTitle}" for ${decisionsNow.join(', ')}`
+          : `regenerate ${kindLabel} "${artifactTitle}"`;
+      const reason = input.reason?.trim() || defaultReason;
+
+      const now = nowIso();
+      const id = shortId('job');
+      const job = RefreshJobSchema.parse({
+        id,
+        kind: 'refresh',
+        artifactType: input.artifactType,
+        artifactId: input.artifactId,
+        artifactTitle,
+        ...(mediaKind ? { mediaKind } : {}),
+        ...(diagramKind ? { diagramKind } : {}),
+        reason,
+        decisionsBefore,
+        decisionsNow,
+        baseVersion,
+        status: 'queued',
+        claimedBy: null,
+        leaseToken: null,
+        claimedAt: null,
+        leaseExpiresAt: null,
+        result: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const jobsDir = await this.safeBoardFilePath(tx.slug, 'jobs');
+      await ensureDir(jobsDir);
+      const jobPath = await assertContainedPath(jobsDir, path.join(jobsDir, `${job.id}.yaml`), {
+        label: `job "${job.id}"`,
+      });
+      tx.stageFile(jobPath, dumpYaml(job), { noClobber: true });
+      tx.addEvent({
+        kind: 'job.created',
+        entityId: job.id,
+        summary: `Refresh job waiting: ${reason}`,
+        details: {
+          artifactType: job.artifactType,
+          artifactId: job.artifactId,
+          artifactTitle: job.artifactTitle,
+          decisionsBefore: job.decisionsBefore,
+          decisionsNow: job.decisionsNow,
+          baseVersion: job.baseVersion,
+        },
+      });
+
+      return { job, deduplicated: false };
+    });
+  }
+
+  /**
+   * Atomically claim a queued (or lease-expired) refresh job with a lease token and 15 min TTL (AC7.4, D19).
+   */
+  public async claimJob(
+    boardSlug: string | undefined,
+    rawInput: {
+      jobId?: string;
+      artifactType?: RefreshJobArtifactType;
+      mediaKind?: MediaKind;
+      claimedBy: string;
+      ttlMs?: number;
+      now?: Date;
+    },
+    actor: Actor = DEFAULT_ACTOR,
+  ): Promise<RefreshJob | null> {
+    const { now: nowOpt, ...schemaInput } = rawInput;
+    const input = parseStrict(ClaimJobInputSchema.omit({ actor: true }), schemaInput, 'job claim');
+    const nowDate = nowOpt ?? new Date();
+    const nowMs = nowDate.getTime();
+    const nowStr = nowDate.toISOString();
+    const ttlMs = input.ttlMs ?? DEFAULT_JOB_LEASE_TTL_MS;
+
+    const isClaimable = (job: RefreshJob): boolean => {
+      if (job.status === 'queued') return true;
+      if (job.status === 'claimed' && job.leaseExpiresAt) {
+        const expMs = Date.parse(job.leaseExpiresAt);
+        return Number.isFinite(expMs) && expMs <= nowMs;
+      }
+      return false;
+    };
+
+    return this.mutate(boardSlug, actor, async (tx) => {
+      let target: RefreshJob | null = null;
+      if (input.jobId) {
+        const found = await this.readJobById(tx.slug, input.jobId);
+        if (!found) {
+          throw new NotFoundError(`Refresh job "${input.jobId}" not found on board "${tx.slug}".`);
+        }
+        if (!isClaimable(found)) {
+          throw new ConflictError(
+            `Refresh job "${found.id}" cannot be claimed (status: ${found.status}, active lease until ${found.leaseExpiresAt ?? 'n/a'}).`,
+          );
+        }
+        target = found;
+      } else {
+        const allJobs = await this.listJobs(tx.slug);
+        target =
+          allJobs.find((j) => {
+            if (!isClaimable(j)) return false;
+            if (input.artifactType && j.artifactType !== input.artifactType) return false;
+            if (input.mediaKind && j.mediaKind !== input.mediaKind) return false;
+            return true;
+          }) ?? null;
+        if (!target) return null;
+      }
+
+      const leaseToken = crypto.randomBytes(16).toString('hex');
+      const leaseExpiresAt = new Date(nowMs + ttlMs).toISOString();
+      const updated = RefreshJobSchema.parse({
+        ...target,
+        status: 'claimed',
+        claimedBy: input.claimedBy,
+        leaseToken,
+        claimedAt: nowStr,
+        leaseExpiresAt,
+        updatedAt: nowStr,
+      });
+
+      const jobPath = await this.safeBoardFilePath(tx.slug, 'jobs', `${updated.id}.yaml`);
+      tx.stageFile(jobPath, dumpYaml(updated));
+      tx.addEvent({
+        kind: 'job.claimed',
+        entityId: updated.id,
+        summary: `Claimed refresh job ${updated.id} by ${input.claimedBy}`,
+      });
+      return updated;
+    });
+  }
+
+  /**
+   * Renew an active job lease with a matching lease token (D19).
+   */
+  public async renewJob(
+    boardSlug: string | undefined,
+    jobId: string,
+    rawInput: { leaseToken: string; ttlMs?: number; now?: Date },
+    actor: Actor = DEFAULT_ACTOR,
+  ): Promise<RefreshJob> {
+    validateEntityId(jobId, 'jobId');
+    const { now: nowOpt, ...schemaInput } = rawInput;
+    const input = parseStrict(RenewJobInputSchema.omit({ actor: true }), schemaInput, 'job renew');
+    const nowDate = nowOpt ?? new Date();
+    const nowMs = nowDate.getTime();
+    const nowStr = nowDate.toISOString();
+    const ttlMs = input.ttlMs ?? DEFAULT_JOB_LEASE_TTL_MS;
+
+    return this.mutate(boardSlug, actor, async (tx) => {
+      const existing = await this.readJobById(tx.slug, jobId);
+      if (!existing) {
+        throw new NotFoundError(`Refresh job "${jobId}" not found on board "${tx.slug}".`);
+      }
+      if (existing.status !== 'claimed' || !existing.leaseToken || existing.leaseToken !== input.leaseToken) {
+        throw new ConflictError(`Invalid lease token or job "${jobId}" is not actively claimed.`);
+      }
+      if (existing.leaseExpiresAt && Date.parse(existing.leaseExpiresAt) < nowMs) {
+        throw new ConflictError(`Lease for refresh job "${jobId}" has already expired.`);
+      }
+
+      const updated = RefreshJobSchema.parse({
+        ...existing,
+        leaseExpiresAt: new Date(nowMs + ttlMs).toISOString(),
+        updatedAt: nowStr,
+      });
+      const jobPath = await this.safeBoardFilePath(tx.slug, 'jobs', `${updated.id}.yaml`);
+      tx.stageFile(jobPath, dumpYaml(updated));
+      tx.addEvent({
+        kind: 'job.renewed',
+        entityId: updated.id,
+        summary: `Renewed lease for refresh job ${updated.id}`,
+      });
+      return updated;
+    });
+  }
+
+  /**
+   * Release a claimed job back to `queued` using its lease token (D19).
+   */
+  public async releaseJob(
+    boardSlug: string | undefined,
+    jobId: string,
+    rawInput: { leaseToken: string; reason?: string },
+    actor: Actor = DEFAULT_ACTOR,
+  ): Promise<RefreshJob> {
+    validateEntityId(jobId, 'jobId');
+    const input = parseStrict(ReleaseJobInputSchema.omit({ actor: true }), rawInput, 'job release');
+
+    return this.mutate(boardSlug, actor, async (tx) => {
+      const existing = await this.readJobById(tx.slug, jobId);
+      if (!existing) {
+        throw new NotFoundError(`Refresh job "${jobId}" not found on board "${tx.slug}".`);
+      }
+      if (existing.status !== 'claimed' || !existing.leaseToken || existing.leaseToken !== input.leaseToken) {
+        throw new ConflictError(`Invalid lease token or job "${jobId}" is not claimed.`);
+      }
+
+      const updated = RefreshJobSchema.parse({
+        ...existing,
+        status: 'queued',
+        claimedBy: null,
+        leaseToken: null,
+        claimedAt: null,
+        leaseExpiresAt: null,
+        updatedAt: nowIso(),
+      });
+      const jobPath = await this.safeBoardFilePath(tx.slug, 'jobs', `${updated.id}.yaml`);
+      tx.stageFile(jobPath, dumpYaml(updated));
+      tx.addEvent({
+        kind: 'job.released',
+        entityId: updated.id,
+        summary: input.reason
+          ? `Released refresh job ${updated.id}: ${input.reason}`
+          : `Released refresh job ${updated.id} back to queue`,
+      });
+      return updated;
+    });
+  }
+
+  /**
+   * Complete (or fail) a claimed refresh job (AC7.4, D19).
+   * When completing as `done`, strictly requires that the target artifact has a new version
+   * (`version > baseVersion`) whose history entry has `createdByJob === job.id`.
+   */
+  public async completeJob(
+    boardSlug: string | undefined,
+    jobId: string,
+    rawInput: {
+      leaseToken: string;
+      status?: 'done' | 'failed';
+      artifactVersion?: number;
+      summary?: string;
+      error?: string;
+      now?: Date;
+    },
+    actor: Actor = DEFAULT_ACTOR,
+  ): Promise<RefreshJob> {
+    validateEntityId(jobId, 'jobId');
+    const { now: nowOpt, ...schemaInput } = rawInput;
+    const input = parseStrict(CompleteJobInputSchema.omit({ actor: true }), schemaInput, 'job complete');
+    const nowDate = nowOpt ?? new Date();
+    const nowMs = nowDate.getTime();
+    const nowStr = nowDate.toISOString();
+    const targetStatus = input.status ?? 'done';
+
+    return this.mutate(boardSlug, actor, async (tx) => {
+      const existing = await this.readJobById(tx.slug, jobId);
+      if (!existing) {
+        throw new NotFoundError(`Refresh job "${jobId}" not found on board "${tx.slug}".`);
+      }
+      if (existing.status !== 'claimed' || !existing.leaseToken || existing.leaseToken !== input.leaseToken) {
+        throw new ConflictError(`Invalid lease token or job "${jobId}" is not claimed.`);
+      }
+      if (existing.leaseExpiresAt && Date.parse(existing.leaseExpiresAt) < nowMs) {
+        throw new ConflictError(`Lease for refresh job "${jobId}" has expired; reclaim before completing.`);
+      }
+
+      if (targetStatus === 'failed') {
+        const failed = RefreshJobSchema.parse({
+          ...existing,
+          status: 'failed',
+          leaseToken: null,
+          leaseExpiresAt: null,
+          result: {
+            ...(input.error ? { error: input.error } : {}),
+            ...(input.summary ? { summary: input.summary } : {}),
+          },
+          updatedAt: nowStr,
+        });
+        const jobPath = await this.safeBoardFilePath(tx.slug, 'jobs', `${failed.id}.yaml`);
+        tx.stageFile(jobPath, dumpYaml(failed));
+        tx.addEvent({
+          kind: 'job.failed',
+          entityId: failed.id,
+          summary: `Refresh job ${failed.id} failed${input.error ? `: ${input.error}` : ''}`,
+        });
+        return failed;
+      }
+
+      // D19 / AC7.4 strict verification: artifact must have version > baseVersion AND createdByJob === job.id
+      let artifactVersion: number;
+      let history: ArtifactVersionEntry[];
+      if (existing.artifactType === 'diagram') {
+        const diag = await this.readDiagramById(tx.slug, existing.artifactId);
+        if (!diag) throw new NotFoundError(`Target diagram "${existing.artifactId}" no longer exists.`);
+        artifactVersion = diag.version;
+        history = diag.history;
+      } else if (existing.artifactType === 'media') {
+        const media = await this.readMediaById(tx.slug, existing.artifactId, { loadContent: false });
+        if (!media) throw new NotFoundError(`Target media "${existing.artifactId}" no longer exists.`);
+        artifactVersion = media.version;
+        history = media.history;
+      } else {
+        const quiz = await this.readQuizById(tx.slug, existing.artifactId);
+        if (!quiz) throw new NotFoundError(`Target quiz "${existing.artifactId}" no longer exists.`);
+        artifactVersion = quiz.version;
+        history = quiz.history;
+      }
+
+      const claimedVersion = input.artifactVersion ?? artifactVersion;
+      if (artifactVersion <= existing.baseVersion || claimedVersion <= existing.baseVersion) {
+        throw new ValidationError(
+          `Cannot complete refresh job "${existing.id}": artifact version (${claimedVersion}) must be greater than baseVersion (${existing.baseVersion}).`,
+        );
+      }
+
+      const matchingEntry = history.find(
+        (h) => h.version === claimedVersion && h.createdByJob === existing.id,
+      );
+      if (!matchingEntry) {
+        throw new ValidationError(
+          `Cannot complete refresh job "${existing.id}": artifact version ${claimedVersion} was not created with createdByJob="${existing.id}".`,
+        );
+      }
+
+      const completed = RefreshJobSchema.parse({
+        ...existing,
+        status: 'done',
+        leaseToken: null,
+        leaseExpiresAt: null,
+        result: {
+          artifactVersion: claimedVersion,
+          ...(input.summary ? { summary: input.summary } : {}),
+        },
+        updatedAt: nowStr,
+      });
+      const jobPath = await this.safeBoardFilePath(tx.slug, 'jobs', `${completed.id}.yaml`);
+      tx.stageFile(jobPath, dumpYaml(completed));
+      tx.addEvent({
+        kind: 'job.completed',
+        entityId: completed.id,
+        summary: `Completed refresh job ${completed.id} (${completed.artifactType} "${completed.artifactTitle}" → v${claimedVersion})`,
+        details: {
+          artifactType: completed.artifactType,
+          artifactId: completed.artifactId,
+          artifactVersion: claimedVersion,
+        },
+      });
+      return completed;
     });
   }
 

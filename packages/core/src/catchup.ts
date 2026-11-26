@@ -1,0 +1,344 @@
+import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import os from 'node:os';
+import { capSingleLine, isMeaningfulEvent, resolveLatestDecision } from './drift.js';
+import { validateEntityId } from './ids.js';
+import type {
+  BoardSnapshot,
+  CatchUpDecisionChange,
+  CatchUpNewSession,
+  CatchUpReport,
+  CatchUpStaleArtifact,
+  CatchUpTaskMove,
+  ReaderBoardCursor,
+  TaskColumn,
+} from './schemas.js';
+
+/**
+ * Derive a deterministic, filename-safe per-human reader ID (AC7.1, D16).
+ * Uses SHA-256 of `git config user.email` (when available) or the OS username,
+ * so raw emails/usernames never appear in filenames or committed files (C3).
+ */
+export function resolveDefaultReaderId(options: {
+  projectRoot?: string;
+  env?: NodeJS.ProcessEnv;
+} = {}): string {
+  const env = options.env ?? process.env;
+  const explicit = env.CONTEXTDECK_READER?.trim();
+  if (explicit) {
+    try {
+      return validateEntityId(explicit, 'readerId');
+    } catch {
+      const hash = crypto.createHash('sha256').update(explicit).digest('hex').slice(0, 16);
+      return `reader_${hash}`;
+    }
+  }
+
+  let identity = '';
+  try {
+    const email = execFileSync('git', ['config', 'user.email'], {
+      cwd: options.projectRoot,
+      encoding: 'utf8',
+      timeout: 500,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    if (email) identity = email.toLowerCase();
+  } catch {
+    // Fallback to OS user
+  }
+
+  if (!identity) {
+    try {
+      identity = os.userInfo().username || env.USER || env.USERNAME || 'local';
+    } catch {
+      identity = env.USER || env.USERNAME || 'local';
+    }
+  }
+
+  const hash = crypto.createHash('sha256').update(identity).digest('hex').slice(0, 16);
+  return `reader_${hash}`;
+}
+
+export function resolveDefaultReaderLabel(options: {
+  projectRoot?: string;
+  env?: NodeJS.ProcessEnv;
+} = {}): string {
+  const env = options.env ?? process.env;
+  const explicit = env.CONTEXTDECK_READER_LABEL?.trim();
+  if (explicit) return capSingleLine(explicit, 80);
+
+  try {
+    const name = execFileSync('git', ['config', 'user.name'], {
+      cwd: options.projectRoot,
+      encoding: 'utf8',
+      timeout: 500,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    if (name) return capSingleLine(name, 80);
+  } catch {
+    // fallback
+  }
+
+  try {
+    const user = os.userInfo().username || env.USER || env.USERNAME;
+    if (user) return capSingleLine(user, 80);
+  } catch {
+    // fallback
+  }
+
+  return 'human';
+}
+
+function firstRationaleLine(summary: string, rationale: string): string {
+  if (summary.trim()) return capSingleLine(summary, 180);
+  const firstLine = rationale
+    .split(/\r?\n/)
+    .map((l) => l.replace(/^#+\s*/, '').trim())
+    .find((l) => l.length > 0);
+  return firstLine ? capSingleLine(firstLine, 180) : '';
+}
+
+const VALID_COLUMNS = new Set<TaskColumn>(['backlog', 'in_progress', 'in_review', 'done']);
+
+function parseTaskColumn(value: unknown): TaskColumn | null {
+  return typeof value === 'string' && VALID_COLUMNS.has(value as TaskColumn)
+    ? (value as TaskColumn)
+    : null;
+}
+
+/**
+ * Compute the human "Catch up" report between a reader's cursor and the board's current revision (AC7.2, D16).
+ */
+export function computeCatchUp(
+  snapshot: BoardSnapshot,
+  cursor: ReaderBoardCursor | null,
+): CatchUpReport {
+  const fromRevision = cursor?.lastReviewedRevision ?? 0;
+  const toRevision = snapshot.config.revision;
+  const lastReviewedAt = cursor?.lastReviewedAt ?? null;
+
+  const windowEvents = snapshot.events
+    .filter((ev) => ev.revision > fromRevision && ev.revision <= toRevision)
+    .sort((a, b) => a.revision - b.revision);
+
+  const decisionMap = new Map(snapshot.decisions.map((d) => [d.id, d]));
+  const taskMap = new Map(snapshot.tasks.map((t) => [t.id, t]));
+
+  // 1. Decisions changed in window
+  const rawDecChanges = new Map<string, CatchUpDecisionChange>();
+  const supersededInWindow = new Set<string>();
+  const changedDecisionIds = new Set<string>();
+
+  for (const ev of windowEvents) {
+    if (
+      ev.kind !== 'decision.recorded' &&
+      ev.kind !== 'decision.superseded' &&
+      ev.kind !== 'decision.updated'
+    ) {
+      continue;
+    }
+    if (!ev.entityId) continue;
+    const dec = decisionMap.get(ev.entityId);
+    if (!dec) continue;
+    changedDecisionIds.add(dec.id);
+
+    const supersedesId =
+      (typeof ev.details?.supersedes === 'string' ? ev.details.supersedes : null) ??
+      dec.supersedes ??
+      null;
+    const prevDec = supersedesId ? decisionMap.get(supersedesId) : undefined;
+    const beforeObj =
+      ev.details?.before && typeof ev.details.before === 'object'
+        ? (ev.details.before as { id?: unknown; title?: unknown })
+        : null;
+    const previousDecisionId =
+      supersedesId ?? (typeof beforeObj?.id === 'string' && beforeObj.id !== dec.id ? beforeObj.id : undefined);
+    const previousTitle =
+      prevDec?.title ??
+      (previousDecisionId && typeof beforeObj?.title === 'string' ? beforeObj.title : undefined);
+
+    if (previousDecisionId) {
+      supersededInWindow.add(previousDecisionId);
+      changedDecisionIds.add(previousDecisionId);
+    }
+
+    const existing = rawDecChanges.get(dec.id);
+    rawDecChanges.set(dec.id, {
+      decisionId: dec.id,
+      title: dec.title,
+      status: dec.status,
+      summary: dec.summary,
+      rationaleLine: firstRationaleLine(dec.summary, dec.rationale),
+      previousDecisionId: previousDecisionId ?? existing?.previousDecisionId,
+      previousTitle: previousTitle ?? existing?.previousTitle,
+      revision: ev.revision,
+      timestamp: ev.timestamp,
+    });
+  }
+
+  // Drop redundant standalone entries for decisions that were superseded in the exact same window
+  const decisionsChanged = Array.from(rawDecChanges.values())
+    .filter((entry) => !supersededInWindow.has(entry.decisionId))
+    .sort((a, b) => a.revision - b.revision);
+
+  // 2. Artifacts now out of date (diagram, media, quiz only — D17 tasks are not refresh targets)
+  const openJobByKey = new Map<string, { id: string; status: 'queued' | 'claimed'; claimedBy: string | null }>();
+  for (const job of snapshot.jobs ?? []) {
+    if (job.status === 'queued' || job.status === 'claimed') {
+      openJobByKey.set(`${job.artifactType}:${job.artifactId}`, {
+        id: job.id,
+        status: job.status,
+        claimedBy: job.claimedBy,
+      });
+    }
+  }
+
+  const artifactRevMap = new Map<string, number>();
+  for (const d of snapshot.diagrams) artifactRevMap.set(`diagram:${d.id}`, d.boardRevisionAtUpdate);
+  for (const m of snapshot.media) artifactRevMap.set(`media:${m.id}`, m.boardRevisionAtUpdate);
+  for (const q of snapshot.quizzes) artifactRevMap.set(`quiz:${q.id}`, q.boardRevisionAtUpdate);
+
+  const staleArtifacts: CatchUpStaleArtifact[] = [];
+  if (fromRevision < toRevision) {
+    for (const notice of snapshot.drift.staleArtifacts) {
+      if (notice.artifactType === 'task') continue;
+      const key = `${notice.artifactType}:${notice.artifactId}`;
+      const artRev = artifactRevMap.get(key) ?? 0;
+
+      const decisionTriggered = notice.staleDecisionIds.some((staleDecId) => {
+        if (changedDecisionIds.has(staleDecId)) return true;
+        const latest = resolveLatestDecision(staleDecId, decisionMap);
+        return latest ? changedDecisionIds.has(latest.id) : false;
+      });
+
+      if (fromRevision === 0 || decisionTriggered || artRev > fromRevision) {
+        staleArtifacts.push({
+          artifactType: notice.artifactType,
+          artifactId: notice.artifactId,
+          title: notice.title,
+          staleDecisionIds: notice.staleDecisionIds,
+          reasons: notice.reasons,
+          activeJob: openJobByKey.get(key) ?? null,
+        });
+      }
+    }
+  }
+
+  // 3. Tasks moved (or created) in window
+  const taskTrack = new Map<
+    string,
+    { title: string; fromColumn: TaskColumn | null; toColumn: TaskColumn; revision: number; created: boolean }
+  >();
+  const deletedTasks = new Set<string>();
+  for (const ev of windowEvents) {
+    if (!ev.entityId) continue;
+    if (ev.kind === 'task.deleted') {
+      deletedTasks.add(ev.entityId);
+      taskTrack.delete(ev.entityId);
+      continue;
+    }
+    if (ev.kind !== 'task.created' && ev.kind !== 'task.updated') continue;
+    deletedTasks.delete(ev.entityId);
+
+    const beforeObj =
+      ev.details?.before && typeof ev.details.before === 'object'
+        ? (ev.details.before as { column?: unknown; title?: unknown })
+        : null;
+    const afterObj =
+      ev.details?.after && typeof ev.details.after === 'object'
+        ? (ev.details.after as { column?: unknown; title?: unknown })
+        : null;
+
+    const currentTask = taskMap.get(ev.entityId);
+    const toCol = parseTaskColumn(afterObj?.column) ?? currentTask?.column ?? 'backlog';
+    const fromCol = ev.kind === 'task.created' ? null : parseTaskColumn(beforeObj?.column);
+    const title =
+      currentTask?.title ??
+      (typeof afterObj?.title === 'string' ? afterObj.title : ev.entityId);
+
+    const prev = taskTrack.get(ev.entityId);
+    if (!prev) {
+      taskTrack.set(ev.entityId, {
+        title,
+        fromColumn: fromCol,
+        toColumn: toCol,
+        revision: ev.revision,
+        created: ev.kind === 'task.created',
+      });
+    } else {
+      prev.title = title;
+      prev.toColumn = toCol;
+      prev.revision = ev.revision;
+    }
+  }
+
+  const tasksMoved: CatchUpTaskMove[] = [];
+  for (const [taskId, info] of taskTrack.entries()) {
+    if (deletedTasks.has(taskId)) continue;
+    if (info.created || (info.fromColumn !== null && info.fromColumn !== info.toColumn)) {
+      tasksMoved.push({
+        taskId,
+        title: info.title,
+        fromColumn: info.fromColumn,
+        toColumn: info.toColumn,
+        revision: info.revision,
+      });
+    }
+  }
+  tasksMoved.sort((a, b) => a.revision - b.revision);
+
+  // 4. New sessions (from session.registered events OR hook-created sessions after lastReviewedAt)
+  const registeredEventSessionIds = new Set<string>();
+  for (const ev of windowEvents) {
+    if (ev.kind === 'session.registered' && ev.entityId) {
+      registeredEventSessionIds.add(ev.entityId);
+    }
+  }
+
+  const newSessions: CatchUpNewSession[] = [];
+  let hookOnlyNewSessions = 0;
+  for (const s of snapshot.sessions) {
+    const viaEvent = registeredEventSessionIds.has(s.id);
+    const viaTimestamp =
+      lastReviewedAt === null
+        ? fromRevision === 0
+        : Date.parse(s.createdAt) > Date.parse(lastReviewedAt);
+    if (viaEvent || viaTimestamp) {
+      newSessions.push({
+        sessionId: s.id,
+        title: s.title,
+        harness: s.harness,
+        createdAt: s.createdAt,
+      });
+      if (!viaEvent && lastReviewedAt !== null) {
+        hookOnlyNewSessions += 1;
+      }
+    }
+  }
+  newSessions.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+
+  // Count meaningful changes since last look (excluding initial board.init)
+  const meaningfulEventsCount = windowEvents.filter(
+    (ev) => isMeaningfulEvent(ev.kind) && ev.kind !== 'board.init',
+  ).length;
+
+  const unseenCount = meaningfulEventsCount + hookOnlyNewSessions;
+  const hasUnseen =
+    unseenCount > 0 ||
+    decisionsChanged.length > 0 ||
+    staleArtifacts.length > 0 ||
+    tasksMoved.length > 0 ||
+    newSessions.length > 0;
+
+  return {
+    fromRevision,
+    toRevision,
+    lastReviewedAt,
+    unseenCount: unseenCount > 0 ? unseenCount : hasUnseen ? newSessions.length : 0,
+    hasUnseen,
+    decisionsChanged,
+    staleArtifacts,
+    tasksMoved,
+    newSessions,
+  };
+}

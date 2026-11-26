@@ -1,0 +1,523 @@
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import * as core from '../src/index.js';
+
+const tmpDirs: string[] = [];
+
+async function makeTempDir(prefix = 'cdeck-b3-core-'): Promise<string> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  tmpDirs.push(dir);
+  return dir;
+}
+
+afterEach(async () => {
+  while (tmpDirs.length > 0) {
+    await fs.rm(tmpDirs.pop()!, { recursive: true, force: true });
+  }
+});
+
+describe('B3 Core: Reader cursors & Catch up (AC7.1, AC7.2, D16)', () => {
+  it('stores reader cursors per reader & board under .runtime/readers without appending events to events.jsonl', async () => {
+    const dir = await makeTempDir();
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Alpha', slug: 'alpha', setAsDefault: true });
+    await store.createBoard({ title: 'Beta', slug: 'beta' });
+
+    const d1 = await store.recordDecision('alpha', { title: 'Use Redis' });
+    const d2 = await store.recordDecision('alpha', {
+      title: 'Use Plain Files',
+      supersedes: d1.id,
+      summary: 'Zero-daemon local-first storage.',
+    });
+    const t1 = await store.upsertTask('alpha', { title: 'Migrate storage', column: 'backlog' });
+    await store.patchTask('alpha', t1.id, { column: 'in_progress' });
+    await store.upsertDiagram('alpha', {
+      title: 'Storage Flow',
+      kind: 'mermaid',
+      content: 'flowchart LR\nA-->B',
+      basedOnDecisions: [d1.id],
+    });
+    await store.registerSession('alpha', { title: 'Backend Session', harness: 'codex' });
+
+    const snap = await store.getSnapshot('alpha');
+    const beforeEventCount = snap.events.length;
+    const beforeRev = snap.config.revision;
+
+    // First look (no cursor yet) -> has unseen changes
+    const cursorBefore = await store.getReaderCursor('alpha', 'reader_alice');
+    expect(cursorBefore).toBeNull();
+
+    const catchUp1 = core.computeCatchUp(snap, cursorBefore);
+    expect(catchUp1.fromRevision).toBe(0);
+    expect(catchUp1.toRevision).toBe(beforeRev);
+    expect(catchUp1.hasUnseen).toBe(true);
+    expect(catchUp1.unseenCount).toBeGreaterThan(0);
+    expect(catchUp1.decisionsChanged.some((d) => d.decisionId === d2.id && d.previousDecisionId === d1.id)).toBe(true);
+    expect(catchUp1.staleArtifacts.some((a) => a.title === 'Storage Flow')).toBe(true);
+    expect(catchUp1.tasksMoved.some((t) => t.taskId === t1.id && t.toColumn === 'in_progress')).toBe(true);
+    expect(catchUp1.newSessions.some((s) => s.title === 'Backend Session')).toBe(true);
+
+    // Acknowledge displayed revision for reader_alice on alpha ONLY
+    const acked = await store.ackReaderCursor('alpha', beforeRev, { readerId: 'reader_alice' });
+    expect(acked.lastReviewedRevision).toBe(beforeRev);
+
+    // D16: No reader.* events in events.jsonl, board revision unchanged
+    const snapAfterAck = await store.getSnapshot('alpha');
+    expect(snapAfterAck.config.revision).toBe(beforeRev);
+    expect(snapAfterAck.events).toHaveLength(beforeEventCount);
+    expect(snapAfterAck.events.some((e) => e.kind.startsWith('reader.'))).toBe(false);
+
+    // Cursor file lives under .runtime/readers/<readerId>.yaml
+    const readerFile = path.join(store.runtimeDir, 'readers', 'reader_alice.yaml');
+    await expect(fs.stat(readerFile)).resolves.toBeTruthy();
+
+    // reader_alice is now caught up on alpha; reader_bob is still unseen; reader_alice on beta is untouched
+    const catchUpAlice = core.computeCatchUp(snapAfterAck, await store.getReaderCursor('alpha', 'reader_alice'));
+    expect(catchUpAlice.hasUnseen).toBe(false);
+    expect(catchUpAlice.unseenCount).toBe(0);
+    expect(catchUpAlice.decisionsChanged).toEqual([]);
+    expect(catchUpAlice.staleArtifacts).toEqual([]);
+    expect(catchUpAlice.tasksMoved).toEqual([]);
+    expect(catchUpAlice.newSessions).toEqual([]);
+
+    expect(await store.getReaderCursor('alpha', 'reader_bob')).toBeNull();
+    expect(await store.getReaderCursor('beta', 'reader_alice')).toBeNull();
+
+    // Ack cannot rewind cursor backwards
+    const noRewind = await store.ackReaderCursor('alpha', 1, { readerId: 'reader_alice' });
+    expect(noRewind.lastReviewedRevision).toBe(beforeRev);
+
+    // A new change makes reader_alice see only the delta
+    const d3 = await store.recordDecision('alpha', {
+      title: 'Add WAL checksums',
+      supersedes: d2.id,
+      summary: 'Detect torn writes.',
+    });
+    const snapAfterD3 = await store.getSnapshot('alpha');
+    const catchUpDelta = core.computeCatchUp(
+      snapAfterD3,
+      await store.getReaderCursor('alpha', 'reader_alice'),
+    );
+    expect(catchUpDelta.fromRevision).toBe(beforeRev);
+    expect(catchUpDelta.toRevision).toBe(snapAfterD3.config.revision);
+    expect(catchUpDelta.unseenCount).toBe(1);
+    expect(catchUpDelta.decisionsChanged).toHaveLength(1);
+    expect(catchUpDelta.decisionsChanged[0].decisionId).toBe(d3.id);
+    expect(catchUpDelta.decisionsChanged[0].previousDecisionId).toBe(d2.id);
+  });
+});
+
+describe('B3 Core: Confirm vs Refresh & removal of Mark Aligned (AC7.3, D17)', () => {
+  it('removes refreshArtifactDecisions and implements confirmations map with auto re-stale on next supersede', async () => {
+    const dir = await makeTempDir();
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Confirmations', slug: 'main' });
+
+    // D17: old refreshArtifactDecisions must be removed
+    expect((store as unknown as Record<string, unknown>).refreshArtifactDecisions).toBeUndefined();
+
+    const d1 = await store.recordDecision('main', { title: 'Auth via Cookies' });
+    const diag = await store.upsertDiagram('main', {
+      title: 'Auth Diagram',
+      kind: 'mermaid',
+      content: 'flowchart LR\nA-->B',
+      basedOnDecisions: [d1.id],
+    });
+    const task = await store.upsertTask('main', {
+      title: 'Implement Auth',
+      linkedDecisionIds: [d1.id],
+    });
+    const d2 = await store.recordDecision('main', {
+      title: 'Auth via JWT',
+      supersedes: d1.id,
+    });
+
+    // Diagram is stale against d1 -> d2
+    const snapStale = await store.getSnapshot('main');
+    expect(snapStale.drift.staleArtifacts.some((s) => s.artifactId === diag.id)).toBe(true);
+
+    // D17: tasks are not confirm/refresh targets
+    await expect(
+      store.confirmArtifact('main', 'task' as never, task.id, { note: 'nope' }, { type: 'human', label: 'alice' }),
+    ).rejects.toThrow(/task|artifact/i);
+
+    // Human confirms diagram against d2 without rewriting basedOnDecisions
+    const confirmed = await store.confirmArtifact(
+      'main',
+      'diagram',
+      diag.id,
+      { note: 'High-level box flow still accurate' },
+      { type: 'human', label: 'alice' },
+    );
+    expect(confirmed.basedOnDecisions).toEqual([d1.id]);
+    expect(confirmed.confirmations[d1.id]).toMatchObject({
+      againstDecisionId: d2.id,
+      confirmedBy: 'alice',
+      actorType: 'human',
+      note: 'High-level box flow still accurate',
+    });
+
+    // Drift clears for diag while latest replacement is d2
+    const snapConfirmed = await store.getSnapshot('main');
+    expect(snapConfirmed.drift.staleArtifacts.some((s) => s.artifactId === diag.id)).toBe(false);
+
+    // Auto re-stale when d2 is superseded by d3!
+    const d3 = await store.recordDecision('main', {
+      title: 'Auth via Passkeys',
+      supersedes: d2.id,
+    });
+    const snapReStale = await store.getSnapshot('main');
+    const reStale = snapReStale.drift.staleArtifacts.find((s) => s.artifactId === diag.id);
+    expect(reStale).toBeDefined();
+    expect(reStale!.staleDecisionIds).toContain(d1.id);
+    expect(reStale!.reasons[0]).toContain(d3.id);
+
+    // Agent confirmation records actorType === 'agent'
+    const agentConfirmed = await store.confirmArtifact(
+      'main',
+      'diagram',
+      diag.id,
+      { note: 'Verified abstract boundary holds' },
+      { type: 'agent', harness: 'codex', sessionId: 'sess_1' },
+    );
+    expect(agentConfirmed.confirmations[d1.id].actorType).toBe('agent');
+    expect(agentConfirmed.confirmations[d1.id].againstDecisionId).toBe(d3.id);
+  });
+});
+
+describe('B3 Core: Refresh Jobs, Leases, Dedupe, Completion Gate, and Neon 15 Digest (AC7.4, D19)', () => {
+  it('supports create (with dedupe), atomic claim + lease TTL + renew + release + strict completion verification', async () => {
+    const dir = await makeTempDir();
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Jobs', slug: 'main' });
+
+    const d1 = await store.recordDecision('main', { title: 'Old Spec' });
+    const diag = await store.upsertDiagram('main', {
+      title: 'Architecture',
+      kind: 'mermaid',
+      content: 'flowchart LR\nA-->Old',
+      basedOnDecisions: [d1.id],
+    });
+    const d2 = await store.recordDecision('main', { title: 'New Spec', supersedes: d1.id });
+
+    // Create refresh job -> deduped on second call
+    const r1 = await store.createRefreshJob(
+      'main',
+      { artifactType: 'diagram', artifactId: diag.id, reason: 'Update for New Spec' },
+      { type: 'human', label: 'alice' },
+    );
+    expect(r1.deduplicated).toBe(false);
+    expect(r1.job.status).toBe('queued');
+    expect(r1.job.baseVersion).toBe(1);
+    expect(r1.job.decisionsBefore).toEqual([d1.id]);
+    expect(r1.job.decisionsNow).toEqual([d2.id]);
+
+    const r2 = await store.createRefreshJob(
+      'main',
+      { artifactType: 'diagram', artifactId: diag.id },
+      { type: 'human', label: 'alice' },
+    );
+    expect(r2.deduplicated).toBe(true);
+    expect(r2.job.id).toBe(r1.job.id);
+    expect(await store.listJobs('main')).toHaveLength(1);
+
+    // Queued job appears in Context Pack
+    const snapQueued = await store.getSnapshot('main');
+    const pack = core.generateContextPack(snapQueued, { includeUpdateProtocol: false });
+    expect(pack).toContain('## Queued Refresh Jobs');
+    expect(pack).toContain(r1.job.id);
+
+    // Atomic claim grants lease token with 15 min default TTL
+    const t0 = new Date('2026-11-26T12:00:00.000Z');
+    const claimed = await store.claimJob(
+      'main',
+      { jobId: r1.job.id, claimedBy: 'worker-1', now: t0 },
+      { type: 'agent', label: 'worker-1' },
+    );
+    expect(claimed).not.toBeNull();
+    expect(claimed!.status).toBe('claimed');
+    expect(claimed!.leaseToken).toBeTruthy();
+    expect(Date.parse(claimed!.leaseExpiresAt!) - t0.getTime()).toBe(15 * 60 * 1000);
+
+    // Second claim while lease is active must fail / return conflict
+    await expect(
+      store.claimJob(
+        'main',
+        { jobId: r1.job.id, claimedBy: 'worker-2', now: new Date(t0.getTime() + 60_000) },
+        { type: 'agent', label: 'worker-2' },
+      ),
+    ).rejects.toThrow(/claimed|lease/i);
+
+    // Renew with wrong lease token rejected; right token extends TTL
+    await expect(
+      store.renewJob('main', r1.job.id, { leaseToken: 'wrong', now: new Date(t0.getTime() + 60_000) }),
+    ).rejects.toThrow(/lease/i);
+    const renewed = await store.renewJob('main', r1.job.id, {
+      leaseToken: claimed!.leaseToken!,
+      now: new Date(t0.getTime() + 5 * 60 * 1000),
+    });
+    expect(Date.parse(renewed.leaseExpiresAt!)).toBeGreaterThan(Date.parse(claimed!.leaseExpiresAt!));
+
+    // Release returns job to queued
+    const released = await store.releaseJob('main', r1.job.id, { leaseToken: claimed!.leaseToken! });
+    expect(released.status).toBe('queued');
+    expect(released.leaseToken).toBeNull();
+
+    // Reclaim, then expire lease after 16 min -> another worker can reclaim
+    const c2 = await store.claimJob('main', { jobId: r1.job.id, claimedBy: 'worker-1', now: t0 });
+    const c3 = await store.claimJob('main', {
+      jobId: r1.job.id,
+      claimedBy: 'worker-2',
+      now: new Date(t0.getTime() + 16 * 60 * 1000),
+    });
+    expect(c3!.claimedBy).toBe('worker-2');
+    expect(c3!.leaseToken).not.toBe(c2!.leaseToken);
+
+    // D19: Completing without a new artifact version created by this job MUST be rejected!
+    await expect(
+      store.completeJob('main', r1.job.id, {
+        leaseToken: c3!.leaseToken!,
+        now: new Date(t0.getTime() + 17 * 60 * 1000),
+      }),
+    ).rejects.toThrow(/version|createdByJob/i);
+
+    // Updating diagram WITHOUT linking jobId also fails D19 completion check
+    await store.upsertDiagram('main', {
+      id: diag.id,
+      title: diag.title,
+      kind: 'mermaid',
+      content: 'flowchart LR\nA-->UnrelatedEdit',
+      basedOnDecisions: [d2.id],
+    });
+    await expect(
+      store.completeJob('main', r1.job.id, {
+        leaseToken: c3!.leaseToken!,
+        now: new Date(t0.getTime() + 17 * 60 * 1000),
+      }),
+    ).rejects.toThrow(/createdByJob|job/i);
+
+    // Updating diagram WITH jobId and new content satisfies D19 and allows completion
+    const updatedDiag = await store.upsertDiagram('main', {
+      id: diag.id,
+      title: diag.title,
+      kind: 'mermaid',
+      content: 'flowchart LR\nA-->NewSpec',
+      basedOnDecisions: [d2.id],
+      jobId: r1.job.id,
+    });
+    expect(updatedDiag.version).toBe(3);
+
+    const completed = await store.completeJob('main', r1.job.id, {
+      leaseToken: c3!.leaseToken!,
+      artifactVersion: updatedDiag.version,
+      summary: 'Regenerated diagram for New Spec',
+      now: new Date(t0.getTime() + 17 * 60 * 1000),
+    });
+    expect(completed.status).toBe('done');
+    expect(completed.result?.artifactVersion).toBe(3);
+  });
+
+  it('Neon 15 rule: queued job appears in hook digest ONLY when job.created is in the missed window', async () => {
+    const dir = await makeTempDir();
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Digest Jobs', slug: 'main' });
+
+    const s1 = await store.registerSession('main', { title: 'S1', harness: 'claude-code' });
+    const d1 = await store.recordDecision('main', { title: 'Old' });
+    const media = await store.addMedia('main', {
+      title: 'OAuth Explainer',
+      kind: 'video',
+      basedOnDecisions: [d1.id],
+    });
+    await store.recordDecision('main', { title: 'New OAuth', supersedes: d1.id });
+    // Sync s1 BEFORE job creation
+    await store.syncSession('main', s1.id);
+
+    // Create refresh job -> s1 missed job.created -> digest includes it!
+    const { job } = await store.createRefreshJob(
+      'main',
+      { artifactType: 'media', artifactId: media.id },
+      { type: 'human', label: 'alice' },
+    );
+    const drift1 = await store.getSessionDrift('main', s1.id);
+    expect(drift1.behindBy).toBe(1);
+    expect(drift1.digestText).toContain('OAuth Explainer');
+    expect(drift1.digest.some((e) => e.kind === 'job.created' && e.entityId === job.id)).toBe(true);
+
+    // Sync s1 AFTER job creation -> job is still queued, but NO new events -> digest must be empty!
+    await store.syncSession('main', s1.id);
+    const drift2 = await store.getSessionDrift('main', s1.id);
+    expect(drift2.behindBy).toBe(0);
+    expect(drift2.digestText).toBe('');
+
+    // Unrelated task created -> digest mentions ONLY the task, NOT the previously seen queued job!
+    await store.upsertTask('main', { title: 'Unrelated task' }, { type: 'human', label: 'alice' });
+    const drift3 = await store.getSessionDrift('main', s1.id);
+    expect(drift3.behindBy).toBe(1);
+    expect(drift3.digestText).toContain('Unrelated task');
+    expect(drift3.digestText).not.toContain('OAuth Explainer');
+  });
+});
+
+describe('B3 Core: Immutable Media Versions, Quiz Update, Prune, and Per-Question Staleness (AC7.6, AC7.7, D17, D19)', () => {
+  it('stores immutable <id>.v<N>.<ext> media files, protects open-job versions during prune, and removes all versions on delete', async () => {
+    const dir = await makeTempDir();
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Versioning', slug: 'main' });
+
+    const srcV1 = path.join(dir, 'v1.mp4');
+    const srcV2 = path.join(dir, 'v2.mp4');
+    const srcV3 = path.join(dir, 'v3.mp4');
+    await fs.writeFile(srcV1, Buffer.from('video-bytes-v1'));
+    await fs.writeFile(srcV2, Buffer.from('video-bytes-v2'));
+    await fs.writeFile(srcV3, Buffer.from('video-bytes-v3'));
+
+    const d1 = await store.recordDecision('main', { title: 'D1' });
+    const art = await store.addMedia('main', {
+      title: 'Explainer',
+      kind: 'video',
+      sourceFilePath: srcV1,
+      basedOnDecisions: [d1.id],
+    });
+    expect(art.version).toBe(1);
+    expect(art.filePath).toBe(`${art.id}.v1.mp4`);
+
+    const mediaDir = path.join(store.boardPath('main'), 'media');
+    expect(await fs.readFile(path.join(mediaDir, `${art.id}.v1.mp4`), 'utf8')).toBe('video-bytes-v1');
+
+    // Update to v2 -> v1 stays on disk!
+    const v2 = await store.updateMedia('main', art.id, {
+      sourceFilePath: srcV2,
+      transcript: 'v2 narration',
+    });
+    expect(v2.version).toBe(2);
+    expect(v2.filePath).toBe(`${art.id}.v2.mp4`);
+    expect(v2.history).toHaveLength(2);
+    expect(await fs.readFile(path.join(mediaDir, `${art.id}.v1.mp4`), 'utf8')).toBe('video-bytes-v1');
+    expect(await fs.readFile(path.join(mediaDir, `${art.id}.v2.mp4`), 'utf8')).toBe('video-bytes-v2');
+
+    // Open job created at baseVersion 2 -> v2 must be protected from prune even after v3 exists!
+    const d2 = await store.recordDecision('main', { title: 'D2', supersedes: d1.id });
+    const { job } = await store.createRefreshJob('main', {
+      artifactType: 'media',
+      artifactId: art.id,
+    });
+    expect(job.baseVersion).toBe(2);
+
+    const v3 = await store.updateMedia('main', art.id, {
+      sourceFilePath: srcV3,
+      basedOnDecisions: [d2.id],
+      jobId: job.id,
+    });
+    expect(v3.version).toBe(3);
+    expect(v3.filePath).toBe(`${art.id}.v3.mp4`);
+
+    // Prune while job is STILL OPEN -> v1 pruned, v2 (baseVersion of open job) & v3 (current) KEPT!
+    const prune1 = await store.pruneMedia('main', { keepVersions: 1 });
+    expect(prune1.prunedFiles).toContain(`${art.id}.v1.mp4`);
+    expect(prune1.prunedFiles).not.toContain(`${art.id}.v2.mp4`);
+    expect(prune1.prunedFiles).not.toContain(`${art.id}.v3.mp4`);
+    await expect(fs.stat(path.join(mediaDir, `${art.id}.v1.mp4`))).rejects.toThrow();
+    await expect(fs.stat(path.join(mediaDir, `${art.id}.v2.mp4`))).resolves.toBeTruthy();
+
+    // Complete job -> now prune removes v2 too
+    const claimed = await store.claimJob('main', { jobId: job.id, claimedBy: 'worker' });
+    await store.completeJob('main', job.id, { leaseToken: claimed!.leaseToken!, artifactVersion: 3 });
+
+    const prune2 = await store.pruneMedia('main', { keepVersions: 1 });
+    expect(prune2.prunedFiles).toContain(`${art.id}.v2.mp4`);
+    await expect(fs.stat(path.join(mediaDir, `${art.id}.v2.mp4`))).rejects.toThrow();
+    await expect(fs.stat(path.join(mediaDir, `${art.id}.v3.mp4`))).resolves.toBeTruthy();
+
+    // Add v4 then deleteMedia -> removes ALL versioned files (v3 and v4) + meta
+    await store.updateMedia('main', art.id, { sourceFilePath: srcV1 });
+    await store.deleteMedia('main', art.id);
+    const remaining = await fs.readdir(mediaDir);
+    expect(remaining.filter((f) => f.startsWith(art.id))).toEqual([]);
+  });
+
+  it('quiz_update preserves attempts, bumps version (history capped at 10), and flags per-question staleness via relatedDecisionIds', async () => {
+    const dir = await makeTempDir();
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Quizzes', slug: 'main' });
+
+    const d1 = await store.recordDecision('main', { title: 'Use REST' });
+    const d2 = await store.recordDecision('main', { title: 'Use Strict TS' });
+    const quiz = await store.createQuiz('main', {
+      title: 'Core Mastery',
+      basedOnDecisions: [d1.id, d2.id],
+      questions: [
+        {
+          id: 'q1',
+          prompt: 'Which API style?',
+          type: 'multiple_choice',
+          options: ['REST', 'SOAP'],
+          correctIndex: 0,
+          explanation: 'REST per d1',
+          relatedDecisionIds: [d1.id],
+        },
+        {
+          id: 'q2',
+          prompt: 'Strict TypeScript?',
+          type: 'true_false',
+          correctAnswer: 'true',
+          explanation: 'Strict per d2',
+          relatedDecisionIds: [d2.id],
+        },
+      ],
+    });
+
+    await store.submitQuizAttempt('main', quiz.id, { answers: { q1: 0, q2: 'true' }, confidence: 4 });
+    const d3 = await store.recordDecision('main', { title: 'Use gRPC', supersedes: d1.id });
+
+    // AC7.7: Only q1 is flagged stale; q2 stays fresh!
+    const snap = await store.getSnapshot('main');
+    const qStale = core.evaluateQuizQuestionStaleness(snap.quizzes[0], snap.decisions);
+    expect(qStale.q1?.staleDecisionIds).toEqual([d1.id]);
+    expect(qStale.q1?.reasons[0]).toContain(d3.id);
+    expect(qStale.q2).toBeUndefined();
+
+    // D17: updateQuiz bumps version and preserves attempts!
+    const updated = await store.updateQuiz('main', quiz.id, {
+      basedOnDecisions: [d3.id, d2.id],
+      questions: [
+        {
+          id: 'q1',
+          prompt: 'Which RPC style?',
+          type: 'multiple_choice',
+          options: ['gRPC', 'SOAP'],
+          correctIndex: 0,
+          explanation: 'gRPC per d3',
+          relatedDecisionIds: [d3.id],
+        },
+        snap.quizzes[0].questions[1],
+      ],
+    });
+    expect(updated.version).toBe(2);
+    expect(updated.attempts).toHaveLength(1);
+    expect(updated.attempts[0].percentage).toBe(100);
+    expect(updated.history).toHaveLength(2);
+
+    // History capped at 10 entries across 12 updates
+    for (let i = 0; i < 12; i += 1) {
+      await store.updateQuiz('main', quiz.id, {
+        questions: [
+          {
+            id: 'q1',
+            prompt: `Question rev ${i}`,
+            type: 'true_false',
+            correctAnswer: 'true',
+            explanation: 'ok',
+            relatedDecisionIds: [d3.id],
+          },
+        ],
+      });
+    }
+    const finalSnap = await store.getSnapshot('main');
+    expect(finalSnap.quizzes[0].version).toBe(14);
+    expect(finalSnap.quizzes[0].history).toHaveLength(10);
+    expect(finalSnap.quizzes[0].attempts).toHaveLength(1);
+  });
+});

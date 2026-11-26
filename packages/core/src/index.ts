@@ -7,6 +7,7 @@ export * from './routing.js';
 export * from './txn.js';
 export * from './markdown.js';
 export * from './drift.js';
+export * from './catchup.js';
 export * from './context-pack.js';
 export * from './store.js';
 export * from './demo.js';
