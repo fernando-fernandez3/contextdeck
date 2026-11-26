@@ -1087,4 +1087,151 @@ describe('E1 safe concurrent storage engine', () => {
       accessSpy.mockRestore();
     }
   }, FSYNC_TEST_TIMEOUT_MS);
+
+  it('R5-2: rejects superseding a decision already superseded by another decision while keeping same-edge idempotent', async () => {
+    const dir = await makeTempDir('cdeck-r5-2-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main' });
+
+    const a = await store.recordDecision('main', { title: 'Choice A', summary: 'first' });
+    const b = await store.recordDecision('main', {
+      title: 'Choice B',
+      summary: 'second',
+      supersedes: a.id,
+    });
+
+    // Third decision attempting to supersede A (already superseded by B) must reject
+    await expect(
+      store.recordDecision('main', { title: 'Choice C', summary: 'conflict', supersedes: a.id }),
+    ).rejects.toThrow(
+      new RegExp(`Decision ${a.id} is already superseded by ${b.id}; supersede ${b.id} instead\\.`),
+    );
+    await expect(
+      store.recordDecision('main', { title: 'Choice C', summary: 'conflict', supersedes: a.id }),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+
+    // Graph must be completely unchanged (only A and B exist, A still superseded by B)
+    let snap = await store.getSnapshot('main');
+    expect(snap.decisions.map((d) => d.id)).toEqual([a.id, b.id]);
+    expect(snap.decisions.find((d) => d.id === a.id)).toMatchObject({
+      status: 'superseded',
+      supersededBy: b.id,
+    });
+
+    // updateDecision path must also reject superseding A by another decision
+    const d = await store.recordDecision('main', { title: 'Choice D', summary: 'independent' });
+    await expect(
+      store.updateDecision('main', d.id, { supersedes: a.id }),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+
+    // applyContextUpdate (inMemoryExisting) path must reject two decisions superseding the same target
+    const targetForBatch = await store.recordDecision('main', { title: 'Batch Target' });
+    await expect(
+      store.applyContextUpdate('main', {
+        decisions: [
+          { title: 'Batch One', supersedes: targetForBatch.id },
+          { title: 'Batch Two', supersedes: targetForBatch.id },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    snap = await store.getSnapshot('main');
+    expect(snap.decisions.find((x) => x.id === targetForBatch.id)).toMatchObject({
+      status: 'accepted',
+      supersededBy: null,
+    });
+
+    // Re-applying the SAME edge (same supersedingId) remains idempotent
+    const bUpdated = await store.updateDecision('main', b.id, {
+      title: 'Choice B Revised',
+      supersedes: a.id,
+    });
+    expect(bUpdated.title).toBe('Choice B Revised');
+    expect(bUpdated.supersedes).toBe(a.id);
+
+    // Extending the linear chain (superseding B instead of A) succeeds
+    const cLinear = await store.recordDecision('main', {
+      title: 'Choice C Linear',
+      supersedes: b.id,
+    });
+    snap = await store.getSnapshot('main');
+    expect(snap.decisions.find((x) => x.id === a.id)?.supersededBy).toBe(b.id);
+    expect(snap.decisions.find((x) => x.id === b.id)).toMatchObject({
+      status: 'superseded',
+      supersededBy: cLinear.id,
+    });
+  }, FSYNC_TEST_TIMEOUT_MS);
+
+  it('R5-3: restoring a superseded proposed or deprecated decision preserves its prior status and keeps proposals out of accepted pack decisions', async () => {
+    const dir = await makeTempDir('cdeck-r5-3-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main' });
+
+    // 1. Proposed target -> superseded -> idempotent re-apply -> cleared -> restores to proposed
+    const prop = await store.recordDecision('main', {
+      title: 'Unapproved Proposal',
+      status: 'proposed',
+      summary: 'draft idea',
+    });
+    expect('statusBeforeSupersede' in prop).toBe(false);
+
+    const supProp = await store.recordDecision('main', {
+      title: 'Replacement for Proposal',
+      supersedes: prop.id,
+    });
+    // Idempotent re-apply must preserve statusBeforeSupersede = 'proposed'
+    await store.updateDecision('main', supProp.id, {
+      title: 'Replacement for Proposal v2',
+      supersedes: prop.id,
+    });
+
+    await store.updateDecision('main', supProp.id, { supersedes: null });
+    const snapAfterProp = await store.getSnapshot('main');
+    const restoredProp = snapAfterProp.decisions.find((d) => d.id === prop.id)!;
+    expect(restoredProp.status).toBe('proposed');
+    expect(restoredProp.supersededBy).toBeNull();
+    expect('statusBeforeSupersede' in restoredProp).toBe(false);
+
+    // Verify restored proposal is NOT in the context pack's accepted decisions section
+    const pack = core.generateContextPack(snapAfterProp);
+    const activeSection = pack.split('### Proposed Decisions')[0] ?? '';
+    const proposedSection = pack.split('### Proposed Decisions')[1] ?? '';
+    expect(activeSection).not.toContain(prop.id);
+    expect(proposedSection).toContain(prop.id);
+
+    // 2. Deprecated target -> superseded -> cleared -> restores to deprecated
+    const dep = await store.recordDecision('main', {
+      title: 'Old Deprecated Choice',
+      status: 'deprecated',
+    });
+    const supDep = await store.recordDecision('main', {
+      title: 'Replacement for Deprecated',
+      supersedes: dep.id,
+    });
+    await store.updateDecision('main', supDep.id, { supersedes: null });
+    const snapAfterDep = await store.getSnapshot('main');
+    const restoredDep = snapAfterDep.decisions.find((d) => d.id === dep.id)!;
+    expect(restoredDep.status).toBe('deprecated');
+    expect(restoredDep.supersededBy).toBeNull();
+    expect('statusBeforeSupersede' in restoredDep).toBe(false);
+
+    // 3. Legacy superseded file without statusBeforeSupersede restores to 'accepted'
+    const legacy = await store.recordDecision('main', { title: 'Legacy Accepted' });
+    const supLegacy = await store.recordDecision('main', {
+      title: 'Supersedes Legacy',
+      supersedes: legacy.id,
+    });
+    const legacyPath = path.join(store.boardPath('main'), 'decisions', `${legacy.id}.md`);
+    const rawLegacy = await fs.readFile(legacyPath, 'utf8');
+    await fs.writeFile(
+      legacyPath,
+      rawLegacy.replace(/^statusBeforeSupersede:.*\n/m, ''),
+      'utf8',
+    );
+    await store.updateDecision('main', supLegacy.id, { supersedes: null });
+    const snapAfterLegacy = await store.getSnapshot('main');
+    const restoredLegacy = snapAfterLegacy.decisions.find((d) => d.id === legacy.id)!;
+    expect(restoredLegacy.status).toBe('accepted');
+    expect(restoredLegacy.supersededBy).toBeNull();
+    expect('statusBeforeSupersede' in restoredLegacy).toBe(false);
+  }, FSYNC_TEST_TIMEOUT_MS);
 });

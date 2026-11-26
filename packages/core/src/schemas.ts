@@ -96,6 +96,9 @@ export const SessionSchema = z.object({
 
 export type Session = z.infer<typeof SessionSchema>;
 
+export const NonSupersededDecisionStatusSchema = z.enum(['proposed', 'accepted', 'deprecated']);
+export type NonSupersededDecisionStatus = z.infer<typeof NonSupersededDecisionStatusSchema>;
+
 export const DecisionStatusSchema = z.enum(['proposed', 'accepted', 'superseded', 'deprecated']);
 export type DecisionStatus = z.infer<typeof DecisionStatusSchema>;
 
@@ -103,6 +106,7 @@ export const DecisionSchema = z.object({
   id: EntityIdSchema,
   title: z.string().min(1),
   status: DecisionStatusSchema.default('accepted'),
+  statusBeforeSupersede: NonSupersededDecisionStatusSchema.optional(),
   supersedes: EntityIdSchema.nullable().optional(),
   supersededBy: EntityIdSchema.nullable().optional(),
   sessionId: EntityIdSchema.nullable().optional(),

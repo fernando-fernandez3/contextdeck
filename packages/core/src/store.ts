@@ -1486,10 +1486,22 @@ export class ContextDeckStore {
       return undefined;
     }
 
+    if (oldDecision.supersededBy && oldDecision.supersededBy !== supersedingId) {
+      throw new ValidationError(
+        `Decision ${targetId} is already superseded by ${oldDecision.supersededBy}; supersede ${oldDecision.supersededBy} instead.`,
+      );
+    }
+
+    const statusBeforeSupersede =
+      oldDecision.status === 'superseded'
+        ? oldDecision.statusBeforeSupersede
+        : oldDecision.status;
+
     const updatedOld: Decision = DecisionSchema.parse({
       ...oldDecision,
       status: 'superseded',
       supersededBy: supersedingId,
+      ...(statusBeforeSupersede !== undefined ? { statusBeforeSupersede } : {}),
       updatedAt: now,
     });
     const oldPath = await this.safeBoardFilePath(tx.slug, 'decisions', `${updatedOld.id}.md`);
@@ -2026,8 +2038,13 @@ export class ContextDeckStore {
         throw new NotFoundError(`Decision "${decisionId}" not found on board "${tx.slug}".`);
       }
       const now = nowIso();
+      const { statusBeforeSupersede: existingPriorStatus, ...restExisting } = existing;
+      const nextStatus = patch.status ?? existing.status;
       const updated = DecisionSchema.parse({
-        ...existing,
+        ...restExisting,
+        ...(nextStatus === 'superseded' && existingPriorStatus !== undefined
+          ? { statusBeforeSupersede: existingPriorStatus }
+          : {}),
         ...(patch.title !== undefined ? { title: patch.title } : {}),
         ...(patch.status !== undefined ? { status: patch.status } : {}),
         ...(patch.summary !== undefined ? { summary: patch.summary } : {}),
@@ -2054,10 +2071,14 @@ export class ContextDeckStore {
       if (supersedesChanged && prevSupersedes) {
         const prevTarget = await this.readDecisionById(tx.slug, prevSupersedes);
         if (prevTarget && prevTarget.supersededBy === updated.id) {
+          const { statusBeforeSupersede: priorStatus, ...restPrevTarget } = prevTarget;
           const restoredTarget = DecisionSchema.parse({
-            ...prevTarget,
+            ...restPrevTarget,
             supersededBy: null,
-            status: prevTarget.status === 'superseded' ? 'accepted' : prevTarget.status,
+            status:
+              prevTarget.status === 'superseded'
+                ? (priorStatus ?? 'accepted')
+                : prevTarget.status,
             updatedAt: now,
           });
           const prevPath = await this.safeBoardFilePath(

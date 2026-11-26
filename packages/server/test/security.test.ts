@@ -1003,4 +1003,89 @@ describe('E2 Server & MCP security (reproducing Bugs 2, 3, 4, 7-media, 8 + D5/D6
       await close();
     }
   });
+
+  it('R5-2: REST and MCP return 400 / tool error when superseding an already-superseded decision', async () => {
+    const dir = await makeTempDir('cdeck-r5-2-rest-');
+    const store = new ContextDeckStore(dir);
+    await store.createBoard({ title: 'Demo', slug: 'demo' });
+    const { app, token, close } = createApp({ store, port: 4310 });
+
+    try {
+      const postDecision = (payload: Record<string, unknown>) =>
+        app.request('http://127.0.0.1:4310/api/boards/demo/decisions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(payload),
+        });
+
+      const resA = await postDecision({ title: 'Decision A' });
+      expect(resA.status).toBe(201);
+      const decA = (await resA.json()) as { id: string };
+
+      const resB = await postDecision({ title: 'Decision B', supersedes: decA.id });
+      expect(resB.status).toBe(201);
+      const decB = (await resB.json()) as { id: string };
+
+      // Second decision trying to supersede A via REST POST must return 400 VALIDATION_ERROR
+      const resC = await postDecision({ title: 'Decision C', supersedes: decA.id });
+      expect(resC.status).toBe(400);
+      const errBody = (await resC.json()) as { code?: string; error?: string };
+      expect(errBody.code).toBe('VALIDATION_ERROR');
+      expect(errBody.error).toContain(`already superseded by ${decB.id}`);
+
+      // PATCH attempting to supersede A must also return 400 VALIDATION_ERROR
+      const resD = await postDecision({ title: 'Decision D' });
+      expect(resD.status).toBe(201);
+      const decD = (await resD.json()) as { id: string };
+      const resPatch = await app.request(
+        `http://127.0.0.1:4310/api/boards/demo/decisions/${decD.id}`,
+        {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ supersedes: decA.id }),
+        },
+      );
+      expect(resPatch.status).toBe(400);
+      const patchErr = (await resPatch.json()) as { code?: string; error?: string };
+      expect(patchErr.code).toBe('VALIDATION_ERROR');
+
+      // MCP decision_record must surface it as a tool error
+      const mcpRes = await app.request('http://127.0.0.1:4310/mcp', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/call',
+          params: {
+            name: 'decision_record',
+            arguments: { board: 'demo', title: 'Decision MCP', supersedes: decA.id },
+          },
+        }),
+      });
+      const mcpText = await mcpRes.text();
+      const dataLine = mcpText
+        .split('\n')
+        .find((l) => l.startsWith('data: '));
+      const rpc = JSON.parse(dataLine ? dataLine.slice(6) : mcpText) as {
+        result?: { isError?: boolean; content?: Array<{ text?: string }> };
+        error?: { message?: string };
+      };
+      expect(rpc.result?.isError || rpc.error).toBeTruthy();
+      const mcpMsg = rpc.result?.content?.[0]?.text ?? rpc.error?.message ?? '';
+      expect(mcpMsg).toContain(`already superseded by ${decB.id}`);
+    } finally {
+      await close();
+    }
+  });
 });
