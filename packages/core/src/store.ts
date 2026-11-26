@@ -1279,13 +1279,18 @@ export class ContextDeckStore {
       }
 
       const snapshot = await this.readSnapshotOnce(slug);
-      const [configAfter, txnAfter] = await Promise.all([
-        this.readBoardConfig(slug),
-        this.txnJournalExists(txnPath),
-      ]);
-
-      if (!txnAfter && configAfter.revision === snapshot.config.revision) {
-        return snapshot;
+      // Order matters (R5-1): writer commits in strict order
+      //   txn.json create -> entity renames -> events -> board.yaml commit -> txn.json remove.
+      // Checking txnJournalExists BEFORE readBoardConfig prevents straddling a commit:
+      // once the journal is observed absent, any overlapping commit has already updated
+      // board.yaml, so the subsequent readBoardConfig is guaranteed to see the new revision
+      // and force a retry.
+      const txnAfter = await this.txnJournalExists(txnPath);
+      if (!txnAfter) {
+        const configAfter = await this.readBoardConfig(slug);
+        if (configAfter.revision === snapshot.config.revision) {
+          return snapshot;
+        }
       }
 
       if (attempt < maxRetries) {

@@ -990,4 +990,101 @@ describe('E1 safe concurrent storage engine', () => {
     );
     await expect(fs.stat(txnPath)).rejects.toThrow();
   }, FSYNC_TEST_TIMEOUT_MS);
+
+  it('R5-1: getSnapshot post-read checks run txnJournalExists before readBoardConfig and cannot straddle a commit', async () => {
+    const dir = await makeTempDir('cdeck-r5-1-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'Main', slug: 'main', brief: '# V1\n' });
+
+    const boardDir = store.boardPath('main');
+    const boardYamlPath = path.join(boardDir, 'board.yaml');
+    const briefPath = path.join(boardDir, 'brief.md');
+    const txnPath = path.join(store.runtimeDir, 'txn.json');
+
+    let onBriefRenamed!: () => void;
+    const briefRenamed = new Promise<void>((resolve) => {
+      onBriefRenamed = resolve;
+    });
+    let releaseWriter!: () => void;
+    const writerGate = new Promise<void>((resolve) => {
+      releaseWriter = resolve;
+    });
+    let onPostConfigRead!: () => void;
+    const postConfigReadDone = new Promise<void>((resolve) => {
+      onPostConfigRead = resolve;
+    });
+
+    let writerPromise: Promise<{ revision: number; brief: string }> | null = null;
+    let briefReadIntercepted = false;
+    let afterBriefRead = false;
+    let writerReleased = false;
+    let txnAfterIntercepted = false;
+    let configReadWhileWriterPaused = false;
+
+    const origRename = fs.rename.bind(fs);
+    const origReadFile = fs.readFile.bind(fs);
+    const origAccess = fs.access.bind(fs);
+
+    const renameSpy = vi.spyOn(fs, 'rename').mockImplementation(async (oldPath, newPath) => {
+      const res = await origRename(oldPath, newPath);
+      if (String(newPath) === briefPath) {
+        onBriefRenamed();
+        await writerGate;
+      }
+      return res;
+    });
+
+    const readFileSpy = vi.spyOn(fs, 'readFile').mockImplementation((async (
+      p: Parameters<typeof fs.readFile>[0],
+      options?: Parameters<typeof fs.readFile>[1],
+    ) => {
+      const target = String(p);
+      if (!briefReadIntercepted && target === briefPath) {
+        briefReadIntercepted = true;
+        // Start writer after reader has already read board.yaml (rev 1) and seen no txn.json.
+        // Pause writer right after brief.md is renamed to V2, while board.yaml is still rev 1 and txn.json exists.
+        writerPromise = store.updateBrief('main', '# V2\n', undefined, { baseRevision: 1 });
+        await briefRenamed;
+        afterBriefRead = true;
+        return origReadFile(p, options as never);
+      }
+      if (afterBriefRead && !writerReleased && target === boardYamlPath) {
+        const res = await origReadFile(p, options as never);
+        configReadWhileWriterPaused = true;
+        onPostConfigRead();
+        return res;
+      }
+      return origReadFile(p, options as never);
+    }) as typeof fs.readFile);
+
+    const accessSpy = vi.spyOn(fs, 'access').mockImplementation(async (p, mode) => {
+      if (afterBriefRead && !txnAfterIntercepted && String(p) === txnPath) {
+        txnAfterIntercepted = true;
+        // If readBoardConfig runs concurrently with txnJournalExists (Promise.all),
+        // it captures old rev 1 here before we release the writer to commit rev 2 and remove txn.json.
+        // If txnJournalExists runs sequentially BEFORE readBoardConfig, board.yaml is not read yet.
+        await Promise.race([postConfigReadDone, new Promise((r) => setTimeout(r, 50))]);
+        writerReleased = true;
+        releaseWriter();
+        await writerPromise;
+      }
+      return origAccess(p, mode);
+    });
+
+    try {
+      const snap = await store.getSnapshot('main');
+      await writerPromise;
+
+      expect({ revision: snap.config.revision, brief: snap.brief }).toEqual({
+        revision: 2,
+        brief: '# V2\n',
+      });
+      expect(configReadWhileWriterPaused).toBe(false);
+    } finally {
+      releaseWriter();
+      renameSpy.mockRestore();
+      readFileSpy.mockRestore();
+      accessSpy.mockRestore();
+    }
+  }, FSYNC_TEST_TIMEOUT_MS);
 });
