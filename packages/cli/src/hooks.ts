@@ -438,6 +438,15 @@ export async function runHookCli(
       Math.min(HOOK_LOCK_WAIT_MS, deadlineAt - Date.now() - 250),
     );
 
+    const onCorruptSession = (filePath: string, message: string) => {
+      appendHookLogSync(
+        resolvedDeckDir,
+        rawHarness,
+        rawEvent,
+        `Skipped corrupt session ${filePath}: ${message}`,
+      );
+    };
+
     if (eventAction === 'start') {
       const { session, boardSlug, snapshot, pendingAck } = await store.upsertHookSession({
         externalRef,
@@ -446,6 +455,7 @@ export async function runHookCli(
         cwd: payloadCwd,
         maxWaitMs: remainingForLock,
         deferCursorCommit: true,
+        onCorruptSession,
       });
 
       if (deadlineTriggered) return;
@@ -477,6 +487,7 @@ export async function runHookCli(
         maxWaitMs: remainingForLock,
         now,
         deferCursorCommit: true,
+        onCorruptSession,
       });
 
       if (
@@ -517,6 +528,7 @@ export async function runHookCli(
       await store.markHookSessionIdle({
         externalRef,
         maxWaitMs: remainingForLock,
+        onCorruptSession,
       });
       return;
     }

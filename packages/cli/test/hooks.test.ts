@@ -1011,4 +1011,188 @@ describe('AC5.1-AC5.4 + AC5.9 + D11/D12/D14 cdeck hook contract fixtures and cro
     expect(parsed.additional_context).toContain('Web B');
     expect(parsed.additional_context).toContain('Board: `web`');
   });
+
+  it('H8: checkAndSyncHookDrift fast-forwards cursor past self-authored and housekeeping events without touching git-tracked files', async () => {
+    const repo = await makeTempDir('cdeck-h8-');
+    const store = new ContextDeckStore(repo);
+    await store.createBoard({ title: 'Fast Forward Board', slug: 'main' });
+
+    // Start session A -> cursor at rev 1
+    const startRes = await runCliWithStdin(['hook', 'claude-code', 'SessionStart'], {
+      cwd: repo,
+      stdin: JSON.stringify({
+        session_id: 'h8-sess',
+        cwd: repo,
+        hook_event_name: 'SessionStart',
+        source: 'startup',
+      }),
+    });
+    expect(startRes.code).toBe(0);
+    const sess = await store.findSessionByExternalRef('claude-code:h8-sess');
+    expect(sess).not.toBeNull();
+    const sessionYamlPath = path.join(store.sessionsDir, `${sess!.id}.yaml`);
+    const yamlBefore = await fs.readFile(sessionYamlPath, 'utf8');
+
+    // Record several self-authored events (decisions by sess.id) so board revision advances well past 1
+    for (let i = 1; i <= 5; i += 1) {
+      await store.recordDecision(
+        'main',
+        { title: `Self decision ${i}` },
+        { type: 'agent', harness: 'claude-code', sessionId: sess!.id },
+      );
+    }
+    const boardRev = (await store.readBoardConfig('main')).revision;
+    expect(boardRev).toBeGreaterThan(1);
+    expect((await store.readSessionCursor(sess!.id))?.syncedRevisions.main).toBe(1);
+
+    // Stamp a lastCursorInjectAt to confirm fast-forward preserves it
+    const prevCursor = (await store.readSessionCursor(sess!.id))!;
+    const stamp = '2026-11-25T10:00:00.000Z';
+    await store.writeSessionCursor({ ...prevCursor, lastCursorInjectAt: stamp });
+
+    // One UserPromptSubmit sees behindBy === 0 -> outputs nothing AND fast-forwards cursor to boardRev
+    const promptRes = await runCliWithStdin(['hook', 'claude-code', 'UserPromptSubmit'], {
+      cwd: repo,
+      stdin: JSON.stringify({
+        session_id: 'h8-sess',
+        cwd: repo,
+        hook_event_name: 'UserPromptSubmit',
+        prompt: 'self authored only',
+      }),
+    });
+    expect(promptRes.code).toBe(0);
+    expect(promptRes.stdout).toBe('');
+
+    const cursorAfter = await store.readSessionCursor(sess!.id);
+    expect(cursorAfter?.syncedRevisions.main).toBe(boardRev);
+    expect(cursorAfter?.lastCursorInjectAt).toBe(stamp);
+    expect(await fs.readFile(sessionYamlPath, 'utf8')).toBe(yamlBefore);
+  });
+
+  it('N3: one corrupt session YAML is skipped and logged in hook path while other sessions keep working (non-hook paths stay fail-closed)', async () => {
+    const repo = await makeTempDir('cdeck-n3-');
+    const store = new ContextDeckStore(repo);
+    await store.createBoard({ title: 'Resilient Sessions', slug: 'main' });
+
+    // Register a healthy session via SessionStart
+    const startRes = await runCliWithStdin(['hook', 'claude-code', 'SessionStart'], {
+      cwd: repo,
+      stdin: JSON.stringify({
+        session_id: 'n3-healthy',
+        cwd: repo,
+        hook_event_name: 'SessionStart',
+        source: 'startup',
+      }),
+    });
+    expect(startRes.code).toBe(0);
+
+    // Plant one corrupt session YAML alongside the healthy session
+    await fs.writeFile(
+      path.join(store.sessionsDir, 'sess_corrupt_one.yaml'),
+      ':::broken yaml [[[\n',
+      'utf8',
+    );
+
+    // Non-hook path MUST stay fail-closed
+    await expect(store.listAllSessions()).rejects.toThrow(/Corrupt/i);
+
+    // Another session records a decision -> healthy session's hook MUST still emit digest & log the corrupt file
+    await store.recordDecision(
+      'main',
+      { title: 'N3 Decision Still Delivered' },
+      { type: 'agent', sessionId: 'sess_other' },
+    );
+
+    const promptRes = await runCliWithStdin(['hook', 'claude-code', 'UserPromptSubmit'], {
+      cwd: repo,
+      stdin: JSON.stringify({
+        session_id: 'n3-healthy',
+        cwd: repo,
+        hook_event_name: 'UserPromptSubmit',
+        prompt: 'should still receive digest',
+      }),
+    });
+    expect(promptRes.code).toBe(0);
+    expect(promptRes.stdout.length).toBeGreaterThan(0);
+    expect(JSON.parse(promptRes.stdout).hookSpecificOutput.additionalContext).toContain(
+      'N3 Decision Still Delivered',
+    );
+
+    const hooksLog = await fs.readFile(path.join(store.runtimeDir, 'hooks.log'), 'utf8');
+    expect(hooksLog).toContain('sess_corrupt_one.yaml');
+  });
+
+  it('H7: scale fixture (40 sessions, 5,000 events) — 6 concurrent SessionStart hooks all emit a pack without LockTimeoutError', async () => {
+    const repo = await makeTempDir('cdeck-h7-scale-');
+    const store = new ContextDeckStore(repo);
+    await store.createBoard({ title: 'Scale Board', slug: 'main' });
+    await store.recordDecision('main', { title: 'Scale Decision', summary: 'Must appear in pack' });
+
+    // Seed 40 active sessions + 5,000 events directly on disk (fast fixture setup)
+    const now = new Date().toISOString();
+    await fs.mkdir(store.sessionsDir, { recursive: true });
+    await fs.mkdir(store.cursorsDir, { recursive: true });
+    for (let i = 0; i < 40; i += 1) {
+      const id = `sess_scale_${String(i).padStart(2, '0')}`;
+      await fs.writeFile(
+        path.join(store.sessionsDir, `${id}.yaml`),
+        `id: ${id}\ntitle: Scale Session ${i}\nharness: claude-code\nexternalRef: claude-code:scale-${i}\nboard: main\nparentSessionId: null\nrelatedSessionIds: []\nstatus: active\nsummary: ""\nfocusFiles: []\ncreatedAt: "${now}"\nupdatedAt: "${now}"\n`,
+        'utf8',
+      );
+      await fs.writeFile(
+        path.join(store.cursorsDir, `${id}.json`),
+        JSON.stringify({ sessionId: id, syncedRevisions: { main: 1 }, lastActiveAt: now }),
+        'utf8',
+      );
+    }
+
+    const eventsLines: string[] = [];
+    for (let rev = 3; rev <= 5002; rev += 1) {
+      eventsLines.push(
+        JSON.stringify({
+          id: `evt_scale_${rev}`,
+          revision: rev,
+          timestamp: now,
+          actor: { type: 'agent', harness: 'codex', sessionId: 'sess_scale_00' },
+          kind: 'task.updated',
+          entityId: `task_${(rev % 20) + 1}`,
+          summary: `Scale event ${rev}`,
+        }),
+      );
+    }
+    const boardDir = store.boardPath('main');
+    await fs.appendFile(path.join(boardDir, 'events.jsonl'), `${eventsLines.join('\n')}\n`, 'utf8');
+    const cfgRaw = await fs.readFile(path.join(boardDir, 'board.yaml'), 'utf8');
+    await fs.writeFile(
+      path.join(boardDir, 'board.yaml'),
+      cfgRaw.replace(/revision:\s*\d+/, 'revision: 5002'),
+      'utf8',
+    );
+
+    // Launch 6 concurrent SessionStart hooks against the 40-session / 5,000-event board
+    const results = await Promise.all(
+      Array.from({ length: 6 }, (_, idx) =>
+        runCliWithStdin(['hook', 'claude-code', 'SessionStart'], {
+          cwd: repo,
+          stdin: JSON.stringify({
+            session_id: `concurrent-start-${idx}`,
+            cwd: repo,
+            hook_event_name: 'SessionStart',
+            source: 'startup',
+          }),
+          timeoutMs: 6000,
+        }),
+      ),
+    );
+
+    for (const res of results) {
+      expect(res.code).toBe(0);
+      expect(res.stdout.length).toBeGreaterThan(0);
+      const parsed = JSON.parse(res.stdout) as {
+        hookSpecificOutput: { hookEventName: string; additionalContext: string };
+      };
+      expect(parsed.hookSpecificOutput.hookEventName).toBe('SessionStart');
+      expect(parsed.hookSpecificOutput.additionalContext).toContain('Scale Decision');
+    }
+  });
 });
