@@ -10,7 +10,7 @@ import {
   X,
 } from 'lucide-react';
 import type { BoardSnapshot } from '../types';
-import { api } from '../api';
+import { ApiError, api } from '../api';
 import { HarnessBadge, MarkdownView, StatusBadge } from './Badge';
 
 interface BriefLensProps {
@@ -22,14 +22,25 @@ interface BriefLensProps {
 export function BriefLens({ snapshot, onRefresh, onNavigateLens }: BriefLensProps) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(snapshot.brief);
+  const [editBaseRevision, setEditBaseRevision] = useState<number>(snapshot.config.revision);
+  const [conflictMsg, setConflictMsg] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
   const handleSave = async () => {
     setSaving(true);
+    setConflictMsg(null);
     try {
-      await api.updateBrief(snapshot.config.slug, draft);
+      await api.updateBrief(snapshot.config.slug, draft, editBaseRevision);
       setEditing(false);
       onRefresh();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409) {
+        setConflictMsg(
+          `Brief was updated concurrently (latest revision: ${String(err.data?.currentRevision ?? 'newer')}). Reload latest brief to merge your edits.`,
+        );
+      } else {
+        setConflictMsg(err instanceof Error ? err.message : String(err));
+      }
     } finally {
       setSaving(false);
     }
@@ -44,7 +55,7 @@ export function BriefLens({ snapshot, onRefresh, onNavigateLens }: BriefLensProp
   };
 
   const handleSyncSession = async (sessionId: string) => {
-    await api.syncSession(snapshot.config.slug, sessionId);
+    await api.syncSession(snapshot.config.slug, sessionId, snapshot.config.revision);
     onRefresh();
   };
 
@@ -147,6 +158,8 @@ export function BriefLens({ snapshot, onRefresh, onNavigateLens }: BriefLensProp
               <button
                 onClick={() => {
                   setDraft(snapshot.brief);
+                  setEditBaseRevision(snapshot.config.revision);
+                  setConflictMsg(null);
                   setEditing(true);
                 }}
                 className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs text-zinc-300 hover:text-white hover:bg-zinc-800 transition"
@@ -156,6 +169,22 @@ export function BriefLens({ snapshot, onRefresh, onNavigateLens }: BriefLensProp
             )}
           </div>
           <div className="p-5">
+            {conflictMsg && (
+              <div className="mb-3 rounded-lg border border-amber-500/40 bg-amber-950/30 px-3 py-2 flex items-center justify-between gap-2 text-xs text-amber-200">
+                <span>{conflictMsg}</span>
+                <button
+                  onClick={() => {
+                    setDraft(snapshot.brief);
+                    setEditBaseRevision(snapshot.config.revision);
+                    setConflictMsg(null);
+                    onRefresh();
+                  }}
+                  className="shrink-0 px-2 py-1 rounded border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 text-[11px]"
+                >
+                  Reload Latest
+                </button>
+              </div>
+            )}
             {editing ? (
               <textarea
                 value={draft}

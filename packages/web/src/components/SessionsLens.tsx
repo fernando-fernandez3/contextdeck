@@ -22,16 +22,16 @@ interface SessionsLensProps {
 
 interface SessionNodeData extends Record<string, unknown> {
   session: Session;
-  currentRevision: number;
+  behindBy: number;
   selected: boolean;
 }
 
 function SessionNodeCard({ data }: NodeProps<Node<SessionNodeData>>) {
-  const { session, currentRevision, selected } = data;
+  const { session, behindBy, selected } = data;
   const lag =
-    session.status === 'archived' || session.status === 'completed'
+    session.status === 'archived' || session.status === 'completed' || session.status === 'idle'
       ? 0
-      : Math.max(0, currentRevision - session.lastSyncedRevision);
+      : behindBy;
 
   return (
     <div
@@ -65,7 +65,11 @@ function SessionNodeCard({ data }: NodeProps<Node<SessionNodeData>>) {
 
 const nodeTypes = { sessionNode: SessionNodeCard };
 
-function computeHierarchyLayout(sessions: Session[], currentRevision: number, selectedId: string | null) {
+function computeHierarchyLayout(
+  sessions: Session[],
+  driftBySessionId: Map<string, number>,
+  selectedId: string | null,
+) {
   const byId = new Map(sessions.map((s) => [s.id, s]));
   const depthMap = new Map<string, number>();
 
@@ -102,7 +106,7 @@ function computeHierarchyLayout(sessions: Session[], currentRevision: number, se
         position: { x: idx * spacingX - totalWidth / 2 + 320, y: level * 200 + 30 },
         data: {
           session: s,
-          currentRevision,
+          behindBy: driftBySessionId.get(s.id) ?? 0,
           selected: s.id === selectedId,
         },
       });
@@ -152,9 +156,14 @@ export function SessionsLens({ snapshot, onRefresh }: SessionsLensProps) {
 
   const selectedSession = snapshot.sessions.find((s) => s.id === selectedId) ?? null;
 
+  const driftBySessionId = useMemo(
+    () => new Map(snapshot.drift.driftedSessions.map((d) => [d.sessionId, d.behindBy])),
+    [snapshot.drift.driftedSessions],
+  );
+
   const { nodes, edges } = useMemo(
-    () => computeHierarchyLayout(snapshot.sessions, snapshot.config.revision, selectedId),
-    [snapshot.sessions, snapshot.config.revision, selectedId],
+    () => computeHierarchyLayout(snapshot.sessions, driftBySessionId, selectedId),
+    [snapshot.sessions, driftBySessionId, selectedId],
   );
 
   const handleCreate = async (e: React.FormEvent) => {
@@ -183,7 +192,7 @@ export function SessionsLens({ snapshot, onRefresh }: SessionsLensProps) {
 
   const handleSync = async () => {
     if (!selectedSession) return;
-    await api.syncSession(snapshot.config.slug, selectedSession.id);
+    await api.syncSession(snapshot.config.slug, selectedSession.id, snapshot.config.revision);
     onRefresh();
   };
 
@@ -275,6 +284,7 @@ export function SessionsLens({ snapshot, onRefresh }: SessionsLensProps) {
                   className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 text-xs text-zinc-100"
                 >
                   <option value="active">active</option>
+                  <option value="idle">idle</option>
                   <option value="paused">paused</option>
                   <option value="completed">completed</option>
                   <option value="archived">archived</option>

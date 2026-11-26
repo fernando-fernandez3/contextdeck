@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import type { BoardSnapshot, DecisionStatus, Diagram } from '../types';
 import { api } from '../api';
+import { MERMAID_CONFIG, sanitizeMermaidSvg } from '../security';
 import { MarkdownView, StatusBadge } from './Badge';
 
 const ExcalidrawLazy = lazy(async () => {
@@ -22,12 +23,7 @@ const ExcalidrawLazy = lazy(async () => {
   return { default: mod.Excalidraw };
 });
 
-mermaid.initialize({
-  startOnLoad: false,
-  theme: 'dark',
-  securityLevel: 'loose',
-  fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
-});
+mermaid.initialize(MERMAID_CONFIG);
 
 function MermaidPreview({ code }: { code: string }) {
   const reactId = useId().replace(/:/g, '');
@@ -40,7 +36,7 @@ function MermaidPreview({ code }: { code: string }) {
       .render(`mmd_${reactId}_${Date.now()}`, code || 'flowchart LR\n  A[Empty Diagram]')
       .then((res) => {
         if (!active) return;
-        setSvg(res.svg);
+        setSvg(sanitizeMermaidSvg(res.svg));
         setError(null);
       })
       .catch((err) => {

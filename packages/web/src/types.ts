@@ -18,7 +18,7 @@ export interface BoardConfig {
   updatedAt: string;
 }
 
-export type SessionStatus = 'active' | 'paused' | 'completed' | 'archived';
+export type SessionStatus = 'active' | 'idle' | 'paused' | 'completed' | 'archived';
 
 export interface Session {
   id: string;
@@ -167,6 +167,16 @@ export interface StaleArtifactNotice {
   reasons: string[];
 }
 
+export interface DriftDigestEntry {
+  key: string;
+  revision: number;
+  kind: string;
+  entityId?: string;
+  summary: string;
+  actorLabel: string;
+  timestamp: string;
+}
+
 export interface DriftedSessionNotice {
   sessionId: string;
   title: string;
@@ -174,7 +184,9 @@ export interface DriftedSessionNotice {
   lastSyncedRevision: number;
   currentRevision: number;
   behindBy: number;
-  missedEvents: BoardEvent[];
+  digest: DriftDigestEntry[];
+  digestText: string;
+  truncatedCount: number;
 }
 
 export interface BoardSnapshot {
