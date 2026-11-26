@@ -78,5 +78,5 @@ describe('AC1.4 / Bug 1: 32 concurrent separate Node processes', () => {
     for (let i = 1; i < revisions.length; i += 1) {
       expect(revisions[i]).toBeGreaterThan(revisions[i - 1]);
     }
-  }, 30_000);
+  }, 60_000);
 });

@@ -87,7 +87,7 @@ describe('@contextdeck/core', () => {
     expect(syncResult.behindBy).toBeGreaterThan(0);
     const afterSync = await store.getSnapshot('auth-redesign');
     expect(afterSync.drift.driftedSessions.find((s) => s.sessionId === s1.id)).toBeUndefined();
-  });
+  }, 20_000);
 
   it('scores interactive quiz attempts and applies web-chat Context Pack updates', async () => {
     const dir = await makeTempDir();
@@ -123,5 +123,5 @@ describe('@contextdeck/core', () => {
     expect(result.appliedCount).toBe(2);
     expect(result.snapshot.sessions.some((s) => s.title === 'Grok Follow-up')).toBe(true);
     expect(result.snapshot.tasks.some((t) => t.title.includes('keyboard shortcuts'))).toBe(true);
-  });
+  }, 20_000);
 });

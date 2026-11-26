@@ -400,10 +400,17 @@ export class ContextDeckStore {
       const stagedTmpPaths: string[] = [];
       try {
         assertActive();
-        const briefTmp = await writeTempFileFsync(dir, initialBrief);
-        stagedTmpPaths.push(briefTmp);
-        const boardTmp = await writeTempFileFsync(dir, dumpYaml(config));
-        stagedTmpPaths.push(boardTmp);
+        const stagedResults = await Promise.allSettled([
+          writeTempFileFsync(dir, initialBrief),
+          writeTempFileFsync(dir, dumpYaml(config)),
+        ]);
+        for (const r of stagedResults) {
+          if (r.status === 'fulfilled') stagedTmpPaths.push(r.value);
+        }
+        const firstRejected = stagedResults.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+        if (firstRejected) throw firstRejected.reason;
+        const briefTmp = (stagedResults[0] as PromiseFulfilledResult<string>).value;
+        const boardTmp = (stagedResults[1] as PromiseFulfilledResult<string>).value;
 
         const txn: TxnJournal = {
           id: shortId('txn'),
@@ -416,7 +423,11 @@ export class ContextDeckStore {
         const txnPath = path.join(this.runtimeDir, TXN_FILENAME);
         assertActive();
         await atomicWriteFile(txnPath, `${JSON.stringify(txn, null, 2)}\n`);
-        await executeTxnJournal(txnPath, txn, { assertActive, allowFaultInjection: true });
+        await executeTxnJournal(txnPath, txn, {
+          assertActive,
+          allowFaultInjection: true,
+          checkEventDedupe: false,
+        });
       } catch (err) {
         if (!existsSync(path.join(this.runtimeDir, TXN_FILENAME))) {
           await Promise.all(stagedTmpPaths.map((p) => fs.rm(p, { force: true }).catch(() => {})));
@@ -527,22 +538,65 @@ export class ContextDeckStore {
         return result;
       }
 
-      // Stage all temp files (fsynced) BEFORE writing txn.json
+      // Stage all temp files (fsynced) concurrently BEFORE writing txn.json so the OS/filesystem
+      // can coalesce journal flushes while preserving the strict D1 commit barrier.
       const createdTmpFiles: string[] = [];
       const ops: TxnOp[] = [];
       let boardCommit: TxnJournal['boardCommit'];
 
       try {
-        for (const item of stagedWrites) {
-          assertActive();
+        assertActive();
+        const pendingTempWrites: Array<{
+          slot: number | 'board';
+          promise: Promise<string>;
+        }> = [];
+
+        for (let i = 0; i < stagedWrites.length; i += 1) {
+          const item = stagedWrites[i];
+          if (item.kind === 'write') {
+            pendingTempWrites.push({
+              slot: i,
+              promise: writeTempFileFsync(path.dirname(item.finalPath), item.content!),
+            });
+          }
+        }
+
+        if (configDirty) {
+          const nextConfig: BoardConfig = {
+            ...initialConfig,
+            revision: currentRevision,
+            updatedAt: nowIso(),
+          };
+          pendingTempWrites.push({
+            slot: 'board',
+            promise: writeTempFileFsync(boardDir, dumpYaml(nextConfig)),
+          });
+        }
+
+        const settled = await Promise.allSettled(pendingTempWrites.map((w) => w.promise));
+        const stagedTmpBySlot = new Map<number | 'board', string>();
+        let firstError: unknown;
+        for (let i = 0; i < settled.length; i += 1) {
+          const res = settled[i];
+          if (res.status === 'fulfilled') {
+            createdTmpFiles.push(res.value);
+            stagedTmpBySlot.set(pendingTempWrites[i].slot, res.value);
+          } else if (firstError === undefined) {
+            firstError = res.reason;
+          }
+        }
+        if (firstError !== undefined) {
+          throw firstError;
+        }
+
+        for (let i = 0; i < stagedWrites.length; i += 1) {
+          const item = stagedWrites[i];
           if (item.kind === 'unlink') {
             ops.push({ kind: 'unlink', finalPath: item.finalPath });
           } else if (item.kind === 'write') {
-            const tmpPath = await writeTempFileFsync(path.dirname(item.finalPath), item.content!);
-            createdTmpFiles.push(tmpPath);
             ops.push({
               kind: item.noClobber ? 'link_create' : 'rename',
-              tmpPath,
+              tmpPath: stagedTmpBySlot.get(i)!,
               finalPath: item.finalPath,
             });
           } else if (item.kind === 'pre_staged') {
@@ -555,16 +609,8 @@ export class ContextDeckStore {
         }
 
         if (configDirty) {
-          assertActive();
-          const nextConfig: BoardConfig = {
-            ...initialConfig,
-            revision: currentRevision,
-            updatedAt: nowIso(),
-          };
-          const boardTmp = await writeTempFileFsync(boardDir, dumpYaml(nextConfig));
-          createdTmpFiles.push(boardTmp);
           boardCommit = {
-            tmpPath: boardTmp,
+            tmpPath: stagedTmpBySlot.get('board')!,
             finalPath: boardYamlPath,
           };
         }
@@ -582,7 +628,11 @@ export class ContextDeckStore {
         await atomicWriteFile(txnPath, `${JSON.stringify(txn, null, 2)}\n`);
         maybeInjectFault('after-txn-write');
 
-        await executeTxnJournal(txnPath, txn, { assertActive, allowFaultInjection: true });
+        await executeTxnJournal(txnPath, txn, {
+          assertActive,
+          allowFaultInjection: true,
+          checkEventDedupe: false,
+        });
         return result;
       } catch (err) {
         // Only remove temp files we created if txn.json was NOT written (if txn.json exists, roll-forward needs them!)
@@ -947,6 +997,108 @@ export class ContextDeckStore {
     return out.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
+  private async readDecisionById(slug: string, decisionId: string): Promise<Decision | null> {
+    const validId = validateEntityId(decisionId, 'decisionId');
+    const filePath = await this.safeBoardFilePath(slug, 'decisions', `${validId}.md`);
+    const raw = await readFileStrict(filePath);
+    if (raw === null) return null;
+    let data: Record<string, unknown>;
+    let body: string;
+    try {
+      ({ data, body } = parseFrontmatter<Record<string, unknown>>(raw));
+    } catch (err) {
+      throw new CorruptDataError(
+        `Corrupt frontmatter in ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    const parsed = DecisionSchema.safeParse({ ...data, rationale: body });
+    if (!parsed.success) {
+      throw new CorruptDataError(
+        `Invalid decision schema in ${filePath}: ${formatZodError(parsed.error)}`,
+      );
+    }
+    return parsed.data;
+  }
+
+  private async readTaskById(slug: string, taskId: string): Promise<Task | null> {
+    const validId = validateEntityId(taskId, 'taskId');
+    const filePath = await this.safeBoardFilePath(slug, 'tasks', `${validId}.md`);
+    const raw = await readFileStrict(filePath);
+    if (raw === null) return null;
+    let data: Record<string, unknown>;
+    let body: string;
+    try {
+      ({ data, body } = parseFrontmatter<Record<string, unknown>>(raw));
+    } catch (err) {
+      throw new CorruptDataError(
+        `Corrupt frontmatter in ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    const parsed = TaskSchema.safeParse({ ...data, description: body });
+    if (!parsed.success) {
+      throw new CorruptDataError(
+        `Invalid task schema in ${filePath}: ${formatZodError(parsed.error)}`,
+      );
+    }
+    return parsed.data;
+  }
+
+  private async readDiagramById(slug: string, diagramId: string): Promise<Diagram | null> {
+    const validId = validateEntityId(diagramId, 'diagramId');
+    const dir = await this.safeBoardFilePath(slug, 'diagrams');
+    const metaPath = await assertContainedPath(dir, path.join(dir, `${validId}.meta.yaml`), {
+      label: `diagram meta ${validId}`,
+    });
+    const meta = await readYamlStrict<Record<string, unknown>>(metaPath);
+    if (!meta) return null;
+    const ext = meta.kind === 'excalidraw' ? '.excalidraw' : '.mmd';
+    const contentPath = await assertContainedPath(dir, path.join(dir, `${validId}${ext}`), {
+      label: `diagram content ${validId}${ext}`,
+    });
+    const content = (await readFileStrict(contentPath)) ?? '';
+    const parsed = DiagramSchema.safeParse({ ...meta, content });
+    if (!parsed.success) {
+      throw new CorruptDataError(
+        `Invalid diagram schema in ${metaPath}: ${formatZodError(parsed.error)}`,
+      );
+    }
+    return parsed.data;
+  }
+
+  private async readMediaById(
+    slug: string,
+    mediaId: string,
+    options: { loadContent?: boolean } = {},
+  ): Promise<MediaArtifact | null> {
+    const { loadContent = true } = options;
+    const validId = validateEntityId(mediaId, 'mediaId');
+    const dir = await this.safeBoardFilePath(slug, 'media');
+    const metaPath = await assertContainedPath(dir, path.join(dir, `${validId}.meta.yaml`), {
+      label: `media meta ${validId}`,
+    });
+    const meta = await readYamlStrict<Record<string, unknown>>(metaPath);
+    if (!meta) return null;
+    let content = typeof meta.content === 'string' ? meta.content : undefined;
+    if (
+      loadContent &&
+      !content &&
+      typeof meta.filePath === 'string' &&
+      (meta.kind === 'doc' || meta.kind === 'html' || meta.kind === 'json')
+    ) {
+      const contentPath = await assertContainedPath(dir, path.join(dir, meta.filePath), {
+        label: `media content ${meta.filePath}`,
+      });
+      content = (await readFileStrict(contentPath)) ?? undefined;
+    }
+    const parsed = MediaArtifactSchema.safeParse({ ...meta, content });
+    if (!parsed.success) {
+      throw new CorruptDataError(
+        `Invalid media schema in ${metaPath}: ${formatZodError(parsed.error)}`,
+      );
+    }
+    return parsed.data;
+  }
+
   /**
    * Consistent snapshot reader (E1 + D1):
    * reads board.yaml revision first and last; retries up to 3 times if revision changed;
@@ -1028,7 +1180,7 @@ export class ContextDeckStore {
         );
       }
       if (baseRev < currentRev) {
-        const events = await this.readEvents(tx.slug, currentRev);
+        const events = await this.readEventsSince(tx.slug, baseRev, currentRev);
         const briefChangedSince = events.some(
           (ev) => ev.revision > baseRev && ev.kind === 'brief.updated',
         );
@@ -1156,7 +1308,6 @@ export class ContextDeckStore {
   ): Promise<Decision> {
     const input = parseStrict(RecordDecisionInputSchema.omit({ actor: true }), rawInput, 'decision');
     const effActor = actorOverride ?? tx.actor;
-    const existing = inMemoryExisting ?? (await this.listDecisions(tx.slug));
     const decisionsDir = await this.safeBoardFilePath(tx.slug, 'decisions');
 
     let id: string;
@@ -1167,7 +1318,7 @@ export class ContextDeckStore {
       isNewSequential = true;
       const diskFiles = await listFilesStrict(decisionsDir, '.md');
       const allIds = [
-        ...existing.map((d) => d.id),
+        ...(inMemoryExisting ? inMemoryExisting.map((d) => d.id) : []),
         ...diskFiles.map((f) => f.replace(/\.md$/, '')),
       ];
       id = nextSequentialId('dec', allIds);
@@ -1201,7 +1352,9 @@ export class ContextDeckStore {
 
     let oldDecision: Decision | undefined;
     if (decision.supersedes) {
-      oldDecision = existing.find((d) => d.id === decision.supersedes);
+      oldDecision = inMemoryExisting
+        ? inMemoryExisting.find((d) => d.id === decision.supersedes)
+        : ((await this.readDecisionById(tx.slug, decision.supersedes)) ?? undefined);
       if (oldDecision) {
         const updatedOld: Decision = {
           ...oldDecision,
@@ -1271,8 +1424,11 @@ export class ContextDeckStore {
   ): Promise<Task> {
     const input = parseStrict(UpsertTaskInputSchema.omit({ actor: true }), rawInput, 'task');
     const effActor = actorOverride ?? tx.actor;
-    const existingList = inMemoryExisting ?? (await this.listTasks(tx.slug));
-    const existing = input.id ? existingList.find((t) => t.id === input.id) : undefined;
+    const existing = input.id
+      ? inMemoryExisting
+        ? inMemoryExisting.find((t) => t.id === input.id)
+        : ((await this.readTaskById(tx.slug, input.id)) ?? undefined)
+      : undefined;
     const tasksDir = await this.safeBoardFilePath(tx.slug, 'tasks');
     const now = nowIso();
 
@@ -1286,7 +1442,7 @@ export class ContextDeckStore {
       isNewSequential = true;
       const diskFiles = await listFilesStrict(tasksDir, '.md');
       const allIds = [
-        ...existingList.map((t) => t.id),
+        ...(inMemoryExisting ? inMemoryExisting.map((t) => t.id) : []),
         ...diskFiles.map((f) => f.replace(/\.md$/, '')),
       ];
       id = nextSequentialId('task', allIds);
@@ -1356,8 +1512,7 @@ export class ContextDeckStore {
   ): Promise<Diagram> {
     const input = parseStrict(UpsertDiagramInputSchema.omit({ actor: true }), rawInput, 'diagram');
     const effActor = actorOverride ?? tx.actor;
-    const existingList = await this.listDiagrams(tx.slug);
-    const existing = input.id ? existingList.find((d) => d.id === input.id) : undefined;
+    const existing = input.id ? ((await this.readDiagramById(tx.slug, input.id)) ?? undefined) : undefined;
     const now = nowIso();
 
     const kind = input.kind ?? existing?.kind ?? 'mermaid';
@@ -1406,8 +1561,7 @@ export class ContextDeckStore {
     const patch = parseStrict(UpdateMediaPatchSchema.omit({ actor: true }), rawPatch, 'media patch');
     const effActor = actorOverride ?? tx.actor;
 
-    const list = await this.listMedia(tx.slug);
-    const existing = list.find((m) => m.id === mediaId);
+    const existing = await this.readMediaById(tx.slug, mediaId, { loadContent: true });
     if (!existing) {
       throw new NotFoundError(`Media artifact "${mediaId}" not found on board "${tx.slug}".`);
     }
@@ -1658,8 +1812,7 @@ export class ContextDeckStore {
     const patch = parseStrict(UpdateDecisionPatchSchema.omit({ actor: true }), rawPatch, 'decision patch');
 
     return this.mutate(boardSlug, actor, async (tx) => {
-      const existingList = await this.listDecisions(tx.slug);
-      const existing = existingList.find((d) => d.id === decisionId);
+      const existing = await this.readDecisionById(tx.slug, decisionId);
       if (!existing) {
         throw new NotFoundError(`Decision "${decisionId}" not found on board "${tx.slug}".`);
       }
@@ -2016,8 +2169,7 @@ export class ContextDeckStore {
   ): Promise<void> {
     validateEntityId(mediaId, 'mediaId');
     await this.mutate(boardSlug, actor, async (tx) => {
-      const list = await this.listMedia(tx.slug, { loadContent: false });
-      const existing = list.find((m) => m.id === mediaId);
+      const existing = await this.readMediaById(tx.slug, mediaId, { loadContent: false });
       const mediaDir = await this.safeBoardFilePath(tx.slug, 'media');
       const metaPath = await assertContainedPath(
         mediaDir,
@@ -2047,8 +2199,7 @@ export class ContextDeckStore {
   ): Promise<{ absolutePath: string; artifact: MediaArtifact } | null> {
     const slug = await this.resolveBoardSlug(boardSlug);
     validateEntityId(mediaId, 'mediaId');
-    const list = await this.listMedia(slug, { loadContent: false });
-    const artifact = list.find((m) => m.id === mediaId);
+    const artifact = await this.readMediaById(slug, mediaId, { loadContent: false });
     if (!artifact?.filePath) return null;
     const mediaDir = await this.safeBoardFilePath(slug, 'media');
     const candidate = path.join(mediaDir, artifact.filePath);
@@ -2191,8 +2342,7 @@ export class ContextDeckStore {
       };
 
       if (artifactType === 'diagram') {
-        const list = await this.listDiagrams(tx.slug);
-        const item = list.find((d) => d.id === artifactId);
+        const item = await this.readDiagramById(tx.slug, artifactId);
         if (!item) throw new NotFoundError(`Diagram "${artifactId}" not found.`);
         await this.upsertDiagramUnlocked(tx, {
           id: item.id,
@@ -2206,8 +2356,7 @@ export class ContextDeckStore {
       }
 
       if (artifactType === 'media') {
-        const list = await this.listMedia(tx.slug, { loadContent: false });
-        const item = list.find((m) => m.id === artifactId);
+        const item = await this.readMediaById(tx.slug, artifactId, { loadContent: false });
         if (!item) throw new NotFoundError(`Media "${artifactId}" not found.`);
         await this.updateMediaUnlocked(tx, artifactId, {
           basedOnDecisions: upgradeDecisionIds(item.basedOnDecisions),
@@ -2216,8 +2365,7 @@ export class ContextDeckStore {
       }
 
       if (artifactType === 'task') {
-        const list = await this.listTasks(tx.slug);
-        const item = list.find((t) => t.id === artifactId);
+        const item = await this.readTaskById(tx.slug, artifactId);
         if (!item) throw new NotFoundError(`Task "${artifactId}" not found.`);
         await this.upsertTaskUnlocked(tx, {
           id: item.id,

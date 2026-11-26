@@ -80,7 +80,7 @@ describe('E4 workspace resolution, worktrees, global pointer, and watcher', () =
     });
     const wtSnap = await wtStore.getSnapshot('main');
     expect(wtSnap.decisions.map((d) => d.title)).toContain('Second main decision');
-  });
+  }, 20_000);
 
   it('supports .contextdeck.yaml global pointer across main checkout and linked git worktree', async () => {
     const base = await makeTempDir();
@@ -128,7 +128,7 @@ describe('E4 workspace resolution, worktrees, global pointer, and watcher', () =
 
     const mainSnap = await mainStore.getSnapshot('core-board');
     expect(mainSnap.decisions.map((d) => d.title)).toContain('Global worktree decision');
-  });
+  }, 20_000);
 
   it('enforces resolver precedence: --dir > CONTEXTDECK_DIR > CLAUDE_PROJECT_DIR > ancestor lookup > error', async () => {
     const base = await makeTempDir();

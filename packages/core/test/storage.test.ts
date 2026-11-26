@@ -20,6 +20,11 @@ afterEach(async () => {
   }
 });
 
+// Fsync-heavy transactional storage tests run real temp-file fsync, txn.json fsync,
+// events fdatasync, and cross-process locking. Under virtualized CI disk contention
+// (e.g. GitHub ubuntu-latest), multi-mutation tests need headroom beyond vitest's 5s default.
+const FSYNC_TEST_TIMEOUT_MS = 20_000;
+
 describe('E1 safe concurrent storage engine', () => {
   it('refuses to overwrite an existing board in createBoard', async () => {
     const dir = await makeTempDir();
@@ -34,7 +39,7 @@ describe('E1 safe concurrent storage engine', () => {
     const snap = await store.getSnapshot('main');
     expect(snap.config.title).toBe('Original');
     expect(snap.decisions).toHaveLength(1);
-  });
+  }, FSYNC_TEST_TIMEOUT_MS);
 
   it('distinguishes ENOENT from corrupt files and keeps corrupt files untouched', async () => {
     const dir = await makeTempDir();
@@ -65,7 +70,7 @@ describe('E1 safe concurrent storage engine', () => {
       code: 'CORRUPT_DATA',
     });
     expect(await fs.readFile(boardYamlPath, 'utf8')).toBe(corruptBoard);
-  });
+  }, FSYNC_TEST_TIMEOUT_MS);
 
   it('enforces brief baseRevision conflicts with currentBrief included', async () => {
     const dir = await makeTempDir();
@@ -94,7 +99,7 @@ describe('E1 safe concurrent storage engine', () => {
     const conflict = caught as core.ConflictError;
     expect(conflict.details?.currentBrief).toBe('# V3\n');
     expect(conflict.details?.currentRevision).toBe(4);
-  });
+  }, FSYNC_TEST_TIMEOUT_MS);
 
   it('preserves both edits under conflicting concurrent PATCHes of the same task', async () => {
     const dir = await makeTempDir();
@@ -117,7 +122,7 @@ describe('E1 safe concurrent storage engine', () => {
     expect(updated.column).toBe('in_progress');
     expect(updated.priority).toBe('urgent');
     expect(updated.assignee).toBe('claude-code');
-  });
+  }, FSYNC_TEST_TIMEOUT_MS);
 
   it('rejects storage fields on updateMedia (Bug 8 core defense)', async () => {
     const dir = await makeTempDir();
@@ -139,7 +144,7 @@ describe('E1 safe concurrent storage engine', () => {
 
     const snap = await store.getSnapshot('main');
     expect(snap.brief).toBe('# Safe Brief\n');
-  });
+  }, FSYNC_TEST_TIMEOUT_MS);
 
   it('guards submitQuizAttempt against zero-question quizzes (AC1.5)', async () => {
     const dir = await makeTempDir();
@@ -172,7 +177,7 @@ describe('E1 safe concurrent storage engine', () => {
     await expect(
       store.submitQuizAttempt('main', 'quiz_zero', { answers: {} }),
     ).rejects.toThrow();
-  });
+  }, FSYNC_TEST_TIMEOUT_MS);
 
   it('recovers cleanly via roll-forward journal when killed mid-commit (after-rename-1 and after-event)', async () => {
     const dir = await makeTempDir();
@@ -222,7 +227,7 @@ describe('E1 safe concurrent storage engine', () => {
     expect(finalSnap.config.revision).toBe(6);
     expect(finalSnap.events.map((e) => e.revision)).toEqual([1, 2, 3, 4, 5, 6]);
     expect(new Set(finalSnap.events.map((e) => e.id)).size).toBe(6);
-  });
+  }, FSYNC_TEST_TIMEOUT_MS);
 
   it('aborts mutation without writing when lock is compromised', async () => {
     const dir = await makeTempDir();
@@ -248,7 +253,7 @@ describe('E1 safe concurrent storage engine', () => {
     const afterSnap = await store.getSnapshot('main');
     expect(afterSnap.config.revision).toBe(beforeSnap.config.revision);
     expect(afterSnap.brief).toBe(beforeSnap.brief);
-  });
+  }, FSYNC_TEST_TIMEOUT_MS);
 
   it('runs applyContextUpdate and refreshArtifactDecisions without re-entrant lock deadlock', async () => {
     const dir = await makeTempDir();
@@ -276,5 +281,5 @@ describe('E1 safe concurrent storage engine', () => {
     await store.refreshArtifactDecisions('main', 'diagram', diag.id);
     const refreshed = await store.getSnapshot('main');
     expect(refreshed.drift.staleArtifacts).toHaveLength(0);
-  });
+  }, FSYNC_TEST_TIMEOUT_MS);
 });

@@ -13,7 +13,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:unit": "vitest run --project unit",
+    "test:stress": "vitest run --project stress"
   },
   "dependencies": {
     "chokidar": "^4.0.3",

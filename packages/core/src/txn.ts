@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
-import { createReadStream, statSync } from 'node:fs';
+import { createReadStream, existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import lockfile from 'proper-lockfile';
 import { z } from 'zod';
@@ -95,9 +95,18 @@ export async function writeTempFileFsync(
   content: string | Buffer,
   prefix = '.tmp-',
 ): Promise<string> {
-  await fs.mkdir(targetDir, { recursive: true });
   const tmpPath = path.join(targetDir, `${prefix}${crypto.randomBytes(8).toString('hex')}`);
-  const fh = await fs.open(tmpPath, 'wx', 0o644);
+  let fh: fs.FileHandle;
+  try {
+    fh = await fs.open(tmpPath, 'wx', 0o644);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      await fs.mkdir(targetDir, { recursive: true });
+      fh = await fs.open(tmpPath, 'wx', 0o644);
+    } else {
+      throw err;
+    }
+  }
   try {
     if (typeof content === 'string') {
       await fh.writeFile(content, 'utf8');
@@ -170,8 +179,17 @@ export async function streamFileToTempFsync(
 }
 
 export async function appendLineFdatasync(filePath: string, line: string): Promise<void> {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  const fh = await fs.open(filePath, 'a', 0o644);
+  let fh: fs.FileHandle;
+  try {
+    fh = await fs.open(filePath, 'a', 0o644);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      fh = await fs.open(filePath, 'a', 0o644);
+    } else {
+      throw err;
+    }
+  }
   try {
     await fh.write(line, null, 'utf8');
     await fh.datasync();
@@ -236,9 +254,13 @@ export function maybeInjectFault(stage: string): void {
 export async function executeTxnJournal(
   txnPath: string,
   txn: TxnJournal,
-  options: { assertActive?: () => void; allowFaultInjection?: boolean } = {},
+  options: {
+    assertActive?: () => void;
+    allowFaultInjection?: boolean;
+    checkEventDedupe?: boolean;
+  } = {},
 ): Promise<void> {
-  const { assertActive, allowFaultInjection = false } = options;
+  const { assertActive, allowFaultInjection = false, checkEventDedupe = true } = options;
 
   for (let i = 0; i < txn.ops.length; i += 1) {
     assertActive?.();
@@ -287,11 +309,30 @@ export async function executeTxnJournal(
     maybeInjectFault('after-renames');
   }
 
-  for (const ev of txn.events) {
-    assertActive?.();
-    const alreadyPresent = await eventIdExistsInFile(ev.eventsPath, ev.eventId);
-    if (!alreadyPresent) {
-      await appendLineFdatasync(ev.eventsPath, ev.line);
+  if (txn.events.length > 0) {
+    if (checkEventDedupe) {
+      for (const ev of txn.events) {
+        assertActive?.();
+        const alreadyPresent = await eventIdExistsInFile(ev.eventsPath, ev.eventId);
+        if (!alreadyPresent) {
+          await appendLineFdatasync(ev.eventsPath, ev.line);
+        }
+      }
+    } else {
+      // Fresh commit: event IDs were just minted in this transaction; skip scanning events.jsonl
+      // and coalesce contiguous events per target path into one write + fdatasync.
+      let idx = 0;
+      while (idx < txn.events.length) {
+        assertActive?.();
+        const targetPath = txn.events[idx].eventsPath;
+        let batch = txn.events[idx].line;
+        idx += 1;
+        while (idx < txn.events.length && txn.events[idx].eventsPath === targetPath) {
+          batch += txn.events[idx].line;
+          idx += 1;
+        }
+        await appendLineFdatasync(targetPath, batch);
+      }
     }
   }
 
@@ -356,6 +397,7 @@ export async function recoverPendingTxn(
   await executeTxnJournal(txnPath, validated.data, {
     assertActive,
     allowFaultInjection: false,
+    checkEventDedupe: true,
   });
   return true;
 }
@@ -377,10 +419,12 @@ export async function withWorkspaceLock<T>(
   runtimeDir: string,
   fn: (assertActive: () => void) => Promise<T>,
 ): Promise<T> {
-  await fs.mkdir(runtimeDir, { recursive: true, mode: 0o700 });
   const sentinelPath = path.join(runtimeDir, LOCK_SENTINEL_NAME);
-  const fh = await fs.open(sentinelPath, 'a', 0o600);
-  await fh.close();
+  if (!existsSync(sentinelPath)) {
+    await fs.mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+    const fh = await fs.open(sentinelPath, 'a', 0o600);
+    await fh.close();
+  }
 
   const { stale, update } = getLockTimings();
   let compromised = false;
@@ -390,10 +434,10 @@ export async function withWorkspaceLock<T>(
     stale,
     update,
     retries: {
-      retries: 100,
-      factor: 1.15,
-      minTimeout: 20,
-      maxTimeout: 350,
+      retries: 150,
+      factor: 1.12,
+      minTimeout: 10,
+      maxTimeout: 200,
       randomize: true,
     },
     onCompromised: (err: Error) => {
