@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import type { BoardConfig, BoardSnapshot } from './types';
 import { AuthExpiredError, api, setAuthExpiredHandler } from './api';
+import { buildBoardTreeOptions } from './board-tree';
 import { BriefLens } from './components/BriefLens';
 import { SessionsLens } from './components/SessionsLens';
 import { DecisionsCanvasLens } from './components/DecisionsCanvasLens';
@@ -46,6 +47,7 @@ export function App() {
   const [showNewBoard, setShowNewBoard] = useState(false);
   const [newBoardTitle, setNewBoardTitle] = useState('');
   const [newBoardDesc, setNewBoardDesc] = useState('');
+  const [newBoardParent, setNewBoardParent] = useState('');
 
   useEffect(() => {
     setAuthExpiredHandler(() => {
@@ -118,9 +120,11 @@ export function App() {
     const created = await api.createBoard({
       title: newBoardTitle.trim(),
       description: newBoardDesc.trim(),
+      ...(newBoardParent ? { parentBoard: newBoardParent } : {}),
     });
     setNewBoardTitle('');
     setNewBoardDesc('');
+    setNewBoardParent('');
     setShowNewBoard(false);
     await loadBoardsAndSnapshot(created.slug);
   };
@@ -152,11 +156,11 @@ export function App() {
               aria-label="Select Board"
               value={activeSlug}
               onChange={(e) => void handleSelectBoard(e.target.value)}
-              className="rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-xs font-medium text-zinc-100 max-w-[220px] truncate"
+              className="rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-xs font-medium text-zinc-100 max-w-[240px] truncate"
             >
-              {boards.map((b) => (
-                <option key={b.slug} value={b.slug}>
-                  {b.title} ({b.slug})
+              {buildBoardTreeOptions(boards).map(({ board, label }) => (
+                <option key={board.slug} value={board.slug}>
+                  {label}
                 </option>
               ))}
             </select>
@@ -358,6 +362,23 @@ export function App() {
                   className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-100"
                 />
               </div>
+              {boards.length > 0 && (
+                <div>
+                  <label className="block text-xs text-zinc-400 mb-1">Parent Board (optional)</label>
+                  <select
+                    value={newBoardParent}
+                    onChange={(e) => setNewBoardParent(e.target.value)}
+                    className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-xs text-zinc-100"
+                  >
+                    <option value="">None (top-level board)</option>
+                    {buildBoardTreeOptions(boards).map(({ board, label }) => (
+                      <option key={board.slug} value={board.slug}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
             </div>
             <div className="flex justify-end gap-2">
               <button type="button" onClick={() => setShowNewBoard(false)} className="px-3 py-1.5 text-xs text-zinc-400">

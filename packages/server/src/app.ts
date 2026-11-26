@@ -23,6 +23,7 @@ import {
   RestUpdateDiagramInputSchema,
   SubmitQuizAttemptInputSchema,
   SyncSessionInputSchema,
+  UpdateBoardInputSchema,
   UpdateBriefInputSchema,
   UpdateDecisionPatchSchema,
   UpdateMediaPatchSchema,
@@ -484,6 +485,17 @@ export function createApp(options: AppOptions): {
     const slug = validateBoardSlug(c.req.param('slug'));
     const snapshot = await store.getSnapshot(slug);
     return c.json(snapshot);
+  });
+
+  app.patch('/api/boards/:slug', async (c) => {
+    const slug = validateBoardSlug(c.req.param('slug'));
+    const { actor, ...patch } = parseBodyStrict(
+      UpdateBoardInputSchema,
+      await readByteCountedJson(c),
+    );
+    const updated = await store.updateBoard(slug, patch, actor ?? { type: 'human', label: 'web-ui' });
+    broadcast('board.changed', slug);
+    return c.json(updated);
   });
 
   app.get('/api/boards/:slug/context-pack', async (c) => {

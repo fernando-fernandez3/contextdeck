@@ -1,5 +1,11 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import {
+  ErrorCode,
+  McpError,
+  SubscribeRequestSchema,
+  UnsubscribeRequestSchema,
+} from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import {
   BoardSlugSchema,
@@ -16,11 +22,14 @@ import {
   TaskColumnSchema,
   TaskPrioritySchema,
   generateContextPack,
+  type WatchOptions,
 } from '@contextdeck/core';
 import { validateMcpMediaSourcePath } from './security.js';
 
 const MCP_MAX_BRIEF_CHARS = 200 * 1024; // 200 KB (E2 amended)
 const MCP_MAX_TEXT_CHARS = 20 * 1024; // 20 KB (E2 amended)
+const SUBSCRIBABLE_RESOURCE_URIS = new Set(['contextdeck://brief', 'contextdeck://snapshot']);
+const subscribedUrisByServer = new WeakMap<McpServer, Set<string>>();
 
 export interface CreateMcpServerOptions {
   defaultBoard?: string;
@@ -43,14 +52,50 @@ export function createContextDeckMcpServer(
   const { defaultBoard, onMutate, env, homeDir } = options;
   const maxMediaBytes = options.maxMediaBytes ?? store.maxMediaBytes;
 
-  const server = new McpServer({
-    name: 'contextdeck',
-    version: '0.2.0',
+  const server = new McpServer(
+    {
+      name: 'contextdeck',
+      version: '0.2.0',
+    },
+    {
+      capabilities: {
+        resources: {
+          subscribe: true,
+          listChanged: true,
+        },
+      },
+    },
+  );
+
+  const subscribedUris = new Set<string>();
+  subscribedUrisByServer.set(server, subscribedUris);
+
+  server.server.setRequestHandler(SubscribeRequestSchema, async (req) => {
+    const uri = req.params.uri;
+    if (!SUBSCRIBABLE_RESOURCE_URIS.has(uri)) {
+      throw new McpError(ErrorCode.InvalidParams, `Unknown subscribable resource URI: ${uri}`);
+    }
+    subscribedUris.add(uri);
+    return {};
   });
 
-  // D4 / D9: Never auto-initialize a workspace or call ensureDefaultBoard()!
-  const resolveSlug = async (board?: string) => {
-    return store.resolveBoardSlug(board ?? defaultBoard);
+  server.server.setRequestHandler(UnsubscribeRequestSchema, async (req) => {
+    subscribedUris.delete(req.params.uri);
+    return {};
+  });
+
+  // D4 / D9 / AC6.1: Never auto-initialize a workspace. Default to the session's bound board when sessionId is passed.
+  const resolveSlug = async (board?: string, sessionId?: string | null) => {
+    if (board !== undefined && board !== '') {
+      return store.resolveBoardSlug(board);
+    }
+    if (sessionId) {
+      const session = await store.getSession(sessionId);
+      if (session?.board) {
+        return store.resolveBoardSlug(session.board);
+      }
+    }
+    return store.resolveBoardSlug(defaultBoard);
   };
 
   server.registerTool(
@@ -91,7 +136,7 @@ export function createContextDeckMcpServer(
         .strict(),
     },
     async ({ board, sessionId, maxChars }) => {
-      const slug = await resolveSlug(board);
+      const slug = await resolveSlug(board, sessionId);
       // D7: Read snapshot FIRST, then acknowledge exact snapshot.config.revision!
       const snapshot = await store.getSnapshot(slug);
       let missedSummary = '';
@@ -139,7 +184,7 @@ export function createContextDeckMcpServer(
         .strict(),
     },
     async ({ board, brief, baseRevision, harness, sessionId }) => {
-      const slug = await resolveSlug(board);
+      const slug = await resolveSlug(board, sessionId);
       try {
         const res = await store.updateBrief(
           slug,
@@ -189,11 +234,12 @@ export function createContextDeckMcpServer(
       inputSchema: z
         .object({
           board: BoardSlugSchema.optional(),
+          sessionId: EntityIdSchema.optional(),
         })
         .strict(),
     },
-    async ({ board }) => {
-      const slug = await resolveSlug(board);
+    async ({ board, sessionId }) => {
+      const slug = await resolveSlug(board, sessionId);
       const snapshot = await store.getSnapshot(slug);
       return {
         content: [{ type: 'text', text: JSON.stringify(snapshot.drift, null, 2) }],
@@ -253,7 +299,7 @@ export function createContextDeckMcpServer(
         .strict(),
     },
     async ({ board, sessionId, ...patch }) => {
-      const slug = await resolveSlug(board);
+      const slug = await resolveSlug(board, sessionId);
       const updated = await store.updateSession(slug, sessionId, patch, {
         type: 'agent',
         sessionId,
@@ -286,7 +332,7 @@ export function createContextDeckMcpServer(
         .strict(),
     },
     async ({ board, harness, ...input }) => {
-      const slug = await resolveSlug(board);
+      const slug = await resolveSlug(board, input.sessionId);
       const decision = await store.recordDecision(slug, input, {
         type: 'agent',
         harness: harness ?? 'mcp',
@@ -322,7 +368,7 @@ export function createContextDeckMcpServer(
         .strict(),
     },
     async ({ board, harness, sessionId, ...input }) => {
-      const slug = await resolveSlug(board);
+      const slug = await resolveSlug(board, sessionId);
       const task = await store.upsertTask(slug, input, {
         type: 'agent',
         harness: harness ?? 'mcp',
@@ -356,7 +402,7 @@ export function createContextDeckMcpServer(
         .strict(),
     },
     async ({ board, harness, ...input }) => {
-      const slug = await resolveSlug(board);
+      const slug = await resolveSlug(board, input.sessionId);
       const diagram = await store.upsertDiagram(slug, input, {
         type: 'agent',
         harness: harness ?? 'mcp',
@@ -398,7 +444,7 @@ export function createContextDeckMcpServer(
         .strict(),
     },
     async ({ board, harness, sourceFilePath, ...input }) => {
-      const slug = await resolveSlug(board);
+      const slug = await resolveSlug(board, input.sessionId);
       let safeSourcePath: string | undefined;
       if (sourceFilePath !== undefined) {
         safeSourcePath = await validateMcpMediaSourcePath(sourceFilePath, {
@@ -449,7 +495,7 @@ export function createContextDeckMcpServer(
         .strict(),
     },
     async ({ board, harness, ...input }) => {
-      const slug = await resolveSlug(board);
+      const slug = await resolveSlug(board, input.sessionId);
       const quiz = await store.createQuiz(slug, input, {
         type: 'agent',
         harness: harness ?? 'mcp',
@@ -479,7 +525,7 @@ export function createContextDeckMcpServer(
         .strict(),
     },
     async ({ board, artifactType, artifactId, harness, sessionId }) => {
-      const slug = await resolveSlug(board);
+      const slug = await resolveSlug(board, sessionId);
       await store.refreshArtifactDecisions(slug, artifactType, artifactId, {
         type: 'agent',
         harness: harness ?? 'mcp',
@@ -546,6 +592,29 @@ export function createContextDeckMcpServer(
   return server;
 }
 
+/**
+ * Attach a scoped board-config file watcher (D10: `boards/<slug>/board.yaml`, depth 2)
+ * that emits `notifications/resources/updated` for every subscribed URI on board change (AC5.8).
+ */
+export function attachMcpResourceWatcher(
+  server: McpServer,
+  store: ContextDeckStore,
+  options: Omit<WatchOptions, 'scope'> = {},
+) {
+  if (!store.isInitialized()) return null;
+  const subscribedUris = subscribedUrisByServer.get(server);
+
+  return store.watch(
+    () => {
+      if (!subscribedUris || subscribedUris.size === 0) return;
+      for (const uri of subscribedUris) {
+        void server.server.sendResourceUpdated({ uri }).catch(() => {});
+      }
+    },
+    { ...options, scope: 'board-configs' },
+  );
+}
+
 export async function startStdioMcpServer(
   store: ContextDeckStore,
   defaultBoard?: string,
@@ -553,17 +622,8 @@ export async function startStdioMcpServer(
   const server = createContextDeckMcpServer(store, { defaultBoard });
   const transport = new StdioServerTransport();
 
-  // D10: MCP stdio watches only boards/*/board.yaml (depth 2)
-  const watcher = store.isInitialized()
-    ? store.watch(
-        () => {
-          void server.server
-            .sendResourceUpdated({ uri: 'contextdeck://brief' })
-            .catch(() => {});
-        },
-        { scope: 'board-configs' },
-      )
-    : null;
+  // D10 / AC5.8: MCP stdio watches only boards/*/board.yaml (depth 2) and notifies subscribers
+  const watcher = attachMcpResourceWatcher(server, store);
 
   transport.onclose = () => {
     if (watcher) {
