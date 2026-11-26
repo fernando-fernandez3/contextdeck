@@ -482,4 +482,201 @@ test.describe.serial('ContextDeck v0.2 Playwright Smoke & Isolation', () => {
     await downloadPage.close();
     await context.close();
   });
+
+  test('R2-8: light theme maintains >= 4.5 contrast on QuizRunner selected/correct/incorrect options, light Sessions controls, and light Excalidraw canvas', async ({
+    browser,
+  }) => {
+    const screenshotDir = process.env.CONTEXTDECK_SCREENSHOT_DIR?.trim();
+    if (screenshotDir) {
+      await fsp.mkdir(screenshotDir, { recursive: true });
+    }
+
+    const measureContrast = async (page: Page, selector: string, index: number) =>
+      page.evaluate(
+        ({ sel, idx }) => {
+          const toSrgb = (cssColor: string): [number, number, number] => {
+            const canvas = document.createElement('canvas');
+            canvas.width = 1;
+            canvas.height = 1;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) throw new Error('No 2d canvas context');
+            ctx.fillStyle = cssColor;
+            ctx.fillRect(0, 0, 1, 1);
+            const [r, g, b] = ctx.getImageData(0, 0, 1, 1).data;
+            return [r, g, b];
+          };
+          const lum = ([r, g, b]: [number, number, number]): number => {
+            const lin = (v: number) => {
+              const s = v / 255;
+              return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+            };
+            return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+          };
+          const ratio = (c1: string, c2: string): number => {
+            const l1 = lum(toSrgb(c1));
+            const l2 = lum(toSrgb(c2));
+            return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+          };
+          const el = document.querySelectorAll(sel)[idx] as HTMLElement | undefined;
+          if (!el) throw new Error(`Element not found: ${sel}[${idx}]`);
+          const cs = window.getComputedStyle(el);
+          return {
+            color: cs.color,
+            bg: cs.backgroundColor,
+            rgbColor: toSrgb(cs.color),
+            rgbBg: toSrgb(cs.backgroundColor),
+            contrast: ratio(cs.color, cs.backgroundColor),
+          };
+        },
+        { sel: selector, idx: index },
+      );
+
+    // --- Desktop light theme check + screenshots ---
+    const desktopCtx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const desktopPage = await desktopCtx.newPage();
+    const errors: string[] = [];
+    desktopPage.on('console', (msg) => {
+      if (msg.type() === 'error') errors.push(`console.error: ${msg.text()}`);
+    });
+    desktopPage.on('pageerror', (err) => errors.push(`pageerror: ${err.message}`));
+
+    await authenticateViaLaunchUrl(desktopPage);
+    await desktopPage.locator('button[aria-label="Toggle theme"]').click();
+    await expect(desktopPage.locator('html')).toHaveClass(/\blight\b/);
+
+    // 1. Media & Mastery: select quiz, check selected, correct, and incorrect option contrast >= 4.5
+    await waitForLensReady(desktopPage, 'media');
+    await desktopPage.getByRole('button', { name: /Mental Model Check: Realtime Sync Engine v2/ }).click();
+    await expect(desktopPage.locator('[data-question-id="q1"]')).toBeVisible();
+
+    // Select q1[1] (correct), q2[0] (incorrect), q3[1] (correct)
+    await desktopPage.locator('[data-question-id="q1"] button').nth(1).click();
+    await desktopPage.waitForTimeout(250);
+    const selectedMetric = await measureContrast(desktopPage, '[data-question-id="q1"] button', 1);
+    expect(
+      selectedMetric.contrast,
+      `Selected quiz option contrast too low: ${JSON.stringify(selectedMetric)}`,
+    ).toBeGreaterThanOrEqual(4.5);
+
+    await desktopPage.locator('[data-question-id="q2"] button').nth(0).click();
+    await desktopPage.locator('[data-question-id="q3"] button').nth(1).click();
+    await desktopPage.getByRole('button', { name: 'Submit answers' }).click();
+    await expect(desktopPage.locator('main')).toContainText('Score: 2 / 3');
+    await desktopPage.waitForTimeout(250);
+
+    const correctMetric = await measureContrast(desktopPage, '[data-question-id="q1"] button', 1);
+    const incorrectMetric = await measureContrast(desktopPage, '[data-question-id="q2"] button', 0);
+    expect(
+      correctMetric.contrast,
+      `Correct quiz option contrast too low: ${JSON.stringify(correctMetric)}`,
+    ).toBeGreaterThanOrEqual(4.5);
+    expect(
+      incorrectMetric.contrast,
+      `Incorrect quiz option contrast too low: ${JSON.stringify(incorrectMetric)}`,
+    ).toBeGreaterThanOrEqual(4.5);
+
+    if (screenshotDir) {
+      await desktopPage.screenshot({
+        path: path.join(screenshotDir, 'desktop-media-light.png'),
+        fullPage: false,
+      });
+    }
+
+    // 2. Sessions: React Flow controls must use light surface, not hardcoded dark bg-zinc-900
+    await waitForLensReady(desktopPage, 'sessions');
+    await desktopPage.waitForTimeout(250);
+    const controlsBg = await desktopPage.evaluate(() => {
+      const btn = document.querySelector('.react-flow__controls-button') ?? document.querySelector('.react-flow__controls');
+      if (!btn) return null;
+      const bg = window.getComputedStyle(btn).backgroundColor;
+      const m = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+      return m ? { bg, r: Number(m[1]), g: Number(m[2]), b: Number(m[3]) } : { bg, r: 0, g: 0, b: 0 };
+    });
+    expect(controlsBg).not.toBeNull();
+    expect(controlsBg!.r, `Sessions controls stayed dark: ${JSON.stringify(controlsBg)}`).toBeGreaterThan(200);
+    if (screenshotDir) {
+      await desktopPage.screenshot({
+        path: path.join(screenshotDir, 'desktop-sessions-light.png'),
+        fullPage: false,
+      });
+    }
+
+    // 3. Excalidraw canvas: must follow html.light (not dark theme)
+    await waitForLensReady(desktopPage, 'decisions');
+    await desktopPage.getByRole('button', { name: /Mental Model Whiteboard \(Excalidraw\)/ }).click();
+    const excalidrawRoot = desktopPage.locator('.excalidraw').first();
+    await expect(excalidrawRoot).toBeVisible({ timeout: 15_000 });
+    await desktopPage.waitForTimeout(350);
+    const excalidrawTheme = await excalidrawRoot.evaluate((el) => ({
+      isDarkClass: el.classList.contains('theme--dark'),
+      bg: window.getComputedStyle(el).backgroundColor,
+    }));
+    expect(excalidrawTheme.isDarkClass, 'Excalidraw stayed in dark theme').toBe(false);
+    if (screenshotDir) {
+      await desktopPage.screenshot({
+        path: path.join(screenshotDir, 'desktop-excalidraw-light.png'),
+        fullPage: false,
+      });
+    }
+
+    expect(errors).toEqual([]);
+    await desktopCtx.close();
+
+    // --- Phone 390x844 light-theme screenshots & overflow checks ---
+    const phoneCtx = await browser.newContext({ viewport: { width: 390, height: 844 } });
+    const phonePage = await phoneCtx.newPage();
+    const phoneErrors: string[] = [];
+    phonePage.on('console', (msg) => {
+      if (msg.type() === 'error') phoneErrors.push(`console.error: ${msg.text()}`);
+    });
+    phonePage.on('pageerror', (err) => phoneErrors.push(`pageerror: ${err.message}`));
+
+    await authenticateViaLaunchUrl(phonePage);
+    await phonePage.locator('button[aria-label="More actions"]').click();
+    await phonePage.getByRole('button', { name: 'Light theme' }).click();
+    await expect(phonePage.locator('html')).toHaveClass(/\blight\b/);
+
+    // Phone Media & Mastery (quiz answered)
+    await waitForLensReady(phonePage, 'media');
+    await phonePage.getByRole('button', { name: /Mental Model Check: Realtime Sync Engine v2/ }).click();
+    await phonePage.locator('[data-question-id="q1"] button').nth(1).click();
+    await phonePage.locator('[data-question-id="q2"] button').nth(0).click();
+    await phonePage.locator('[data-question-id="q3"] button').nth(1).click();
+    await phonePage.getByRole('button', { name: 'Submit answers' }).click();
+    await expect(phonePage.locator('main')).toContainText('Score: 2 / 3');
+    expect(await phonePage.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+    if (screenshotDir) {
+      await phonePage.screenshot({
+        path: path.join(screenshotDir, 'phone-media-light.png'),
+        fullPage: false,
+      });
+    }
+
+    // Phone Sessions
+    await waitForLensReady(phonePage, 'sessions');
+    await phonePage.waitForTimeout(250);
+    expect(await phonePage.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+    if (screenshotDir) {
+      await phonePage.screenshot({
+        path: path.join(screenshotDir, 'phone-sessions-light.png'),
+        fullPage: false,
+      });
+    }
+
+    // Phone Excalidraw canvas
+    await waitForLensReady(phonePage, 'decisions');
+    await phonePage.getByRole('button', { name: /Mental Model Whiteboard \(Excalidraw\)/ }).click();
+    await expect(phonePage.locator('.excalidraw').first()).toBeVisible({ timeout: 15_000 });
+    await phonePage.waitForTimeout(350);
+    expect(await phonePage.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+    if (screenshotDir) {
+      await phonePage.screenshot({
+        path: path.join(screenshotDir, 'phone-excalidraw-light.png'),
+        fullPage: false,
+      });
+    }
+
+    expect(phoneErrors).toEqual([]);
+    await phoneCtx.close();
+  });
 });

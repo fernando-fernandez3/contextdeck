@@ -100,22 +100,58 @@ html.light .text-zinc-700 {
   color: var(--cd-border-strong);
 }
 html.light .hover\:text-zinc-100:hover,
-html.light .hover\:text-zinc-200:hover {
+html.light .hover\:text-zinc-200:hover,
+html.light .hover\:text-white:hover {
   color: var(--cd-text);
 }
-html.light .text-amber-300 {
+html.light .hover\:text-indigo-300:hover {
+  color: var(--cd-accent-text);
+}
+html.light .hover\:text-rose-400:hover {
+  color: var(--cd-rose-text);
+}
+html.light .text-amber-100,
+html.light .text-amber-200,
+html.light .text-amber-300,
+html.light .text-amber-400 {
   color: var(--cd-amber-text);
 }
-html.light .text-emerald-300 {
+html.light .text-emerald-100,
+html.light .text-emerald-200,
+html.light .text-emerald-300,
+html.light .text-emerald-400 {
   color: var(--cd-emerald-text);
 }
+html.light .text-indigo-100,
+html.light .text-indigo-200,
 html.light .text-indigo-300,
 html.light .text-indigo-400 {
   color: var(--cd-accent-text);
 }
+html.light .text-rose-100,
+html.light .text-rose-200,
 html.light .text-rose-300,
 html.light .text-rose-400 {
   color: var(--cd-rose-text);
+}
+
+/* Theme-aware React Flow controls (R2-8) */
+.cd-flow-controls {
+  background-color: var(--cd-surface);
+  border: 1px solid var(--cd-border-strong);
+  box-shadow: none;
+}
+.cd-flow-controls .react-flow__controls-button {
+  background-color: var(--cd-surface);
+  border-bottom: 1px solid var(--cd-border);
+  color: var(--cd-text);
+  fill: var(--cd-text);
+}
+.cd-flow-controls .react-flow__controls-button:hover {
+  background-color: var(--cd-surface-2);
+}
+.cd-flow-controls .react-flow__controls-button svg {
+  fill: currentColor;
 }
 
 /* Clean Markdown prose styling (C7: subtle 1px neutral borders, no colored rails) */

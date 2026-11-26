@@ -228,8 +228,8 @@ export function SessionsLens({ snapshot, onRefresh }: SessionsLensProps) {
             onNodeClick={(_, node) => setSelectedId(node.id)}
             proOptions={{ hideAttribution: true }}
           >
-            <Background color="#27272a" gap={20} />
-            <Controls className="!bg-zinc-900 !border-zinc-700 !text-zinc-200" />
+            <Background color="var(--cd-border)" gap={20} />
+            <Controls className="cd-flow-controls" />
           </ReactFlow>
         </div>
 
