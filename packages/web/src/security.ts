@@ -9,6 +9,19 @@ export const MERMAID_CONFIG = {
   theme: 'dark' as const,
   securityLevel: 'strict' as const,
   fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
+  // R4-2: Prevent untrusted %%{init: ...}%% directives from injecting raw themeCSS
+  // into document.body during mermaid.render() before sanitizeMermaidSvg runs.
+  secure: [
+    'secure',
+    'securityLevel',
+    'startOnLoad',
+    'maxTextSize',
+    'suppressErrorRendering',
+    'maxEdges',
+    'themeCSS',
+    'fontFamily',
+    'altFontFamily',
+  ],
 };
 
 const SAFE_URI_REGEX = /^(?:https?:\/\/(?![/\\])|mailto:|\/(?![/\\])|#)/i;
@@ -93,6 +106,10 @@ function decodeCssToFixedPoint(cssText: string): string {
   return current;
 }
 
+function isCssNewline(ch: string): boolean {
+  return ch === '\n' || ch === '\r' || ch === '\f';
+}
+
 function dropSegmentsWithBackslash(css: string): string {
   if (!css.includes('\\')) return css;
 
@@ -107,7 +124,7 @@ function dropSegmentsWithBackslash(css: string): string {
     for (let i = 0; i < css.length; i += 1) {
       const ch = css[i];
       if (quote) {
-        if (ch === quote) quote = null;
+        if (ch === quote || isCssNewline(ch)) quote = null;
         continue;
       }
       if (ch === '"' || ch === "'") {
@@ -142,7 +159,7 @@ function dropSegmentsWithBackslash(css: string): string {
   for (let i = 0; i < css.length; i += 1) {
     const ch = css[i];
     if (quote) {
-      if (ch === quote) quote = null;
+      if (ch === quote || isCssNewline(ch)) quote = null;
       continue;
     }
     if (ch === '"' || ch === "'") {
@@ -179,7 +196,7 @@ function stripCssAtImports(css: string): string {
       const ch = current[i];
       if (quote) {
         out += ch;
-        if (ch === quote) quote = null;
+        if (ch === quote || isCssNewline(ch)) quote = null;
         i += 1;
         continue;
       }
@@ -197,7 +214,7 @@ function stripCssAtImports(css: string): string {
         while (i < current.length) {
           const c = current[i];
           if (importQuote) {
-            if (c === importQuote) importQuote = null;
+            if (c === importQuote || isCssNewline(c)) importQuote = null;
             i += 1;
             continue;
           }
@@ -256,119 +273,111 @@ function isSafeCssResourceTarget(rawTarget: string): boolean {
   return SAFE_CSS_FRAGMENT_REGEX.test(target) || SAFE_RASTER_DATA_IMAGE_REGEX.test(target);
 }
 
-function splitTopLevelCommas(input: string): string[] {
-  const parts: string[] = [];
-  let start = 0;
-  let depth = 0;
+const RESOURCE_FN_STICKY_RE =
+  /(url|image-set|-webkit-image-set|src|image|cross-fade|-webkit-cross-fade)\s*\(/iy;
+const FAIL_CLOSED_RESOURCE_FN_RE =
+  /(?<![a-z0-9_-])(url|src|image|image-set|-webkit-image-set|cross-fade|-webkit-cross-fade)\s*\(/gi;
+
+function sanitizeCssResourceFunctions(css: string): string {
+  // R4-2: Track CSS string quotes (terminating on matching quote or unescaped newline per
+  // CSS Syntax Level 3 §4.3.5) so resource function names inside strings never desync the
+  // scanner. Replace image-set/-webkit-image-set/image/cross-fade unconditionally with none.
+  let out = '';
+  let i = 0;
   let quote: '"' | "'" | null = null;
-  for (let i = 0; i < input.length; i += 1) {
-    const ch = input[i];
+
+  while (i < css.length) {
+    const ch = css[i];
     if (quote) {
-      if (ch === quote) quote = null;
+      out += ch;
+      if (ch === quote || isCssNewline(ch)) quote = null;
+      i += 1;
       continue;
     }
     if (ch === '"' || ch === "'") {
       quote = ch;
-    } else if (ch === '(') {
-      depth += 1;
-    } else if (ch === ')' && depth > 0) {
-      depth -= 1;
-    } else if (ch === ',' && depth === 0) {
-      parts.push(input.slice(start, i));
-      start = i + 1;
-    }
-  }
-  parts.push(input.slice(start));
-  return parts;
-}
-
-function isSafeImageSetInner(inner: string): boolean {
-  const candidates = splitTopLevelCommas(inner)
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (candidates.length === 0) return false;
-  for (const cand of candidates) {
-    const urlMatch = cand.match(/^url\(\s*([\s\S]*?)\s*\)(?:\s+.*)?$/i);
-    if (urlMatch) {
-      if (!isSafeCssResourceTarget(urlMatch[1])) return false;
+      out += ch;
+      i += 1;
       continue;
     }
-    const strMatch = cand.match(/^("(?:[^"]*)"|'(?:[^']*)')(?:\s+.*)?$/);
-    if (strMatch) {
-      if (!isSafeCssResourceTarget(strMatch[1])) return false;
-      continue;
-    }
-    return false;
-  }
-  return true;
-}
 
-function sanitizeCssResourceFunctions(css: string): string {
-  const fnRe =
-    /(^|[^a-z0-9_-])(url|image-set|-webkit-image-set|src|image|cross-fade|-webkit-cross-fade)\s*\(/gi;
-  let out = '';
-  let cursor = 0;
+    const atTokenBoundary = i === 0 || !/[a-z0-9_-]/i.test(css[i - 1]);
+    if (atTokenBoundary) {
+      RESOURCE_FN_STICKY_RE.lastIndex = i;
+      const match = RESOURCE_FN_STICKY_RE.exec(css);
+      if (match) {
+        const fnName = match[1].toLowerCase();
+        const argStart = RESOURCE_FN_STICKY_RE.lastIndex;
 
-  while (cursor < css.length) {
-    fnRe.lastIndex = cursor;
-    const match = fnRe.exec(css);
-    if (!match) {
-      out += css.slice(cursor);
-      break;
-    }
+        let depth = 1;
+        let innerQuote: '"' | "'" | null = null;
+        let j = argStart;
+        for (; j < css.length && depth > 0; j += 1) {
+          const c = css[j];
+          if (innerQuote) {
+            if (c === innerQuote || isCssNewline(c)) innerQuote = null;
+            continue;
+          }
+          if (c === '"' || c === "'") {
+            innerQuote = c;
+          } else if (c === '(') {
+            depth += 1;
+          } else if (c === ')') {
+            depth -= 1;
+          }
+        }
 
-    const prefix = match[1];
-    const fnName = match[2].toLowerCase();
-    const fnStart = match.index + prefix.length;
-    const argStart = fnRe.lastIndex;
+        if (depth !== 0) {
+          // Unclosed resource function -> neutralize remainder
+          out += 'none';
+          break;
+        }
 
-    // Scan to matching closing paren while respecting quoted strings and nested parens
-    let depth = 1;
-    let quote: '"' | "'" | null = null;
-    let i = argStart;
-    for (; i < css.length && depth > 0; i += 1) {
-      const ch = css[i];
-      if (quote) {
-        if (ch === quote) quote = null;
+        const inner = css.slice(argStart, j - 1);
+        const safe = (fnName === 'url' || fnName === 'src') && isSafeCssResourceTarget(inner);
+        out += safe ? css.slice(i, j) : 'none';
+        i = j;
         continue;
       }
-      if (ch === '"' || ch === "'") {
-        quote = ch;
-      } else if (ch === '(') {
-        depth += 1;
-      } else if (ch === ')') {
-        depth -= 1;
-      }
     }
 
-    out += css.slice(cursor, fnStart);
-    if (depth !== 0) {
-      // Unclosed resource function -> neutralize to end of declaration/input
-      out += 'none';
-      cursor = css.length;
-      break;
-    }
-
-    const inner = css.slice(argStart, i - 1);
-    const safe =
-      fnName === 'url' || fnName === 'src'
-        ? isSafeCssResourceTarget(inner)
-        : fnName === 'image-set' || fnName === '-webkit-image-set'
-          ? isSafeImageSetInner(inner)
-          : false;
-    out += safe ? css.slice(fnStart, i) : 'none';
-    cursor = i;
+    out += ch;
+    i += 1;
   }
 
   return out;
 }
 
+function hasUnsafeCssResourceToken(css: string): boolean {
+  // R4-2 fail-closed check: scan the entire CSS text (both outside and inside strings)
+  // for any remaining resource-fetching function whose target is not strictly a local
+  // #fragment or raster data:image/ URI. Any image/image-set/cross-fade fails closed.
+  FAIL_CLOSED_RESOURCE_FN_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = FAIL_CLOSED_RESOURCE_FN_RE.exec(css)) !== null) {
+    const fnName = match[1].toLowerCase();
+    if (fnName !== 'url' && fnName !== 'src') {
+      return true;
+    }
+    const argStart = match.index + match[0].length;
+    const closeIdx = css.indexOf(')', argStart);
+    if (closeIdx === -1) {
+      return true;
+    }
+    const inner = css.slice(argStart, closeIdx);
+    if (!isSafeCssResourceTarget(inner)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function sanitizeSvgStyleText(cssText: string): string {
-  // R3-1 / R2-2 / H15 / D5: Strip comments and decode CSS escapes to a fixed point,
-  // fail closed on any remaining backslash, strip all @import rules with a
-  // quote/paren-aware scanner, and neutralize any url()/image-set()/src()/image()/cross-fade()
-  // targeting anything other than a local #fragment or raster data:image/ URI
-  // (including inside custom properties).
+  // R4-2 / R3-1 / R2-2 / H15 / D5: Strip comments and decode CSS escapes to a fixed point,
+  // fail closed on any remaining backslash, strip all @import rules with a quote/paren-aware
+  // scanner, neutralize resource functions with quote tracking (replacing image-set/image/
+  // cross-fade unconditionally), and fail closed by dropping the entire style if any unsafe
+  // resource function token remains anywhere (outside or inside strings).
   const decoded = dropSegmentsWithBackslash(decodeCssToFixedPoint(cssText));
   if (!decoded) return '';
   const withoutImports = stripCssAtImports(decoded);
@@ -379,7 +388,11 @@ function sanitizeSvgStyleText(cssText: string): string {
     if (next === result) break;
     result = next;
   }
-  if (result.includes('\\') || /@import(?![a-z0-9_-])/i.test(result)) {
+  if (
+    result.includes('\\') ||
+    /@import(?![a-z0-9_-])/i.test(result) ||
+    hasUnsafeCssResourceToken(result)
+  ) {
     return '';
   }
   return result;

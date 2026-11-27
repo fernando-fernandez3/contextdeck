@@ -1,9 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import type http from 'node:http';
 import { createRequire } from 'node:module';
-import { defineConfig, type Plugin } from 'vite';
+import { defineConfig, type Connect, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
+import { WEB_UI_CSP } from '../server/src/csp.ts';
 
 const EXCALIDRAW_SELF_HOSTED_FONT_FAMILIES = [
   'Assistant',
@@ -75,8 +77,71 @@ function excalidrawSelfHostedFontsPlugin(): Plugin {
   };
 }
 
+function attachHtmlCspMiddleware(middlewares: Connect.Server): void {
+  middlewares.use((_req, res, next) => {
+    const origWriteHead = res.writeHead.bind(res);
+    const origEnd = res.end.bind(res);
+    const ensureHtmlCsp = () => {
+      if (res.headersSent) return;
+      const ct = String(res.getHeader('content-type') ?? '').toLowerCase();
+      if (ct.startsWith('text/html') && !res.getHeader('content-security-policy')) {
+        res.setHeader('Content-Security-Policy', WEB_UI_CSP);
+      }
+    };
+    res.writeHead = ((
+      statusCode: number,
+      statusMessageOrHeaders?: string | http.OutgoingHttpHeaders | http.OutgoingHttpHeader[],
+      maybeHeaders?: http.OutgoingHttpHeaders | http.OutgoingHttpHeader[],
+    ) => {
+      const headersObj =
+        typeof statusMessageOrHeaders === 'object' && statusMessageOrHeaders !== null
+          ? statusMessageOrHeaders
+          : typeof maybeHeaders === 'object' && maybeHeaders !== null
+            ? maybeHeaders
+            : null;
+      if (headersObj && !Array.isArray(headersObj)) {
+        const ctKey = Object.keys(headersObj).find((k) => k.toLowerCase() === 'content-type');
+        const ct = ctKey ? String(headersObj[ctKey]).toLowerCase() : '';
+        if (ct.startsWith('text/html')) {
+          const hasCsp = Object.keys(headersObj).some(
+            (k) => k.toLowerCase() === 'content-security-policy',
+          );
+          if (!hasCsp && !res.getHeader('content-security-policy')) {
+            res.setHeader('Content-Security-Policy', WEB_UI_CSP);
+          }
+        } else {
+          ensureHtmlCsp();
+        }
+      } else {
+        ensureHtmlCsp();
+      }
+      if (typeof statusMessageOrHeaders === 'string') {
+        return origWriteHead(statusCode, statusMessageOrHeaders, maybeHeaders);
+      }
+      return origWriteHead(statusCode, statusMessageOrHeaders);
+    }) as typeof res.writeHead;
+    res.end = ((...args: Parameters<typeof res.end>) => {
+      ensureHtmlCsp();
+      return origEnd(...args);
+    }) as typeof res.end;
+    next();
+  });
+}
+
+function webUiCspPlugin(): Plugin {
+  return {
+    name: 'contextdeck-web-ui-csp',
+    configureServer(server) {
+      attachHtmlCspMiddleware(server.middlewares);
+    },
+    configurePreviewServer(server) {
+      attachHtmlCspMiddleware(server.middlewares);
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [react(), tailwindcss(), excalidrawSelfHostedFontsPlugin()],
+  plugins: [react(), tailwindcss(), excalidrawSelfHostedFontsPlugin(), webUiCspPlugin()],
   define: {
     'process.env.IS_PREACT': JSON.stringify('false'),
   },

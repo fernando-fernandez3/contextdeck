@@ -57,6 +57,7 @@ import {
 } from '@contextdeck/core';
 import { createContextDeckMcpServer } from './mcp.js';
 import { parseStreamingMultipartUpload } from './multipart.js';
+import { WEB_UI_CSP } from './csp.js';
 import {
   DEFAULT_BOOTSTRAP_TTL_MS,
   JSON_BODY_LIMIT_BYTES,
@@ -65,6 +66,8 @@ import {
   resolveMediaServePolicy,
   timingSafeStringEqual,
 } from './security.js';
+
+export { WEB_UI_CSP };
 
 export interface AppOptions {
   store: ContextDeckStore;
@@ -95,28 +98,6 @@ interface AuthContext {
 type AppVariables = {
   auth?: AuthContext;
 };
-
-// R3-1 / R4-1 defense-in-depth CSP for SPA HTML responses: blocks all remote
-// subresource fetches (img/font/connect/script/style) while permitting inline styles
-// (Mermaid/Excalidraw), inline scripts needed by inherited-CSP srcdoc HTML artifacts,
-// and https: media-src for explicit external video/audio artifacts. Only <video>/<audio>
-// use media-src; the diagram sanitizer already forbids <video>/<audio>/<source> tags
-// and src/poster attributes, so allowing https: media-src does not reopen R3-1.
-export const WEB_UI_CSP = [
-  "default-src 'self'",
-  "script-src 'self' 'unsafe-inline'",
-  "style-src 'self' 'unsafe-inline'",
-  "img-src 'self' data: blob:",
-  "media-src 'self' blob: https:",
-  "font-src 'self' data:",
-  "connect-src 'self'",
-  "worker-src 'self' blob:",
-  "frame-src 'self' blob:",
-  "object-src 'none'",
-  "base-uri 'none'",
-  "frame-ancestors 'none'",
-  "form-action 'self'",
-].join('; ');
 
 const STATIC_MIME_MAP: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',

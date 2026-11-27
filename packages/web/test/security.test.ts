@@ -31,6 +31,7 @@ describe('@contextdeck/web content security (Bug 7, AC2.7, AC2.9, D5)', () => {
   it('exports Mermaid config with strict securityLevel', () => {
     expect(MERMAID_CONFIG.securityLevel).toBe('strict');
     expect(MERMAID_CONFIG.startOnLoad).toBe(false);
+    expect(MERMAID_CONFIG.secure).toContain('themeCSS');
   });
 
   it('sanitizes Mermaid rendered SVG to neutralize script tags, event handlers, and javascript: hrefs while preserving diagram geometry and foreignObject labels (D5)', () => {
@@ -251,6 +252,62 @@ describe('@contextdeck/web content security (Bug 7, AC2.7, AC2.9, D5)', () => {
     expect(safeLinks).toContain('href="#g1"');
     expect(safeLinks).toContain('href="#p1"');
     expect(safeLinks).toContain('href="https://example.com/docs"');
+  });
+
+  it('R4-2: quote-desync image-set does not smuggle url()', () => {
+    const vectors: Array<{ name: string; svg: string }> = [
+      {
+        name: '<style> quote-desync image-set smuggling url()',
+        svg: '<svg xmlns="http://www.w3.org/2000/svg"><style>.a { --x: "image-set("#a" "; } .t { background: url(https://evil.example/desync-style.png); } .c { --y: ")"; }</style><foreignObject width="100" height="100"><div class="t">x</div></foreignObject></svg>',
+      },
+      {
+        name: 'inline style quote-desync image-set smuggling url()',
+        svg: '<svg xmlns="http://www.w3.org/2000/svg"><foreignObject width="100" height="100"><div style=\'--x: "image-set("#a" "; background: url(https://evil.example/desync-inline.png); --y: ")"\'>x</div></foreignObject></svg>',
+      },
+      {
+        name: '@font-face src quote-desync image-set smuggling url()',
+        svg: '<svg xmlns="http://www.w3.org/2000/svg"><style>.a { --x: "image-set("#a" "; } @font-face { font-family: Evil; src: url(https://evil.example/font.woff2); } .c { --y: ")"; }</style></svg>',
+      },
+      {
+        name: 'image-set wildcard tail smuggling trailing CSS rule',
+        svg: '<svg><style>.a { background-image: image-set("#a" ; } .t { background: url(https://evil.example/wildcard-tail.png)); } .b { background-image: -webkit-image-set(url(#a) ; } .u { background: url(https://evil.example/webkit-tail.png)); }</style></svg>',
+      },
+      {
+        name: 'CSS Syntax 3 unescaped newline terminates string before url()',
+        svg: '<svg><style>.a { --x: "unclosed\n; } .t { background: url(https://evil.example/newline-break.png); }</style></svg>',
+      },
+      {
+        name: 'string-only "image-set(" vector fails closed',
+        svg: '<svg><style>.a { --x: "image-set("; } .keep { fill: #fff; }</style><foreignObject><div style=\'--x: "image-set("\'>ok</div></foreignObject></svg>',
+      },
+      {
+        name: 'benign image-set and -webkit-image-set are replaced unconditionally',
+        svg: '<svg><style>.a { background-image: image-set("#a" 1x); } .b { background-image: -webkit-image-set(url(#a) 1x); }</style></svg>',
+      },
+      {
+        name: 'string-smuggled url(https://...) fails closed',
+        svg: '<svg><style>.a { --x: "url(https://evil.example/in-string.png)"; }</style></svg>',
+      },
+    ];
+
+    for (const vec of vectors) {
+      const cleaned = sanitizeMermaidSvg(vec.svg);
+      expect(cleaned.toLowerCase(), `Vector leaked external URL: ${vec.name}`).not.toContain(
+        'evil.example',
+      );
+      expect(cleaned.toLowerCase(), `Vector leaked image-set(: ${vec.name}`).not.toContain(
+        'image-set(',
+      );
+    }
+
+    // Legitimate Mermaid SVG styles with quoted font-family, #fragment url(), and raster data:image/ still survive
+    const legitimate = sanitizeMermaidSvg(
+      '<svg viewBox="0 0 100 50"><defs><linearGradient id="linearGradient-1"><stop offset="0%"/></linearGradient><marker id="arrow"><path d="M0,0 L10,5 L0,10 Z"/></marker></defs><style>.label { font-family: "Inter", sans-serif; } .node rect { fill: url(#linearGradient-1); background: url("data:image/png;base64,iVBORw0KGgo="); }</style><path d="M0,0 L50,50" marker-end="url(#arrow)" style="stroke: #fff; fill: url(#linearGradient-1);"/></svg>',
+    );
+    expect(legitimate).toContain('font-family: "Inter", sans-serif');
+    expect(legitimate).toContain('url(#linearGradient-1)');
+    expect(legitimate).toContain('marker-end="url(#arrow)"');
+    expect(legitimate).toContain('data:image/png;base64,iVBORw0KGgo=');
   });
 
   it('wraps HTML artifact srcDoc with strict no-network CSP meta tag', () => {

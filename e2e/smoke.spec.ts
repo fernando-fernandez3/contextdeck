@@ -704,7 +704,7 @@ test.describe.serial('ContextDeck v0.2 Playwright Smoke & Isolation', () => {
       'Content-Type': 'application/json',
     };
 
-    // Seed an adversarial Mermaid diagram with CSS escape directives via REST API
+    // Seed an adversarial Mermaid diagram with CSS escape + R4-2 quote-desync directives via REST API
     const diagRes = await fetch(`${BASE_URL}/api/boards/realtime-sync-v2/diagrams`, {
       method: 'POST',
       headers: authHeaders,
@@ -712,7 +712,7 @@ test.describe.serial('ContextDeck v0.2 Playwright Smoke & Isolation', () => {
         title: 'R3-1 Adversarial Mermaid',
         kind: 'mermaid',
         content: [
-          '%%{init: {"themeCSS": ".node rect { background: \\\\\\\\75rl(\\"https://evil.example/mmd-themecss\\"); }"}}%%',
+          '%%{init: {"themeCSS": ".node rect { background: \\\\\\\\75rl(\\"https://evil.example/mmd-themecss\\"); } .a { --x: \\"image-set(\\"#a\\" \\"; } .nodeLabel { background: url(https://evil.example/mmd-desync.png); } .c { --y: \\")\\"; }"}}%%',
           'flowchart LR',
           '  A[Alpha] --> B[Beta]',
         ].join('\n'),
@@ -779,6 +779,10 @@ test.describe.serial('ContextDeck v0.2 Playwright Smoke & Isolation', () => {
         '<svg width="100" height="100"><foreignObject width="100" height="100"><table background="https://evil.example/hit-table-bg"><tr><td background="https://evil.example/hit-td-bg">x</td></tr></table></foreignObject></svg>',
         '<svg width="100" height="100"><style>:root { --u: \\\\75rl("https://evil.example/hit-custom-prop"); } .c { background: var(--u); }</style><foreignObject width="100" height="100"><div class="c">x</div></foreignObject></svg>',
         '<svg width="100" height="100"><defs><pattern id="p" href="https://evil.example/hit-pattern"/><linearGradient id="g" xlink:href="https://evil.example/hit-grad"/></defs><rect width="100" height="100" fill="url(#p)"/></svg>',
+        // R4-2 Neon quote-desync vectors (<style>, inline style, @font-face)
+        '<svg xmlns="http://www.w3.org/2000/svg"><style>.a { --x: "image-set("#a" "; } .t { background: url(https://evil.example/desync-style.png); } .c { --y: ")"; }</style><foreignObject width="100" height="100"><div class="t">x</div></foreignObject></svg>',
+        '<svg xmlns="http://www.w3.org/2000/svg"><foreignObject width="100" height="100"><div style=\'--x: "image-set("#a" "; background: url(https://evil.example/desync-inline.png); --y: ")"\'>x</div></foreignObject></svg>',
+        '<svg xmlns="http://www.w3.org/2000/svg"><style>.a { --x: "image-set("#a" "; } @font-face { font-family: Evil; src: url(https://evil.example/desync-font.woff2); } .c { --y: ")"; }</style><foreignObject width="100" height="100"><div style="font-family: Evil">x</div></foreignObject></svg>',
       ];
       sanitizedSvgs = vectors.map((v) => sanitizeMermaidSvg(v));
     } finally {
