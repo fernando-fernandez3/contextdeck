@@ -717,6 +717,45 @@ describe('B3 Hardening Round 3 G1: Server SPA Content-Security-Policy (R3-1)', (
       await close();
     }
   });
+
+  it('R4-1: SPA CSP allows https media but still blocks remote img/font/connect', async () => {
+    const dir = await makeTempDir('cdeck-r4-1-csp-');
+    const webDist = path.join(dir, 'web-dist');
+    await fs.mkdir(webDist, { recursive: true });
+    await fs.writeFile(
+      path.join(webDist, 'index.html'),
+      '<!doctype html><html><body><div id="root"></div></body></html>',
+      'utf8',
+    );
+    const store = new ContextDeckStore(dir);
+    await store.createBoard({ title: 'R4-1 CSP Test', slug: 'main' });
+
+    const { app, close } = createApp({ store, webDistDir: webDist, port: 4313 });
+    try {
+      for (const reqPath of ['/', '/media']) {
+        const res = await app.request(`http://127.0.0.1:4313${reqPath}`);
+        expect(res.status).toBe(200);
+        const csp = res.headers.get('content-security-policy') ?? '';
+        expect(csp, `Missing CSP header on ${reqPath}`).toBeTruthy();
+
+        // media-src allows https: alongside 'self' and blob:, but never http: or *
+        expect(csp).toMatch(/media-src\s+'self'\s+blob:\s+https:(?:;|$)/);
+        expect(csp).not.toMatch(/media-src[^;]*(?:http:|\*)/i);
+
+        // img-src, font-src, connect-src, script-src, style-src remain locked down
+        expect(csp).toMatch(/img-src\s+'self'\s+data:\s+blob:(?:;|$)/);
+        expect(csp).not.toMatch(/img-src[^;]*(?:\*|https?:)/i);
+        expect(csp).toMatch(/font-src\s+'self'\s+data:(?:;|$)/);
+        expect(csp).not.toMatch(/font-src[^;]*(?:\*|https?:)/i);
+        expect(csp).toMatch(/connect-src\s+'self'(?:;|$)/);
+        expect(csp).not.toMatch(/connect-src[^;]*(?:\*|https?:)/i);
+        expect(csp).not.toMatch(/script-src[^;]*(?:\*|https?:)/i);
+        expect(csp).not.toMatch(/style-src[^;]*(?:\*|https?:)/i);
+      }
+    } finally {
+      await close();
+    }
+  });
 });
 
 describe('B3 Hardening Round 3 G2: MCP diagram_upsert kind preservation (R3-2)', () => {

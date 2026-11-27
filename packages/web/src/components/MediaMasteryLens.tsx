@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   CheckCircle2,
+  ExternalLink,
   FileText,
   Film,
   HelpCircle,
@@ -12,7 +13,7 @@ import {
 } from 'lucide-react';
 import type { BoardSnapshot, MediaArtifact, Quiz, RefreshJob } from '../types';
 import { ApiError, api } from '../api';
-import { isSafeHttpUrl, wrapHtmlArtifactSrcDoc } from '../security';
+import { isSafeHttpUrl, isSafeHttpsUrl, wrapHtmlArtifactSrcDoc } from '../security';
 import { computeMasteryTrend, getQuizQuestionStaleness } from '../quiz-helpers';
 import { MarkdownView, StatusBadge } from './Badge';
 import { ConfirmationBadges, StaleArtifactActions } from './ArtifactActions';
@@ -437,6 +438,7 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
   const [docTitle, setDocTitle] = useState('');
   const [docContent, setDocContent] = useState('');
   const [docDecisions, setDocDecisions] = useState('');
+  const [failedVideoKey, setFailedVideoKey] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
@@ -707,18 +709,42 @@ export function MediaMasteryLens({ snapshot, onRefresh }: MediaMasteryLensProps)
 
               {activeMedia.kind === 'video' && (
                 <div className="space-y-3">
-                  {activeMedia.filePath || isSafeHttpUrl(activeMedia.externalUrl) ? (
+                  {activeMedia.filePath ? (
                     <video
-                      key={activeMedia.filePath ?? activeMedia.externalUrl ?? activeMedia.id}
+                      key={activeMedia.filePath}
                       ref={videoRef}
                       controls
                       className="w-full rounded-lg border border-zinc-800 bg-black max-h-[400px]"
-                      src={
-                        activeMedia.filePath
-                          ? `/api/boards/${encodeURIComponent(snapshot.config.slug)}/media/${encodeURIComponent(activeMedia.id)}/file?v=${activeMedia.version ?? 1}`
-                          : activeMedia.externalUrl
-                      }
+                      src={`/api/boards/${encodeURIComponent(snapshot.config.slug)}/media/${encodeURIComponent(activeMedia.id)}/file?v=${activeMedia.version ?? 1}`}
                     />
+                  ) : isSafeHttpsUrl(activeMedia.externalUrl) &&
+                    failedVideoKey !==
+                      `${activeMedia.id}:${activeMedia.version ?? 1}:${activeMedia.externalUrl}` ? (
+                    <video
+                      key={`${activeMedia.id}:${activeMedia.version ?? 1}:${activeMedia.externalUrl}`}
+                      ref={videoRef}
+                      controls
+                      preload="none"
+                      onError={() =>
+                        setFailedVideoKey(
+                          `${activeMedia.id}:${activeMedia.version ?? 1}:${activeMedia.externalUrl}`,
+                        )
+                      }
+                      className="w-full rounded-lg border border-zinc-800 bg-black max-h-[400px]"
+                      src={activeMedia.externalUrl}
+                    />
+                  ) : isSafeHttpUrl(activeMedia.externalUrl) ? (
+                    <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-4 flex items-center justify-center">
+                      <a
+                        href={activeMedia.externalUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-zinc-700 bg-zinc-900 hover:border-indigo-500 text-xs font-medium text-indigo-400 transition"
+                      >
+                        <ExternalLink className="w-3.5 h-3.5" />
+                        Open video in a new tab
+                      </a>
+                    </div>
                   ) : (
                     <div className="rounded-lg border border-dashed border-zinc-700 bg-zinc-950 p-5 text-center text-xs text-zinc-400">
                       No video file attached.

@@ -395,6 +395,16 @@ export function isSafeHttpUrl(url: string | undefined | null): boolean {
   }
 }
 
+export function isSafeHttpsUrl(url: string | undefined | null): boolean {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 export function sanitizeMarkdownHtml(markdown: string): string {
   const rawHtml = marked.parse(markdown || '', { async: false, breaks: true }) as string;
   return DOMPurify.sanitize(rawHtml, {

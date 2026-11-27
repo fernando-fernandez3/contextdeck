@@ -810,4 +810,114 @@ test.describe.serial('ContextDeck v0.2 Playwright Smoke & Isolation', () => {
     expect(csp).not.toMatch(/img-src[^;]*(?:\*|https?:)/i);
     await context.close();
   });
+
+  test('R4-1: external https video plays under WEB_UI_CSP', async ({ browser }) => {
+    // 0.5s 64x36 solid-indigo VP9 MP4 (faststart, 952 bytes) playable by headless Chromium
+    const TINY_VP9_MP4 = Buffer.from(
+      'AAAAHGZ0eXBpc29tAAACAGlzb21pc28ybXA0MQAAAydtb292AAAAbG12aGQAAAAAAAAAAAAAAAAAAAPoAAAB9AABAAABAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAACUXRyYWsAAABcdGtoZAAAAAMAAAAAAAAAAAAAAAEAAAAAAAAB9AAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAQAAAACQAAAAAACRlZHRzAAAAHGVsc3QAAAAAAAAAAQAAAfQAAAAAAAEAAAAAAcltZGlhAAAAIG1kaGQAAAAAAAAAAAAAAAAAACgAAAAUAFXEAAAAAAAtaGRscgAAAAAAAAAAdmlkZQAAAAAAAAAAAAAAAFZpZGVvSGFuZGxlcgAAAAF0bWluZgAAABR2bWhkAAAAAQAAAAAAAAAAAAAAJGRpbmYAAAAcZHJlZgAAAAAAAAABAAAADHVybCAAAAABAAABNHN0YmwAAACoc3RzZAAAAAAAAAABAAAAmHZwMDkAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAQAAkAEgAAABIAAAAAAAAAAEYTGF2YzYwLjMxLjEwMiBsaWJ2cHgtdnA5AAAAAAAAAAAY//8AAAAUdnBjQwEAAAAACoICAgIAAAAAAApmaWVsAQAAAAAQcGFzcAAAAAEAAAABAAAAFGJ0cnQAAAAAAABOIAAABlAAAAAYc3R0cwAAAAAAAAABAAAABQAABAAAAAAUc3RzcwAAAAAAAAABAAAAAQAAABxzdHNjAAAAAAAAAAEAAAABAAAABQAAAAEAAAAoc3RzegAAAAAAAAAAAAAABQAAACkAAAAPAAAADwAAAA8AAAAPAAAAFHN0Y28AAAAAAAAAAQAAA1MAAABidWR0YQAAAFptZXRhAAAAAAAAACFoZGxyAAAAAAAAAABtZGlyYXBwbAAAAAAAAAAAAAAAAC1pbHN0AAAAJal0b28AAAAdZGF0YQAAAAEAAAAATGF2ZjYwLjE2LjEwMAAAAAhmcmVlAAAAbW1kYXSCSYNCAAPwAjYAOCQcGEIAADBgAAATv//20NAAI////+6V6f///atAAIYAQJKcAElAAAMgAABUcIYAQJKcAErAAAMgAABUcIYAQJKcAEnAAAMgAABUcIYAQJKcAEigAAMgAABUcA==',
+      'base64',
+    );
+    const VIDEO_URL = 'https://media.example.test/tutorial.mp4';
+
+    const authHeaders = {
+      Authorization: `Bearer ${bearerToken}`,
+      'Content-Type': 'application/json',
+    };
+    const addRes = await fetch(`${BASE_URL}/api/boards/realtime-sync-v2/media`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({
+        title: 'Remote video repro',
+        kind: 'video',
+        externalUrl: VIDEO_URL,
+      }),
+    });
+    expect(addRes.status).toBe(201);
+
+    const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const page = await context.newPage();
+    const errors: string[] = [];
+    const videoRequests: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') errors.push(`console.error: ${msg.text()}`);
+    });
+    page.on('pageerror', (err) => errors.push(`pageerror: ${err.message}`));
+
+    await page.route(VIDEO_URL, async (route) => {
+      videoRequests.push(route.request().url());
+      const rangeHeader = route.request().headers()['range'];
+      if (rangeHeader) {
+        const match = rangeHeader.match(/bytes=(\d+)-(\d*)/);
+        const start = match ? Number(match[1]) : 0;
+        const end = match && match[2] ? Math.min(Number(match[2]), TINY_VP9_MP4.length - 1) : TINY_VP9_MP4.length - 1;
+        const chunk = TINY_VP9_MP4.subarray(start, end + 1);
+        await route.fulfill({
+          status: 206,
+          contentType: 'video/mp4',
+          headers: {
+            'Accept-Ranges': 'bytes',
+            'Content-Range': `bytes ${start}-${end}/${TINY_VP9_MP4.length}`,
+            'Content-Length': String(chunk.length),
+          },
+          body: chunk,
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: 'video/mp4',
+        headers: {
+          'Accept-Ranges': 'bytes',
+          'Content-Length': String(TINY_VP9_MP4.length),
+        },
+        body: TINY_VP9_MP4,
+      });
+    });
+
+    await authenticateViaLaunchUrl(page);
+    await waitForLensReady(page, 'media');
+    await page.getByRole('button', { name: /Remote video repro/ }).click();
+
+    const videoEl = page.locator(`video[src="${VIDEO_URL}"]`);
+    await expect(videoEl).toBeVisible({ timeout: 10_000 });
+    expect(await videoEl.getAttribute('preload')).toBe('none');
+
+    // Before clicking play: zero requests to the external video URL and zero media-src CSP violations
+    await page.waitForTimeout(300);
+    expect(videoRequests, 'External video fetched before user pressed play').toEqual([]);
+    const violationsBefore = await getCspViolations(page);
+    expect(violationsBefore.filter((v) => v.includes('media-src'))).toEqual([]);
+
+    // Click play on the video element (and ensure playback starts cleanly)
+    await videoEl.click();
+    await videoEl.evaluate(async (el) => {
+      const v = el as HTMLVideoElement;
+      if (v.paused && !v.ended) {
+        await v.play();
+      }
+    });
+
+    await expect
+      .poll(() => videoRequests.length, { timeout: 10_000 })
+      .toBeGreaterThanOrEqual(1);
+    const playbackState = await videoEl.evaluate((el) => {
+      const v = el as HTMLVideoElement;
+      return {
+        errorCode: v.error?.code ?? null,
+        readyState: v.readyState,
+        paused: v.paused,
+        ended: v.ended,
+        currentTime: v.currentTime,
+      };
+    });
+    expect(playbackState.errorCode).toBeNull();
+    expect(playbackState.readyState).toBeGreaterThanOrEqual(2);
+    expect(playbackState.paused === false || playbackState.ended || playbackState.currentTime > 0).toBe(true);
+
+    const violationsAfter = await getCspViolations(page);
+    expect(violationsAfter.filter((v) => v.includes('media-src'))).toEqual([]);
+    expect(violationsAfter).toEqual([]);
+    expect(errors).toEqual([]);
+    await context.close();
+  });
 });
