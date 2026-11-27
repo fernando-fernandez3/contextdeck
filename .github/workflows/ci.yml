@@ -48,7 +48,8 @@ jobs:
 
   playwright:
     name: Playwright E2E
-    runs-on: ubuntu-latest
+    # Playwright 1.58.2 cannot install Chromium deps on ubuntu-latest (26.04); pin the last supported LTS.
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
