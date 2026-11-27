@@ -309,7 +309,8 @@ export function maybeInjectFault(stage: string): void {
 }
 
 const TMP_BASENAME_REGEX = /^\.tmp-[A-Za-z0-9._-]+$/;
-const MEDIA_BLOB_FILENAME_REGEX = /^([A-Za-z0-9][A-Za-z0-9_-]{0,80})(?:\.[a-z0-9]{1,12})?$/;
+const MEDIA_BLOB_FILENAME_REGEX =
+  /^([A-Za-z0-9][A-Za-z0-9_-]{0,80})(?:\.v([1-9]\d*))?(?:\.[a-z0-9]{1,12})?$/;
 
 export function toDeckRelativePath(deckDir: string, targetPath: string): string {
   const canonicalDeck = canonicalizePathSync(path.resolve(deckDir));
@@ -410,6 +411,9 @@ function validateEntitySegments(
     if (id && ENTITY_ID_REGEX.test(id)) return { isMediaBlob: false, boardSlug: slug };
   } else if (subdir === 'quizzes') {
     const id = stripSuffix(file, '.quiz.json');
+    if (id && ENTITY_ID_REGEX.test(id)) return { isMediaBlob: false, boardSlug: slug };
+  } else if (subdir === 'jobs') {
+    const id = stripSuffix(file, '.yaml');
     if (id && ENTITY_ID_REGEX.test(id)) return { isMediaBlob: false, boardSlug: slug };
   } else if (subdir === 'media') {
     const metaId = stripSuffix(file, '.meta.yaml');

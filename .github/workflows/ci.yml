@@ -41,3 +41,39 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+      - name: Pack and install check
+        if: matrix.node-version == 22
+        run: pnpm pack:check
+
+  playwright:
+    name: Playwright E2E
+    # Playwright 1.58.2 cannot install Chromium deps on ubuntu-latest (26.04); pin the last supported LTS.
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium
+        run: pnpm exec playwright install chromium --with-deps
+
+      - name: Build
+        run: pnpm build
+
+      - name: Run Playwright smoke and isolation tests
+        run: pnpm test:e2e

@@ -1,6 +1,15 @@
 {
   "name": "@contextdeck/core",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "license": "MIT",
+  "description": "Core Git-backed board store, schemas, drift/catch-up engine, Context Pack builder, and worker config for ContextDeck.",
+  "keywords": [
+    "contextdeck",
+    "mcp",
+    "ai-agents",
+    "shared-context",
+    "local-first"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -10,8 +19,18 @@
       "import": "./dist/index.js"
     }
   },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepack": "pnpm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:unit": "vitest run --project unit",

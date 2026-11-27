@@ -13,18 +13,22 @@ import {
   neutralizeUntrustedDelimiters,
   resolveWorkspace,
   seedDemoBoard,
+  trustWorkerConfig,
   updateGlobalWorkspacePointerBoard,
   validateBoardSlug,
   type Actor,
   type DecisionStatus,
   type DiagramKind,
   type MediaKind,
+  type RefreshJobArtifactType,
+  type RefreshJobStatus,
   type ResolvedWorkspace,
   type TaskColumn,
   type TaskPriority,
 } from '@contextdeck/core';
 import { runHookCli } from './hooks.js';
 import { HARNESS_TARGETS, setupHarness, type HarnessTarget } from './setup.js';
+import { runWorkerLoop, runWorkerOnce } from './worker.js';
 
 // Fast-path hook execution: avoids Commander error output and lazy-loads server deps,
 // guaranteeing silent exit 0 on unknown harness/event or any runtime failure (C5, D12)
@@ -520,8 +524,12 @@ diagramCmd
   .requiredOption('--file <path>', 'Path to .mmd or .excalidraw file')
   .option('-d, --dir <path>', 'Workspace directory')
   .option('-b, --board <slug>', 'Board slug')
-  .option('--kind <kind>', 'mermaid | excalidraw', 'mermaid')
+  .option('--id <diagramId>', 'Existing diagram ID to update (creates a new version)')
+  .option('--kind <kind>', 'mermaid | excalidraw (preserves existing kind on update, defaults to mermaid on create)')
   .option('--based-on <csv>', 'Comma-separated decision IDs')
+  .option('--job <jobId>', 'Optional claimed refresh job ID fulfilled by this version')
+  .option('--lease <token>', 'Active lease token from job claim (required with --job)')
+  .option('--note <text>', 'Optional version note')
   .option('--session <sessionId>', 'Originating session ID')
   .action(async (title, opts) => {
     const { store } = resolveStore(opts.dir);
@@ -533,13 +541,22 @@ diagramCmd
     const diag = await store.upsertDiagram(
       board,
       {
+        ...(opts.id ? { id: String(opts.id) } : {}),
         title,
-        kind: opts.kind as DiagramKind,
+        ...(opts.kind !== undefined ? { kind: opts.kind as DiagramKind } : {}),
         content,
-        sessionId: opts.session ?? null,
-        basedOnDecisions: opts.basedOn
-          ? String(opts.basedOn).split(',').map((s) => s.trim()).filter(Boolean)
-          : [],
+        ...(opts.session !== undefined ? { sessionId: String(opts.session) } : {}),
+        ...(opts.basedOn !== undefined
+          ? {
+              basedOnDecisions: String(opts.basedOn)
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean),
+            }
+          : {}),
+        ...(opts.job ? { jobId: String(opts.job) } : {}),
+        ...(opts.lease ? { leaseToken: String(opts.lease) } : {}),
+        ...(opts.note ? { note: String(opts.note) } : {}),
       },
       actor,
     );
@@ -547,7 +564,7 @@ diagramCmd
   });
 
 // Media subcommand (CLI keeps arbitrary readable paths for human intent per AC2.5)
-const mediaCmd = program.command('media').description('Attach videos, audio, docs, or custom artifacts');
+const mediaCmd = program.command('media').description('Attach, update, or prune media artifacts');
 mediaCmd
   .command('add <title>')
   .option('-d, --dir <path>', 'Workspace directory')
@@ -592,8 +609,87 @@ mediaCmd
     console.log(JSON.stringify(artifact, null, 2));
   });
 
+mediaCmd
+  .command('update <mediaId>')
+  .description('Publish a new immutable version (<id>.v<N>.<ext>) of an existing media artifact')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-b, --board <slug>', 'Board slug')
+  .option('--title <title>', 'Updated title')
+  .option('--file <path>', 'New local file to copy as next immutable version')
+  .option('--url <url>', 'Updated external URL')
+  .option('--transcript <text>', 'Updated transcript text or path to .txt/.md file')
+  .option('--based-on <csv>', 'Updated comma-separated decision IDs')
+  .option('--tags <csv>', 'Updated comma-separated tags')
+  .option('--job <jobId>', 'Claimed refresh job ID fulfilled by this version')
+  .option('--lease <token>', 'Active lease token from job claim (required with --job)')
+  .option('--note <text>', 'Optional version note')
+  .option('--session <sessionId>', 'Originating session ID')
+  .action(async (mediaId: string, opts) => {
+    const { store } = resolveStore(opts.dir);
+    const board = await resolveTargetBoard(store, opts.board, opts.session);
+    let transcript = opts.transcript as string | undefined;
+    if (transcript && (transcript.endsWith('.txt') || transcript.endsWith('.md'))) {
+      try {
+        transcript = await fs.readFile(path.resolve(transcript), 'utf8');
+      } catch {
+        // treat as literal text
+      }
+    }
+    const actor: Actor = opts.session
+      ? { type: 'agent', sessionId: String(opts.session), label: 'cli' }
+      : { type: 'human', label: 'cli' };
+    const updated = await store.updateMedia(
+      board,
+      mediaId,
+      {
+        ...(opts.title !== undefined ? { title: String(opts.title) } : {}),
+        ...(opts.file ? { sourceFilePath: path.resolve(String(opts.file)) } : {}),
+        ...(opts.url !== undefined ? { externalUrl: String(opts.url) } : {}),
+        ...(transcript !== undefined ? { transcript } : {}),
+        ...(opts.basedOn !== undefined
+          ? {
+              basedOnDecisions: String(opts.basedOn)
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean),
+            }
+          : {}),
+        ...(opts.tags !== undefined
+          ? {
+              tags: String(opts.tags)
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean),
+            }
+          : {}),
+        ...(opts.job ? { jobId: String(opts.job) } : {}),
+        ...(opts.lease ? { leaseToken: String(opts.lease) } : {}),
+        ...(opts.note ? { note: String(opts.note) } : {}),
+      },
+      actor,
+    );
+    console.log(JSON.stringify(updated, null, 2));
+  });
+
+mediaCmd
+  .command('prune')
+  .description('Remove older versioned media files while keeping current and open-job versions')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-b, --board <slug>', 'Board slug')
+  .option('--keep <n>', 'Number of most recent versions to keep per artifact', '1')
+  .option('--dry-run', 'Show files that would be removed without deleting them', false)
+  .action(async (opts) => {
+    const { store } = resolveStore(opts.dir);
+    const keepVersions = parseStrictIntFlag(opts.keep, '--keep', 1);
+    const result = await store.pruneMedia(opts.board, {
+      keepVersions,
+      dryRun: Boolean(opts.dryRun),
+    });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
 // Quiz subcommand
-const quizCmd = program.command('quiz').description('Publish interactive quizzes to the board');
+const quizCmd = program.command('quiz').description('Publish or update interactive quizzes on the board');
 quizCmd
   .command('add')
   .requiredOption('--file <path>', 'Path to a quiz JSON file')
@@ -609,6 +705,225 @@ quizCmd
       : { type: 'human', label: 'cli' };
     const quiz = await store.createQuiz(board, raw, actor);
     console.log(JSON.stringify(quiz, null, 2));
+  });
+
+quizCmd
+  .command('update <quizId>')
+  .description('Update quiz questions/metadata while preserving past human attempts')
+  .requiredOption('--file <path>', 'Path to a quiz JSON file')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-b, --board <slug>', 'Board slug')
+  .option('--job <jobId>', 'Claimed refresh job ID fulfilled by this version')
+  .option('--lease <token>', 'Active lease token from job claim (required with --job)')
+  .option('--note <text>', 'Optional version note')
+  .option('--session <sessionId>', 'Originating session ID')
+  .action(async (quizId: string, opts) => {
+    const { store } = resolveStore(opts.dir);
+    const board = await resolveTargetBoard(store, opts.board, opts.session);
+    const raw = JSON.parse(await fs.readFile(path.resolve(opts.file), 'utf8'));
+    const actor: Actor = opts.session
+      ? { type: 'agent', sessionId: String(opts.session), label: 'cli' }
+      : { type: 'human', label: 'cli' };
+    const quiz = await store.updateQuiz(
+      board,
+      quizId,
+      {
+        ...raw,
+        ...(opts.job ? { jobId: String(opts.job) } : {}),
+        ...(opts.lease ? { leaseToken: String(opts.lease) } : {}),
+        ...(opts.note ? { note: String(opts.note) } : {}),
+      },
+      actor,
+    );
+    console.log(JSON.stringify(quiz, null, 2));
+  });
+
+// Job subcommands (AC7.4, D19)
+const jobCmd = program.command('job').description('Manage artifact refresh jobs');
+
+jobCmd
+  .command('list')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-b, --board <slug>', 'Board slug')
+  .option('--status <status>', 'Filter by status (queued | claimed | done | failed)')
+  .option('--type <artifactType>', 'Filter by artifactType (diagram | media | quiz)')
+  .action(async (opts) => {
+    const { store } = resolveStore(opts.dir);
+    const jobs = await store.listJobs(opts.board, {
+      ...(opts.status ? { status: opts.status as RefreshJobStatus } : {}),
+      ...(opts.type ? { artifactType: opts.type as RefreshJobArtifactType } : {}),
+    });
+    console.log(JSON.stringify(jobs, null, 2));
+  });
+
+jobCmd
+  .command('create <artifactType> <artifactId>')
+  .description('Queue a refresh job for a diagram, media, or quiz artifact')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-b, --board <slug>', 'Board slug')
+  .option('--reason <text>', 'Optional reason for regeneration')
+  .option('--session <sessionId>', 'Originating session ID')
+  .action(async (artifactType: string, artifactId: string, opts) => {
+    const { store } = resolveStore(opts.dir);
+    const board = await resolveTargetBoard(store, opts.board, opts.session);
+    const actor: Actor = opts.session
+      ? { type: 'agent', sessionId: String(opts.session), label: 'cli' }
+      : { type: 'human', label: 'cli' };
+    const res = await store.createRefreshJob(
+      board,
+      {
+        artifactType: artifactType as RefreshJobArtifactType,
+        artifactId,
+        ...(opts.reason ? { reason: String(opts.reason) } : {}),
+      },
+      actor,
+    );
+    console.log(JSON.stringify(res, null, 2));
+  });
+
+jobCmd
+  .command('claim [jobId]')
+  .description('Atomically claim a queued or lease-expired refresh job')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-b, --board <slug>', 'Board slug')
+  .option('--type <artifactType>', 'Filter by artifactType (diagram | media | quiz)')
+  .option('--media-kind <kind>', 'Filter by media kind (video | audio | doc | ...)')
+  .option('--by <label>', 'Claimant label', 'cli')
+  .action(async (jobId: string | undefined, opts) => {
+    const { store } = resolveStore(opts.dir);
+    const claimed = await store.claimJob(
+      opts.board,
+      {
+        ...(jobId ? { jobId } : {}),
+        ...(opts.type ? { artifactType: opts.type as RefreshJobArtifactType } : {}),
+        ...(opts.mediaKind ? { mediaKind: opts.mediaKind as MediaKind } : {}),
+        claimedBy: String(opts.by),
+      },
+      { type: 'agent', label: String(opts.by) },
+    );
+    console.log(JSON.stringify(claimed, null, 2));
+  });
+
+jobCmd
+  .command('renew <jobId>')
+  .requiredOption('--lease <token>', 'Active lease token from claim')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-b, --board <slug>', 'Board slug')
+  .action(async (jobId: string, opts) => {
+    const { store } = resolveStore(opts.dir);
+    const renewed = await store.renewJob(opts.board, jobId, { leaseToken: String(opts.lease) });
+    console.log(JSON.stringify(renewed, null, 2));
+  });
+
+jobCmd
+  .command('release <jobId>')
+  .requiredOption('--lease <token>', 'Active lease token from claim')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-b, --board <slug>', 'Board slug')
+  .option('--reason <text>', 'Optional reason')
+  .action(async (jobId: string, opts) => {
+    const { store } = resolveStore(opts.dir);
+    const released = await store.releaseJob(opts.board, jobId, {
+      leaseToken: String(opts.lease),
+      ...(opts.reason ? { reason: String(opts.reason) } : {}),
+    });
+    console.log(JSON.stringify(released, null, 2));
+  });
+
+jobCmd
+  .command('complete <jobId>')
+  .requiredOption('--lease <token>', 'Active lease token from claim')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-b, --board <slug>', 'Board slug')
+  .option('--artifact-version <n>', 'Artifact version created by this job')
+  .option('--summary <text>', 'Completion summary')
+  .option('--fail <error>', 'Mark the job failed with an error message')
+  .action(async (jobId: string, opts) => {
+    const { store } = resolveStore(opts.dir);
+    const artifactVersion =
+      opts.artifactVersion !== undefined
+        ? parseStrictIntFlag(opts.artifactVersion, '--artifact-version', 1)
+        : undefined;
+    const completed = await store.completeJob(opts.board, jobId, {
+      leaseToken: String(opts.lease),
+      status: opts.fail ? 'failed' : 'done',
+      ...(artifactVersion !== undefined ? { artifactVersion } : {}),
+      ...(opts.summary ? { summary: String(opts.summary) } : {}),
+      ...(opts.fail ? { error: String(opts.fail) } : {}),
+    });
+    console.log(JSON.stringify(completed, null, 2));
+  });
+
+// Local human-started refresh job worker (AC7.5, D18)
+const workerCmd = program
+  .command('worker')
+  .description('Run user-local refresh job handlers from ~/.contextdeck/worker.yaml')
+  .option('-d, --dir <path>', 'Workspace directory')
+  .option('-b, --board <slug>', 'Limit to a single board slug')
+  .option('--once', 'Process at most one available job and exit', false)
+  .option('--interval <seconds>', 'Polling interval in seconds (alias of --poll-ms)')
+  .option('--poll-ms <ms>', 'Polling interval in milliseconds')
+  .option('--name <label>', 'Worker claimant label')
+  .action(async (opts) => {
+    const { store } = resolveStore(opts.dir);
+    if (opts.interval !== undefined && opts.pollMs !== undefined) {
+      throw new ValidationError('Cannot specify both --interval and --poll-ms.');
+    }
+    let pollMs = 3000;
+    if (opts.interval !== undefined) {
+      const trimmed = String(opts.interval).trim();
+      const secs = Number(trimmed);
+      if (!trimmed || !Number.isFinite(secs) || secs < 0.1) {
+        throw new ValidationError('Invalid --interval value: expected a number >= 0.1 seconds.');
+      }
+      pollMs = Math.round(secs * 1000);
+    } else if (opts.pollMs !== undefined) {
+      pollMs = parseStrictIntFlag(opts.pollMs, '--poll-ms', 100);
+    }
+
+    if (opts.once) {
+      const res = await runWorkerOnce(store, {
+        boardSlug: opts.board,
+        workerName: opts.name,
+      });
+      console.log(JSON.stringify(res, null, 2));
+      return;
+    }
+
+    let stopping = false;
+    const stop = () => {
+      stopping = true;
+    };
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+
+    console.log(`ContextDeck worker polling ${store.deckDir} (every ${pollMs}ms)...`);
+    await runWorkerLoop(store, {
+      boardSlug: opts.board,
+      workerName: opts.name,
+      pollMs,
+      shouldStop: () => stopping,
+      onResult: (res) => {
+        console.log(
+          `[worker] ${res.boardSlug}/${res.jobId} -> ${res.status}${res.message ? `: ${res.message}` : ''}`,
+        );
+      },
+      onTransientError: (err) => {
+        console.error(
+          `[worker] transient error (continuing): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      },
+    });
+  });
+
+workerCmd
+  .command('trust')
+  .description('Review and trust the current ~/.contextdeck/worker.yaml handler configuration')
+  .action(async () => {
+    const res = await trustWorkerConfig();
+    console.log(`Trusted worker config: ${res.configPath}`);
+    console.log(`  sha256  : ${res.sha256}`);
+    console.log(`  handlers: ${res.handlers.length > 0 ? res.handlers.join(', ') : '(none)'}`);
   });
 
 // Setup harness adapters

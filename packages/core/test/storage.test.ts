@@ -278,7 +278,7 @@ describe('E1 safe concurrent storage engine', () => {
     expect(afterSnap.brief).toBe(beforeSnap.brief);
   }, FSYNC_TEST_TIMEOUT_MS);
 
-  it('runs applyContextUpdate and refreshArtifactDecisions without re-entrant lock deadlock', async () => {
+  it('runs applyContextUpdate and confirmArtifact without re-entrant lock deadlock', async () => {
     const dir = await makeTempDir();
     const store = new core.ContextDeckStore(dir);
     await store.createBoard({ title: 'Main', slug: 'main' });
@@ -303,9 +303,9 @@ describe('E1 safe concurrent storage engine', () => {
     expect(res.appliedCount).toBe(4);
     expect(res.snapshot.drift.staleArtifacts).toHaveLength(1);
 
-    await store.refreshArtifactDecisions('main', 'diagram', diag.id);
-    const refreshed = await store.getSnapshot('main');
-    expect(refreshed.drift.staleArtifacts).toHaveLength(0);
+    await store.confirmArtifact('main', 'diagram', diag.id, { note: 'Still holds' });
+    const confirmed = await store.getSnapshot('main');
+    expect(confirmed.drift.staleArtifacts).toHaveLength(0);
   }, FSYNC_TEST_TIMEOUT_MS);
 
   it('H1: rejects txn.json containing arbitrary absolute paths and leaves outside files + txn.json intact', async () => {
@@ -899,14 +899,14 @@ describe('E1 safe concurrent storage engine', () => {
     ).rejects.toMatchObject({ code: 'CORRUPT_DATA' });
 
     await expect(
-      store.refreshArtifactDecisions('main', 'quiz', 'quiz_bad'),
+      store.confirmArtifact('main', 'quiz', 'quiz_bad', { note: 'check' }),
     ).rejects.toBeInstanceOf(core.CorruptDataError);
     await expect(
-      store.refreshArtifactDecisions('main', 'quiz', 'quiz_bad'),
+      store.confirmArtifact('main', 'quiz', 'quiz_bad', { note: 'check' }),
     ).rejects.toMatchObject({ code: 'CORRUPT_DATA' });
 
     await expect(
-      store.refreshArtifactDecisions('main', 'quiz', 'quiz_bad_schema'),
+      store.confirmArtifact('main', 'quiz', 'quiz_bad_schema', { note: 'check' }),
     ).rejects.toBeInstanceOf(core.CorruptDataError);
 
     // Deleting a corrupt task file must succeed and log task.deleted with entityId only

@@ -76,10 +76,16 @@ describe('@contextdeck/core', () => {
     expect(driftedS1).toBeDefined();
     expect(driftedS1!.behindBy).toBeGreaterThan(0);
 
-    // Refreshing diagram aligns it to d2 and clears staleness
-    await store.refreshArtifactDecisions('auth-redesign', 'diagram', diag.id);
-    const afterRefresh = await store.getSnapshot('auth-redesign');
-    expect(afterRefresh.drift.staleArtifacts).toHaveLength(0);
+    // Confirming diagram clears staleness without rewriting basedOnDecisions
+    await store.confirmArtifact(
+      'auth-redesign',
+      'diagram',
+      diag.id,
+      { note: 'Diagram still reflects high-level architecture' },
+      { type: 'human', label: 'reviewer' },
+    );
+    const afterConfirm = await store.getSnapshot('auth-redesign');
+    expect(afterConfirm.drift.staleArtifacts).toHaveLength(0);
 
     // Syncing session clears drift for s1
     const syncResult = await store.syncSession('auth-redesign', s1.id);

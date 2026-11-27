@@ -1011,7 +1011,7 @@ export async function setupHarness(
     notes.push(
       uninstall
         ? 'Removed ContextDeck MCP block from .codex/config.toml and lifecycle hooks from .codex/hooks.json.'
-        : 'Configured project-scope Codex MCP in .codex/config.toml and SessionStart/UserPromptSubmit/SessionEnd hooks in .codex/hooks.json (hooks are enabled by default in Codex).',
+        : 'Configured project-scope Codex MCP in .codex/config.toml and SessionStart/UserPromptSubmit/SessionEnd hooks in .codex/hooks.json. Next step: open `codex` in this project and run `/hooks` to trust the 3 ContextDeck hooks; until then Codex skips them.',
     );
   } else if (target === 'cursor') {
     const mcpPath = path.join(rootDir, '.cursor', 'mcp.json');

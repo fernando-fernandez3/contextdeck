@@ -403,6 +403,11 @@ describe('AC5.5-AC5.7 + C3/C4 + D13 cdeck setup and --uninstall', () => {
     const agyRes = await runCli(['setup', 'antigravity', '--dir', repo], repo);
     expect(agyRes.code).toBe(0);
     expect(agyRes.stdout).toContain('agy mcp add contextdeck cdeck mcp');
+
+    // Addendum #11: Codex setup prints /hooks trust instruction without touching user ~/.codex/config.toml
+    const codexRes = await runCli(['setup', 'codex', '--dir', repo], repo);
+    expect(codexRes.code).toBe(0);
+    expect(codexRes.stdout).toMatch(/run `\/hooks` to trust/i);
   });
 
   it('H15: setup preserves extra user fields on a compatible contextdeck MCP entry and uninstall leaves the pre-existing entry intact', async () => {

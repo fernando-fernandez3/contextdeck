@@ -1,4 +1,5 @@
 import type {
+  ArtifactConfirmation,
   BoardConfig,
   BoardEvent,
   Decision,
@@ -103,14 +104,18 @@ export const SESSION_INACTIVE_CUTOFF_MS = 7 * 24 * 60 * 60 * 1000; // 7 days (D4
 const MAX_SUMMARY_CHARS = 240;
 
 /**
- * AC3.2: Housekeeping event kinds never count toward session drift.
+ * AC3.2 / D19: Housekeeping event kinds never count toward session drift.
+ * `job.created`, `job.completed`, `job.failed` remain meaningful so Neon 15 digest
+ * surfaces queued jobs only when `job.created` occurred in the missed window.
  */
 export function isHousekeepingEvent(kind: string): boolean {
   return (
     kind.startsWith('session.') ||
     kind === 'quiz.attempted' ||
     kind.startsWith('reader.') ||
-    kind === 'job.claimed'
+    kind === 'job.claimed' ||
+    kind === 'job.renewed' ||
+    kind === 'job.released'
   );
 }
 
@@ -258,6 +263,166 @@ export function resolveLatestDecision(
   return current;
 }
 
+export function evaluateDecisionStaleness(
+  decisionIds: string[],
+  decisionMap: Map<string, Decision>,
+  confirmations?: Record<string, ArtifactConfirmation>,
+): { staleIds: string[]; reasons: string[]; expectedAgainst: Record<string, string> } {
+  const staleIds: string[] = [];
+  const reasons: string[] = [];
+  const expectedAgainst: Record<string, string> = {};
+  const seen = new Set<string>();
+  for (const decId of decisionIds) {
+    if (seen.has(decId)) continue;
+    seen.add(decId);
+    const dec = decisionMap.get(decId);
+    if (!dec) continue;
+    if (dec.status === 'superseded') {
+      const latest = resolveLatestDecision(dec.id, decisionMap);
+      const conf = confirmations?.[dec.id];
+      // D17: Drift clears ONLY while the latest replacement equals againstDecisionId (auto re-stale on next supersede)
+      if (conf && latest && latest.id !== dec.id && conf.againstDecisionId === latest.id) {
+        continue;
+      }
+      staleIds.push(dec.id);
+      expectedAgainst[dec.id] = latest?.id ?? dec.id;
+      if (latest && latest.id !== dec.id) {
+        reasons.push(`${dec.id} ("${dec.title}") was superseded by ${latest.id} ("${latest.title}")`);
+      } else {
+        reasons.push(`${dec.id} ("${dec.title}") was superseded`);
+      }
+    } else if (dec.status === 'deprecated') {
+      const conf = confirmations?.[dec.id];
+      if (conf && conf.againstDecisionId === dec.id) {
+        continue;
+      }
+      staleIds.push(dec.id);
+      expectedAgainst[dec.id] = dec.id;
+      reasons.push(`${dec.id} ("${dec.title}") was deprecated`);
+    }
+  }
+  return { staleIds, reasons, expectedAgainst };
+}
+
+/**
+ * Compute stale artifacts only (without evaluating per-session drift over full events).
+ * Used by both `computeDriftReport` and lightweight `getCatchUp` (H13).
+ */
+export function computeStaleArtifacts(params: {
+  decisions: Decision[];
+  tasks: Task[];
+  diagrams: Diagram[];
+  media: MediaArtifact[];
+  quizzes: Quiz[];
+  includeTasks?: boolean;
+}): StaleArtifactNotice[] {
+  const { decisions, tasks, diagrams, media, quizzes, includeTasks = true } = params;
+  const decisionMap = new Map(decisions.map((d) => [d.id, d]));
+  const staleArtifacts: StaleArtifactNotice[] = [];
+
+  for (const diag of diagrams) {
+    const { staleIds, reasons, expectedAgainst } = evaluateDecisionStaleness(
+      diag.basedOnDecisions,
+      decisionMap,
+      diag.confirmations,
+    );
+    if (staleIds.length > 0) {
+      staleArtifacts.push({
+        artifactType: 'diagram',
+        artifactId: diag.id,
+        title: diag.title,
+        staleDecisionIds: staleIds,
+        reasons,
+        artifactVersion: diag.version,
+        expectedAgainst,
+      });
+    }
+  }
+
+  for (const item of media) {
+    const { staleIds, reasons, expectedAgainst } = evaluateDecisionStaleness(
+      item.basedOnDecisions,
+      decisionMap,
+      item.confirmations,
+    );
+    if (staleIds.length > 0) {
+      staleArtifacts.push({
+        artifactType: 'media',
+        artifactId: item.id,
+        title: item.title,
+        staleDecisionIds: staleIds,
+        reasons,
+        artifactVersion: item.version,
+        expectedAgainst,
+      });
+    }
+  }
+
+  for (const quiz of quizzes) {
+    const quizDecisionIds = [
+      ...quiz.basedOnDecisions,
+      ...quiz.questions.flatMap((q) => q.relatedDecisionIds ?? []),
+    ];
+    const { staleIds, reasons, expectedAgainst } = evaluateDecisionStaleness(
+      quizDecisionIds,
+      decisionMap,
+      quiz.confirmations,
+    );
+    if (staleIds.length > 0) {
+      staleArtifacts.push({
+        artifactType: 'quiz',
+        artifactId: quiz.id,
+        title: quiz.title,
+        staleDecisionIds: staleIds,
+        reasons,
+        artifactVersion: quiz.version,
+        expectedAgainst,
+      });
+    }
+  }
+
+  if (includeTasks) {
+    for (const task of tasks) {
+      if (task.column === 'done') continue;
+      const { staleIds, reasons } = evaluateDecisionStaleness(task.linkedDecisionIds, decisionMap);
+      if (staleIds.length > 0) {
+        staleArtifacts.push({
+          artifactType: 'task',
+          artifactId: task.id,
+          title: task.title,
+          staleDecisionIds: staleIds,
+          reasons,
+        });
+      }
+    }
+  }
+
+  return staleArtifacts;
+}
+
+/**
+ * AC7.7 / Neon 18: Evaluate per-question staleness on a quiz using `question.relatedDecisionIds`,
+ * respecting any active `quiz.confirmations`.
+ */
+export function evaluateQuizQuestionStaleness(
+  quiz: Pick<Quiz, 'questions' | 'confirmations'>,
+  decisions: Decision[],
+): Record<string, { staleDecisionIds: string[]; reasons: string[] }> {
+  const decisionMap = new Map(decisions.map((d) => [d.id, d]));
+  const result: Record<string, { staleDecisionIds: string[]; reasons: string[] }> = {};
+  for (const q of quiz.questions) {
+    const { staleIds, reasons } = evaluateDecisionStaleness(
+      q.relatedDecisionIds ?? [],
+      decisionMap,
+      quiz.confirmations,
+    );
+    if (staleIds.length > 0) {
+      result[q.id] = { staleDecisionIds: staleIds, reasons };
+    }
+  }
+  return result;
+}
+
 export function computeDriftReport(params: {
   config: BoardConfig;
   sessions: Session[];
@@ -282,84 +447,14 @@ export function computeDriftReport(params: {
     now = new Date(),
     maxDigestLines = DEFAULT_MAX_DIGEST_LINES,
   } = params;
-  const decisionMap = new Map(decisions.map((d) => [d.id, d]));
-
-  const evaluateDecisions = (decisionIds: string[]): { staleIds: string[]; reasons: string[] } => {
-    const staleIds: string[] = [];
-    const reasons: string[] = [];
-    for (const decId of decisionIds) {
-      const dec = decisionMap.get(decId);
-      if (!dec) continue;
-      if (dec.status === 'superseded') {
-        staleIds.push(dec.id);
-        const latest = resolveLatestDecision(dec.id, decisionMap);
-        if (latest && latest.id !== dec.id) {
-          reasons.push(`${dec.id} ("${dec.title}") was superseded by ${latest.id} ("${latest.title}")`);
-        } else {
-          reasons.push(`${dec.id} ("${dec.title}") was superseded`);
-        }
-      } else if (dec.status === 'deprecated') {
-        staleIds.push(dec.id);
-        reasons.push(`${dec.id} ("${dec.title}") was deprecated`);
-      }
-    }
-    return { staleIds, reasons };
-  };
-
-  const staleArtifacts: StaleArtifactNotice[] = [];
-
-  for (const diag of diagrams) {
-    const { staleIds, reasons } = evaluateDecisions(diag.basedOnDecisions);
-    if (staleIds.length > 0) {
-      staleArtifacts.push({
-        artifactType: 'diagram',
-        artifactId: diag.id,
-        title: diag.title,
-        staleDecisionIds: staleIds,
-        reasons,
-      });
-    }
-  }
-
-  for (const item of media) {
-    const { staleIds, reasons } = evaluateDecisions(item.basedOnDecisions);
-    if (staleIds.length > 0) {
-      staleArtifacts.push({
-        artifactType: 'media',
-        artifactId: item.id,
-        title: item.title,
-        staleDecisionIds: staleIds,
-        reasons,
-      });
-    }
-  }
-
-  for (const quiz of quizzes) {
-    const { staleIds, reasons } = evaluateDecisions(quiz.basedOnDecisions);
-    if (staleIds.length > 0) {
-      staleArtifacts.push({
-        artifactType: 'quiz',
-        artifactId: quiz.id,
-        title: quiz.title,
-        staleDecisionIds: staleIds,
-        reasons,
-      });
-    }
-  }
-
-  for (const task of tasks) {
-    if (task.column === 'done') continue;
-    const { staleIds, reasons } = evaluateDecisions(task.linkedDecisionIds);
-    if (staleIds.length > 0) {
-      staleArtifacts.push({
-        artifactType: 'task',
-        artifactId: task.id,
-        title: task.title,
-        staleDecisionIds: staleIds,
-        reasons,
-      });
-    }
-  }
+  const staleArtifacts = computeStaleArtifacts({
+    decisions,
+    tasks,
+    diagrams,
+    media,
+    quizzes,
+    includeTasks: true,
+  });
 
   const driftedSessions: DriftedSessionNotice[] = [];
   for (const session of sessions) {

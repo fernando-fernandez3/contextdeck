@@ -1,12 +1,15 @@
 import type {
   BoardConfig,
   BoardSnapshot,
+  CatchUpReport,
   Decision,
   Diagram,
   MediaArtifact,
   MediaKind,
   Quiz,
   QuizAttempt,
+  RefreshJob,
+  RefreshJobArtifactType,
   Session,
   Task,
 } from './types';
@@ -125,6 +128,22 @@ export const api = {
     }),
 
   getBoard: (slug: string) => req<BoardSnapshot>(`/api/boards/${encodeURIComponent(slug)}`),
+
+  getCatchUp: (slug: string) =>
+    req<CatchUpReport>(`/api/boards/${encodeURIComponent(slug)}/catchup`),
+
+  ackCatchUp: (slug: string, revision: number, reviewedAt?: string) =>
+    req<{ cursor: { lastReviewedRevision: number; lastReviewedAt: string }; catchUp: CatchUpReport }>(
+      `/api/boards/${encodeURIComponent(slug)}/reader/ack`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          revision,
+          ...(reviewedAt ? { reviewedAt } : {}),
+        }),
+      },
+    ),
 
   getContextPack: (slug: string, includeProtocol = true) =>
     req<{ slug: string; revision: number; markdown: string }>(
@@ -270,23 +289,60 @@ export const api = {
     quizId: string,
     answers: Record<string, number | string | boolean>,
     confidence?: number,
+    quizVersion?: number,
   ) =>
     req<{ quiz: Quiz; attempt: QuizAttempt }>(
       `/api/boards/${encodeURIComponent(slug)}/quizzes/${encodeURIComponent(quizId)}/attempts`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ answers, confidence }),
+        body: JSON.stringify({
+          answers,
+          confidence,
+          ...(quizVersion !== undefined ? { quizVersion } : {}),
+        }),
       },
     ),
 
-  refreshArtifact: (
+  confirmArtifact: (
     slug: string,
-    type: 'diagram' | 'media' | 'quiz' | 'task',
+    type: RefreshJobArtifactType,
     id: string,
+    payload: {
+      artifactVersion: number;
+      expectedAgainst: Record<string, string>;
+      note?: string;
+    },
   ) =>
-    req<{ refreshed: boolean }>(
-      `/api/boards/${encodeURIComponent(slug)}/artifacts/${type}/${encodeURIComponent(id)}/refresh`,
-      { method: 'POST' },
+    req<Diagram | MediaArtifact | Quiz>(
+      `/api/boards/${encodeURIComponent(slug)}/artifacts/${type}/${encodeURIComponent(id)}/confirm`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          artifactVersion: payload.artifactVersion,
+          expectedAgainst: payload.expectedAgainst,
+          ...(payload.note ? { note: payload.note } : {}),
+        }),
+      },
+    ),
+
+  createRefreshJob: (
+    slug: string,
+    artifactType: RefreshJobArtifactType,
+    artifactId: string,
+    reason?: string,
+  ) =>
+    req<{ job: RefreshJob; deduplicated: boolean }>(
+      `/api/boards/${encodeURIComponent(slug)}/jobs`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          artifactType,
+          artifactId,
+          ...(reason ? { reason } : {}),
+        }),
+      },
     ),
 };

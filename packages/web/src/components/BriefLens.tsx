@@ -1,17 +1,9 @@
-import { useState } from 'react';
-import {
-  AlertTriangle,
-  CheckCircle2,
-  Clock,
-  Edit3,
-  RefreshCw,
-  Save,
-  Sparkles,
-  X,
-} from 'lucide-react';
-import type { BoardSnapshot } from '../types';
+import { useMemo, useState } from 'react';
+import { Clock, Edit3, Save, X } from 'lucide-react';
+import type { BoardSnapshot, RefreshJob } from '../types';
 import { ApiError, api } from '../api';
 import { HarnessBadge, MarkdownView, StatusBadge } from './Badge';
+import { StaleArtifactActions } from './ArtifactActions';
 
 interface BriefLensProps {
   snapshot: BoardSnapshot;
@@ -26,6 +18,16 @@ export function BriefLens({ snapshot, onRefresh, onNavigateLens }: BriefLensProp
   const [conflictMsg, setConflictMsg] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
+  const openJobsByArtifact = useMemo(() => {
+    const map = new Map<string, RefreshJob>();
+    for (const job of snapshot.jobs ?? []) {
+      if (job.status === 'queued' || job.status === 'claimed') {
+        map.set(`${job.artifactType}:${job.artifactId}`, job);
+      }
+    }
+    return map;
+  }, [snapshot.jobs]);
+
   const handleSave = async () => {
     setSaving(true);
     setConflictMsg(null);
@@ -36,7 +38,7 @@ export function BriefLens({ snapshot, onRefresh, onNavigateLens }: BriefLensProp
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) {
         setConflictMsg(
-          `Brief was updated concurrently (latest revision: ${String(err.data?.currentRevision ?? 'newer')}). Reload latest brief to merge your edits.`,
+          `Brief updated concurrently (latest rev ${String(err.data?.currentRevision ?? 'newer')}).`,
         );
       } else {
         setConflictMsg(err instanceof Error ? err.message : String(err));
@@ -46,14 +48,6 @@ export function BriefLens({ snapshot, onRefresh, onNavigateLens }: BriefLensProp
     }
   };
 
-  const handleMarkAligned = async (
-    type: 'diagram' | 'media' | 'quiz' | 'task',
-    id: string,
-  ) => {
-    await api.refreshArtifact(snapshot.config.slug, type, id);
-    onRefresh();
-  };
-
   const handleSyncSession = async (sessionId: string) => {
     await api.syncSession(snapshot.config.slug, sessionId, snapshot.config.revision);
     onRefresh();
@@ -61,23 +55,23 @@ export function BriefLens({ snapshot, onRefresh, onNavigateLens }: BriefLensProp
 
   const activeDecisions = snapshot.decisions.filter((d) => d.status === 'accepted');
   const openTasks = snapshot.tasks.filter((t) => t.column !== 'done');
+  const staleRefreshables = snapshot.drift.staleArtifacts.filter((s) => s.artifactType !== 'task');
   const recentEvents = [...snapshot.events].reverse().slice(0, 12);
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-      {/* Left 8 cols: Living Brief + Active Decisions */}
-      <div className="lg:col-span-8 space-y-6">
-        {/* KPI strip */}
+      <div className="lg:col-span-8 min-w-0 space-y-6">
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           <button
+            type="button"
             onClick={() => onNavigateLens('sessions')}
-            className="text-left rounded-xl border border-zinc-800/90 bg-zinc-900/60 hover:border-zinc-700 p-3.5 transition"
+            className="text-left rounded-lg border border-zinc-800 bg-zinc-900 hover:border-zinc-700 p-3.5 transition"
           >
             <div className="text-[11px] uppercase tracking-wider text-zinc-400">Sessions</div>
             <div className="mt-1 flex items-baseline gap-2">
               <span className="text-2xl font-bold text-zinc-100">{snapshot.sessions.length}</span>
               {snapshot.drift.driftedSessions.length > 0 && (
-                <span className="text-xs text-amber-400">
+                <span className="text-xs text-amber-300">
                   {snapshot.drift.driftedSessions.length} behind
                 </span>
               )}
@@ -85,19 +79,21 @@ export function BriefLens({ snapshot, onRefresh, onNavigateLens }: BriefLensProp
           </button>
 
           <button
+            type="button"
             onClick={() => onNavigateLens('decisions')}
-            className="text-left rounded-xl border border-zinc-800/90 bg-zinc-900/60 hover:border-zinc-700 p-3.5 transition"
+            className="text-left rounded-lg border border-zinc-800 bg-zinc-900 hover:border-zinc-700 p-3.5 transition"
           >
-            <div className="text-[11px] uppercase tracking-wider text-zinc-400">Active Decisions</div>
+            <div className="text-[11px] uppercase tracking-wider text-zinc-400">Decisions</div>
             <div className="mt-1 flex items-baseline gap-2">
               <span className="text-2xl font-bold text-zinc-100">{activeDecisions.length}</span>
-              <span className="text-xs text-zinc-500">/ {snapshot.decisions.length} total</span>
+              <span className="text-xs text-zinc-500">/ {snapshot.decisions.length}</span>
             </div>
           </button>
 
           <button
+            type="button"
             onClick={() => onNavigateLens('tasks')}
-            className="text-left rounded-xl border border-zinc-800/90 bg-zinc-900/60 hover:border-zinc-700 p-3.5 transition"
+            className="text-left rounded-lg border border-zinc-800 bg-zinc-900 hover:border-zinc-700 p-3.5 transition"
           >
             <div className="text-[11px] uppercase tracking-wider text-zinc-400">Open Tasks</div>
             <div className="mt-1 flex items-baseline gap-2">
@@ -109,35 +105,27 @@ export function BriefLens({ snapshot, onRefresh, onNavigateLens }: BriefLensProp
           </button>
 
           <button
+            type="button"
             onClick={() => onNavigateLens('media')}
-            className="text-left rounded-xl border border-zinc-800/90 bg-zinc-900/60 hover:border-zinc-700 p-3.5 transition"
+            className="text-left rounded-lg border border-zinc-800 bg-zinc-900 hover:border-zinc-700 p-3.5 transition"
           >
-            <div className="text-[11px] uppercase tracking-wider text-zinc-400">Stale Artifacts</div>
+            <div className="text-[11px] uppercase tracking-wider text-zinc-400">Stale</div>
             <div className="mt-1 flex items-baseline gap-2">
-              <span
-                className={`text-2xl font-bold ${
-                  snapshot.drift.staleArtifacts.length > 0 ? 'text-amber-400' : 'text-emerald-400'
-                }`}
-              >
-                {snapshot.drift.staleArtifacts.length}
-              </span>
+              <span className="text-2xl font-bold text-zinc-100">{staleRefreshables.length}</span>
               <span className="text-xs text-zinc-500">
-                {snapshot.drift.staleArtifacts.length > 0 ? 'need review' : 'all fresh'}
+                {staleRefreshables.length > 0 ? 'out of date' : 'current'}
               </span>
             </div>
           </button>
         </div>
 
-        {/* Living Brief card */}
-        <section className="rounded-xl border border-zinc-800 bg-zinc-900/50 overflow-hidden">
-          <div className="flex items-center justify-between px-5 py-3 border-b border-zinc-800 bg-zinc-900/80">
-            <div className="flex items-center gap-2">
-              <Sparkles className="w-4 h-4 text-indigo-400" />
-              <h2 className="text-sm font-semibold text-zinc-100">Living Mental Model (brief.md)</h2>
-            </div>
+        <section className="rounded-lg border border-zinc-800 bg-zinc-900 overflow-hidden">
+          <div className="flex items-center justify-between px-4 sm:px-5 py-3 border-b border-zinc-800">
+            <h2 className="text-sm font-semibold text-zinc-100">Brief</h2>
             {editing ? (
               <div className="flex items-center gap-2">
                 <button
+                  type="button"
                   onClick={() => {
                     setDraft(snapshot.brief);
                     setEditing(false);
@@ -147,8 +135,9 @@ export function BriefLens({ snapshot, onRefresh, onNavigateLens }: BriefLensProp
                   <X className="w-3.5 h-3.5" /> Cancel
                 </button>
                 <button
+                  type="button"
                   disabled={saving}
-                  onClick={handleSave}
+                  onClick={() => void handleSave()}
                   className="inline-flex items-center gap-1 px-3 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-xs font-medium text-white"
                 >
                   <Save className="w-3.5 h-3.5" /> {saving ? 'Saving...' : 'Save'}
@@ -156,6 +145,7 @@ export function BriefLens({ snapshot, onRefresh, onNavigateLens }: BriefLensProp
               </div>
             ) : (
               <button
+                type="button"
                 onClick={() => {
                   setDraft(snapshot.brief);
                   setEditBaseRevision(snapshot.config.revision);
@@ -164,24 +154,25 @@ export function BriefLens({ snapshot, onRefresh, onNavigateLens }: BriefLensProp
                 }}
                 className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs text-zinc-300 hover:text-white hover:bg-zinc-800 transition"
               >
-                <Edit3 className="w-3.5 h-3.5" /> Edit Brief
+                <Edit3 className="w-3.5 h-3.5" /> Edit
               </button>
             )}
           </div>
-          <div className="p-5">
+          <div className="p-4 sm:p-5">
             {conflictMsg && (
-              <div className="mb-3 rounded-lg border border-amber-500/40 bg-amber-950/30 px-3 py-2 flex items-center justify-between gap-2 text-xs text-amber-200">
+              <div className="mb-3 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 flex items-center justify-between gap-2 text-xs text-amber-300">
                 <span>{conflictMsg}</span>
                 <button
+                  type="button"
                   onClick={() => {
                     setDraft(snapshot.brief);
                     setEditBaseRevision(snapshot.config.revision);
                     setConflictMsg(null);
                     onRefresh();
                   }}
-                  className="shrink-0 px-2 py-1 rounded border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 text-[11px]"
+                  className="shrink-0 px-2 py-1 rounded border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-[11px] text-zinc-200"
                 >
-                  Reload Latest
+                  Reload
                 </button>
               </div>
             )}
@@ -197,26 +188,26 @@ export function BriefLens({ snapshot, onRefresh, onNavigateLens }: BriefLensProp
           </div>
         </section>
 
-        {/* Active Decisions Quick Glance */}
-        <section className="rounded-xl border border-zinc-800 bg-zinc-900/50 overflow-hidden">
-          <div className="flex items-center justify-between px-5 py-3 border-b border-zinc-800 bg-zinc-900/80">
-            <h2 className="text-sm font-semibold text-zinc-100">Governing Decisions</h2>
+        <section className="rounded-lg border border-zinc-800 bg-zinc-900 overflow-hidden">
+          <div className="flex items-center justify-between px-4 sm:px-5 py-3 border-b border-zinc-800">
+            <h2 className="text-sm font-semibold text-zinc-100">Decisions</h2>
             <button
+              type="button"
               onClick={() => onNavigateLens('decisions')}
               className="text-xs text-indigo-400 hover:text-indigo-300"
             >
-              Open Decision Ledger →
+              View all →
             </button>
           </div>
-          <div className="divide-y divide-zinc-800/80">
+          <div className="divide-y divide-zinc-800">
             {snapshot.decisions.length === 0 ? (
               <div className="p-5 text-xs text-zinc-500">No decisions recorded yet.</div>
             ) : (
               snapshot.decisions.map((d) => (
-                <div key={d.id} className="px-5 py-3 flex items-start justify-between gap-4">
-                  <div className="space-y-0.5">
+                <div key={d.id} className="px-4 sm:px-5 py-3 flex items-start justify-between gap-4">
+                  <div className="space-y-0.5 min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
-                      <span className="font-mono text-xs text-indigo-300">{d.id}</span>
+                      <span className="font-mono text-xs text-zinc-400">{d.id}</span>
                       <span
                         className={`text-sm font-medium ${
                           d.status === 'superseded' ? 'line-through text-zinc-500' : 'text-zinc-100'
@@ -229,7 +220,7 @@ export function BriefLens({ snapshot, onRefresh, onNavigateLens }: BriefLensProp
                     {d.summary && <p className="text-xs text-zinc-400">{d.summary}</p>}
                   </div>
                   {d.supersededBy && (
-                    <span className="text-[11px] font-mono text-rose-300 shrink-0">
+                    <span className="text-[11px] font-mono text-zinc-400 shrink-0">
                       → {d.supersededBy}
                     </span>
                   )}
@@ -240,89 +231,89 @@ export function BriefLens({ snapshot, onRefresh, onNavigateLens }: BriefLensProp
         </section>
       </div>
 
-      {/* Right 4 cols: Staleness Alerts, Drifted Sessions, Timeline */}
-      <div className="lg:col-span-4 space-y-6">
-        {/* Stale Artifacts */}
-        <section className="rounded-xl border border-amber-500/30 bg-amber-950/15 overflow-hidden">
-          <div className="flex items-center justify-between px-4 py-3 border-b border-amber-500/20">
-            <div className="flex items-center gap-2">
-              <AlertTriangle className="w-4 h-4 text-amber-400" />
-              <h3 className="text-sm font-semibold text-amber-200">
-                Stale Artifacts ({snapshot.drift.staleArtifacts.length})
-              </h3>
-            </div>
+      <div className="lg:col-span-4 min-w-0 space-y-6">
+        <section className="rounded-lg border border-zinc-800 bg-zinc-900 overflow-hidden">
+          <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800">
+            <h3 className="text-sm font-semibold text-zinc-100">Out of date</h3>
+            <span className="text-xs font-mono text-zinc-400">{staleRefreshables.length}</span>
           </div>
           <div className="p-4 space-y-3">
-            {snapshot.drift.staleArtifacts.length === 0 ? (
-              <div className="flex items-center gap-2 text-xs text-emerald-300">
-                <CheckCircle2 className="w-4 h-4" />
-                Every diagram, video, quiz, and task aligns with active decisions.
-              </div>
+            {staleRefreshables.length === 0 ? (
+              <div className="text-xs text-zinc-400">All artifacts match current decisions.</div>
             ) : (
-              snapshot.drift.staleArtifacts.map((stale) => (
-                <div
-                  key={`${stale.artifactType}-${stale.artifactId}`}
-                  className="rounded-lg border border-amber-500/25 bg-zinc-950/70 p-3 space-y-2"
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-semibold">
-                      {stale.artifactType}
-                    </span>
-                    <button
-                      onClick={() => handleMarkAligned(stale.artifactType, stale.artifactId)}
-                      className="inline-flex items-center gap-1 text-[11px] text-emerald-300 hover:text-emerald-200"
-                      title="Re-link to the latest superseding decision"
-                    >
-                      <RefreshCw className="w-3 h-3" /> Mark Aligned
-                    </button>
+              staleRefreshables.map((stale) => {
+                const job = openJobsByArtifact.get(`${stale.artifactType}:${stale.artifactId}`) ?? null;
+                return (
+                  <div
+                    key={`${stale.artifactType}-${stale.artifactId}`}
+                    className="rounded-lg border border-zinc-800 bg-zinc-950 p-3 space-y-2"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[10px] uppercase font-mono text-zinc-400">
+                        {stale.artifactType}
+                      </span>
+                      <StatusBadge
+                        status={job ? 'refreshing' : 'stale'}
+                        label={job ? 'Refreshing' : 'Stale'}
+                      />
+                    </div>
+                    <div className="text-xs font-medium text-zinc-100">{stale.title}</div>
+                    <div className="text-[11px] text-zinc-400 leading-snug">
+                      {stale.reasons[0]}
+                    </div>
+                    {stale.artifactType !== 'task' && (
+                      <StaleArtifactActions
+                        boardSlug={snapshot.config.slug}
+                        artifactType={stale.artifactType}
+                        artifactId={stale.artifactId}
+                        artifactVersion={stale.artifactVersion ?? 1}
+                        expectedAgainst={stale.expectedAgainst ?? {}}
+                        activeJob={job}
+                        onUpdated={onRefresh}
+                      />
+                    )}
                   </div>
-                  <div className="text-xs font-semibold text-zinc-100">{stale.title}</div>
-                  <ul className="space-y-1">
-                    {stale.reasons.map((r, i) => (
-                      <li key={i} className="text-[11px] text-amber-200/80 leading-snug">
-                        • {r}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              ))
+                );
+              })
             )}
           </div>
         </section>
 
-        {/* Drifted Sessions */}
-        <section className="rounded-xl border border-zinc-800 bg-zinc-900/50 overflow-hidden">
+        <section className="rounded-lg border border-zinc-800 bg-zinc-900 overflow-hidden">
           <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800">
             <h3 className="text-sm font-semibold text-zinc-100">
-              Sessions Behind rev {snapshot.config.revision}
+              Behind rev {snapshot.config.revision}
             </h3>
-            <span className="text-xs text-zinc-400">{snapshot.drift.driftedSessions.length}</span>
+            <span className="text-xs font-mono text-zinc-400">
+              {snapshot.drift.driftedSessions.length}
+            </span>
           </div>
           <div className="p-4 space-y-2.5">
             {snapshot.drift.driftedSessions.length === 0 ? (
-              <p className="text-xs text-emerald-400">All active agent sessions are up to date.</p>
+              <p className="text-xs text-zinc-400">All active sessions synced.</p>
             ) : (
               snapshot.drift.driftedSessions.map((ds) => (
                 <div
                   key={ds.sessionId}
-                  className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-3 space-y-1.5"
+                  className="rounded-lg border border-zinc-800 bg-zinc-950 p-3 space-y-1.5"
                 >
                   <div className="flex items-center justify-between gap-2">
                     <HarnessBadge harness={ds.harness} />
                     <span className="text-[11px] font-mono text-amber-300">
-                      behind by {ds.behindBy}
+                      -{ds.behindBy}
                     </span>
                   </div>
                   <div className="text-xs font-medium text-zinc-100">{ds.title}</div>
                   <div className="flex items-center justify-between pt-1">
-                    <span className="text-[11px] text-zinc-500">
-                      synced at rev {ds.lastSyncedRevision}
+                    <span className="text-[11px] font-mono text-zinc-500">
+                      rev {ds.lastSyncedRevision}
                     </span>
                     <button
-                      onClick={() => handleSyncSession(ds.sessionId)}
+                      type="button"
+                      onClick={() => void handleSyncSession(ds.sessionId)}
                       className="text-[11px] text-indigo-400 hover:text-indigo-300 font-medium"
                     >
-                      Mark Synced
+                      Mark synced
                     </button>
                   </div>
                 </div>
@@ -331,22 +322,21 @@ export function BriefLens({ snapshot, onRefresh, onNavigateLens }: BriefLensProp
           </div>
         </section>
 
-        {/* Recent Event Timeline */}
-        <section className="rounded-xl border border-zinc-800 bg-zinc-900/50 overflow-hidden">
+        <section className="rounded-lg border border-zinc-800 bg-zinc-900 overflow-hidden">
           <div className="flex items-center gap-2 px-4 py-3 border-b border-zinc-800">
             <Clock className="w-4 h-4 text-zinc-400" />
-            <h3 className="text-sm font-semibold text-zinc-100">Recent Pulse (events.jsonl)</h3>
+            <h3 className="text-sm font-semibold text-zinc-100">Activity</h3>
           </div>
           <div className="p-4 space-y-3 max-h-80 overflow-y-auto">
             {recentEvents.map((ev) => (
               <div key={ev.id} className="flex gap-2.5 text-xs">
-                <span className="font-mono text-[10px] text-indigo-300 bg-indigo-500/10 border border-indigo-500/20 rounded px-1.5 py-0.5 h-fit shrink-0">
+                <span className="font-mono text-[10px] text-zinc-400 bg-zinc-950 border border-zinc-800 rounded px-1.5 py-0.5 h-fit shrink-0">
                   r{ev.revision}
                 </span>
                 <div className="min-w-0">
-                  <div className="text-zinc-200 leading-snug">{ev.summary}</div>
+                  <div className="text-zinc-200 leading-snug break-words">{ev.summary}</div>
                   <div className="text-[10px] text-zinc-500 mt-0.5">
-                    {ev.actor.harness || ev.actor.label || ev.actor.type} •{' '}
+                    {ev.actor.harness || ev.actor.label || ev.actor.type} ·{' '}
                     {new Date(ev.timestamp).toLocaleTimeString()}
                   </div>
                 </div>

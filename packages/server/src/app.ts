@@ -10,16 +10,26 @@ import { streamSSE } from 'hono/streaming';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { z } from 'zod';
 import {
+  AckReaderCursorInputSchema,
+  ActorSchema,
+  ClaimJobInputSchema,
+  CompleteJobInputSchema,
   ContextDeckError,
   ContextDeckStore,
   CreateBoardInputSchema,
   CreateQuizInputSchema,
+  CreateRefreshJobInputSchema,
   MediaKindSchema,
   PatchTaskInputSchema,
   PayloadTooLargeError,
   RecordDecisionInputSchema,
+  RefreshJobArtifactTypeSchema,
+  RefreshJobStatusSchema,
   RegisterSessionInputSchema,
+  ReleaseJobInputSchema,
+  RenewJobInputSchema,
   RestAddMediaInputSchema,
+  RestConfirmArtifactInputSchema,
   RestUpdateDiagramInputSchema,
   SubmitQuizAttemptInputSchema,
   SyncSessionInputSchema,
@@ -27,20 +37,27 @@ import {
   UpdateBriefInputSchema,
   UpdateDecisionPatchSchema,
   UpdateMediaPatchSchema,
+  UpdateQuizPatchSchema,
   UpdateSessionPatchSchema,
   UpsertDiagramInputSchema,
   UpsertTaskInputSchema,
   ValidationError,
   generateContextPack,
   parseContextUpdatePayload,
+  redactJobLease,
+  redactJobsLeases,
+  resolveDefaultReaderLabel,
   seedDemoBoard,
   validateBoardSlug,
   validateEntityId,
   type Actor,
   type MediaKind,
+  type RefreshJobArtifactType,
+  type RefreshJobStatus,
 } from '@contextdeck/core';
 import { createContextDeckMcpServer } from './mcp.js';
 import { parseStreamingMultipartUpload } from './multipart.js';
+import { WEB_UI_CSP } from './csp.js';
 import {
   DEFAULT_BOOTSTRAP_TTL_MS,
   JSON_BODY_LIMIT_BYTES,
@@ -49,6 +66,8 @@ import {
   resolveMediaServePolicy,
   timingSafeStringEqual,
 } from './security.js';
+
+export { WEB_UI_CSP };
 
 export interface AppOptions {
   store: ContextDeckStore;
@@ -484,6 +503,13 @@ export function createApp(options: AppOptions): {
   app.get('/api/boards/:slug', async (c) => {
     const slug = validateBoardSlug(c.req.param('slug'));
     const snapshot = await store.getSnapshot(slug);
+    const includeAllEvents = c.req.query('events') === 'all';
+    if (!includeAllEvents && snapshot.events.length > 200) {
+      return c.json({
+        ...snapshot,
+        events: snapshot.events.slice(-200),
+      });
+    }
     return c.json(snapshot);
   });
 
@@ -751,6 +777,97 @@ export function createApp(options: AppOptions): {
   app.patch('/api/boards/:slug/media/:id', async (c) => {
     const slug = validateBoardSlug(c.req.param('slug'));
     const id = validateEntityId(c.req.param('id'), 'mediaId');
+    const contentType = (c.req.header('content-type') ?? '').toLowerCase();
+
+    if (contentType.includes('multipart/form-data')) {
+      const { mediaDir } = await store.createUploadTempFilePath(slug);
+      const parsed = await parseStreamingMultipartUpload({
+        request: c.req.raw,
+        mediaDir,
+        maxMediaBytes,
+      });
+
+      let title: string | undefined;
+      let transcript: string | undefined;
+      let basedOnDecisions: string[] | undefined;
+      let tags: string[] | undefined;
+      let jobId: string | undefined;
+      let leaseToken: string | undefined;
+      let note: string | undefined;
+      let bodyActor: Actor | undefined;
+      try {
+        title = parsed.fields.title?.trim() ? parsed.fields.title.trim().slice(0, 300) : undefined;
+        transcript = parsed.fields.transcript !== undefined ? parsed.fields.transcript : undefined;
+        basedOnDecisions = parsed.fields.basedOnDecisions
+          ? parsed.fields.basedOnDecisions
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean)
+              .map((decId) => validateEntityId(decId, 'decisionId'))
+          : undefined;
+        tags = parsed.fields.tags
+          ? parsed.fields.tags
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean)
+          : undefined;
+        jobId = parsed.fields.jobId?.trim()
+          ? validateEntityId(parsed.fields.jobId.trim(), 'jobId')
+          : undefined;
+        leaseToken = parsed.fields.leaseToken?.trim()
+          ? parsed.fields.leaseToken.trim().slice(0, 128)
+          : undefined;
+        note = parsed.fields.note?.trim() ? parsed.fields.note.trim().slice(0, 500) : undefined;
+        if (parsed.fields.actor?.trim()) {
+          let rawActor: unknown;
+          try {
+            rawActor = JSON.parse(parsed.fields.actor);
+          } catch {
+            throw new ValidationError('Invalid actor JSON field.');
+          }
+          bodyActor = parseBodyStrict(ActorSchema, rawActor);
+        }
+      } catch (err) {
+        if (parsed.file?.tmpPath) {
+          await fsp.rm(parsed.file.tmpPath, { force: true }).catch(() => {});
+        }
+        throw err;
+      }
+
+      // H19 / Claude N3: Cookie auth (browser) records human actor; bearer auth defaults to agent actor.
+      const auth = c.get('auth');
+      const defaultHumanLabel = resolveDefaultReaderLabel({ projectRoot: store.projectRoot });
+      const actor: Actor =
+        auth?.kind === 'cookie'
+          ? { type: 'human', label: bodyActor?.label || defaultHumanLabel }
+          : bodyActor ?? { type: 'agent', label: 'api-bearer' };
+
+      const media = await store.updateMedia(
+        slug,
+        id,
+        {
+          ...(title !== undefined ? { title } : {}),
+          ...(transcript !== undefined ? { transcript } : {}),
+          ...(basedOnDecisions !== undefined ? { basedOnDecisions } : {}),
+          ...(tags !== undefined ? { tags } : {}),
+          ...(jobId !== undefined ? { jobId } : {}),
+          ...(leaseToken !== undefined ? { leaseToken } : {}),
+          ...(note !== undefined ? { note } : {}),
+          ...(parsed.file
+            ? {
+                stagedTempPath: parsed.file.tmpPath,
+                fileName: parsed.file.fileName,
+                mimeType: parsed.file.mimeType,
+              }
+            : {}),
+          maxBytes: maxMediaBytes,
+        },
+        actor,
+      );
+      broadcast('board.changed', slug);
+      return c.json(media);
+    }
+
     const { actor, ...patch } = parseBodyStrict(
       UpdateMediaPatchSchema,
       await readByteCountedJson(c),
@@ -847,6 +964,18 @@ export function createApp(options: AppOptions): {
     return c.json(quiz, 201);
   });
 
+  app.patch('/api/boards/:slug/quizzes/:id', async (c) => {
+    const slug = validateBoardSlug(c.req.param('slug'));
+    const id = validateEntityId(c.req.param('id'), 'quizId');
+    const { actor, ...patch } = parseBodyStrict(
+      UpdateQuizPatchSchema,
+      await readByteCountedJson(c),
+    );
+    const quiz = await store.updateQuiz(slug, id, patch, actor ?? { type: 'human', label: 'web-ui' });
+    broadcast('board.changed', slug);
+    return c.json(quiz);
+  });
+
   app.post('/api/boards/:slug/quizzes/:id/attempts', async (c) => {
     const slug = validateBoardSlug(c.req.param('slug'));
     const id = validateEntityId(c.req.param('id'), 'quizId');
@@ -859,17 +988,136 @@ export function createApp(options: AppOptions): {
     return c.json(res, 201);
   });
 
-  // Refresh stale artifact
-  app.post('/api/boards/:slug/artifacts/:type/:id/refresh', async (c) => {
+  // Catch up & reader cursor (AC7.1, AC7.2, D16 — never appends events.jsonl)
+  app.get('/api/boards/:slug/catchup', async (c) => {
+    const slug = validateBoardSlug(c.req.param('slug'));
+    const rawReaderId = c.req.query('readerId');
+    const readerId = rawReaderId ? validateEntityId(rawReaderId, 'readerId') : undefined;
+    const report = await store.getCatchUp(slug, { readerId });
+    return c.json(report);
+  });
+
+  app.post('/api/boards/:slug/reader/ack', async (c) => {
+    const slug = validateBoardSlug(c.req.param('slug'));
+    const body = parseBodyStrict(AckReaderCursorInputSchema, await readByteCountedJson(c));
+    const cursor = await store.ackReaderCursor(slug, body.revision, {
+      readerId: body.readerId,
+      reviewedAt: body.reviewedAt,
+    });
+    const catchUp = await store.getCatchUp(slug, { readerId: body.readerId });
+    return c.json({ cursor, catchUp });
+  });
+
+  // Human confirmation for stale artifact (AC7.3, D14, D17, H9, H10; old /refresh removed!)
+  app.post('/api/boards/:slug/artifacts/:type/:id/confirm', async (c) => {
     const slug = validateBoardSlug(c.req.param('slug'));
     const rawType = c.req.param('type');
-    if (rawType !== 'diagram' && rawType !== 'media' && rawType !== 'quiz' && rawType !== 'task') {
-      throw new ValidationError(`Invalid artifact type "${rawType}".`);
+    const parsedType = RefreshJobArtifactTypeSchema.safeParse(rawType);
+    if (!parsedType.success) {
+      throw new ValidationError(
+        `Invalid artifact type "${rawType}". Only diagram, media, and quiz can be confirmed (tasks are not refresh targets).`,
+      );
     }
     const id = validateEntityId(c.req.param('id'), 'artifactId');
-    await store.refreshArtifactDecisions(slug, rawType, id, { type: 'human', label: 'web-ui' });
+    const rawBody = await readByteCountedJson(c);
+    const { actor: bodyActor, ...input } = parseBodyStrict(RestConfirmArtifactInputSchema, rawBody);
+    const auth = c.get('auth');
+    const defaultHumanLabel = resolveDefaultReaderLabel({ projectRoot: store.projectRoot });
+    const actor: Actor =
+      auth?.kind === 'cookie'
+        ? { type: 'human', label: bodyActor?.label || defaultHumanLabel }
+        : bodyActor ?? { type: 'human', label: defaultHumanLabel };
+    const updated = await store.confirmArtifact(slug, parsedType.data, id, input, actor);
     broadcast('board.changed', slug);
-    return c.json({ refreshed: true });
+    return c.json(updated);
+  });
+
+  // Refresh jobs (AC7.4, D19)
+  app.get('/api/boards/:slug/jobs', async (c) => {
+    const slug = validateBoardSlug(c.req.param('slug'));
+    const rawStatus = c.req.query('status');
+    const rawType = c.req.query('artifactType');
+    let status: RefreshJobStatus | undefined;
+    let artifactType: RefreshJobArtifactType | undefined;
+    if (rawStatus) {
+      const parsed = RefreshJobStatusSchema.safeParse(rawStatus);
+      if (!parsed.success) throw new ValidationError(`Invalid job status "${rawStatus}".`);
+      status = parsed.data;
+    }
+    if (rawType) {
+      const parsed = RefreshJobArtifactTypeSchema.safeParse(rawType);
+      if (!parsed.success) throw new ValidationError(`Invalid artifactType "${rawType}".`);
+      artifactType = parsed.data;
+    }
+    const jobs = await store.listJobs(slug, { status, artifactType });
+    return c.json({ jobs: redactJobsLeases(jobs) });
+  });
+
+  app.post('/api/boards/:slug/jobs', async (c) => {
+    const slug = validateBoardSlug(c.req.param('slug'));
+    const { actor, ...input } = parseBodyStrict(
+      CreateRefreshJobInputSchema,
+      await readByteCountedJson(c),
+    );
+    const res = await store.createRefreshJob(slug, input, actor ?? { type: 'human', label: 'web-ui' });
+    if (!res.deduplicated) {
+      broadcast('board.changed', slug);
+    }
+    return c.json(
+      { job: redactJobLease(res.job), deduplicated: res.deduplicated },
+      res.deduplicated ? 200 : 201,
+    );
+  });
+
+  app.post('/api/boards/:slug/jobs/:id/claim', async (c) => {
+    const slug = validateBoardSlug(c.req.param('slug'));
+    const id = validateEntityId(c.req.param('id'), 'jobId');
+    const { actor, ...input } = parseBodyStrict(
+      ClaimJobInputSchema.omit({ jobId: true }),
+      await readByteCountedJson(c),
+    );
+    const claimed = await store.claimJob(
+      slug,
+      { ...input, jobId: id },
+      actor ?? { type: 'agent', label: input.claimedBy },
+    );
+    broadcast('board.changed', slug);
+    return c.json(claimed);
+  });
+
+  app.post('/api/boards/:slug/jobs/:id/renew', async (c) => {
+    const slug = validateBoardSlug(c.req.param('slug'));
+    const id = validateEntityId(c.req.param('id'), 'jobId');
+    const { actor, ...input } = parseBodyStrict(
+      RenewJobInputSchema,
+      await readByteCountedJson(c),
+    );
+    const renewed = await store.renewJob(slug, id, input, actor ?? { type: 'agent', label: 'worker' });
+    return c.json(renewed);
+  });
+
+  app.post('/api/boards/:slug/jobs/:id/release', async (c) => {
+    const slug = validateBoardSlug(c.req.param('slug'));
+    const id = validateEntityId(c.req.param('id'), 'jobId');
+    const { actor, ...input } = parseBodyStrict(
+      ReleaseJobInputSchema,
+      await readByteCountedJson(c),
+    );
+    const released = await store.releaseJob(slug, id, input, actor ?? { type: 'agent', label: 'worker' });
+    broadcast('board.changed', slug);
+    return c.json(redactJobLease(released));
+  });
+
+  app.post('/api/boards/:slug/jobs/:id/complete', async (c) => {
+    const slug = validateBoardSlug(c.req.param('slug'));
+    const id = validateEntityId(c.req.param('id'), 'jobId');
+    const { actor, ...input } = parseBodyStrict(
+      CompleteJobInputSchema,
+      await readByteCountedJson(c),
+    );
+    const completed = await store.completeJob(slug, id, input, actor ?? { type: 'agent', label: 'worker' });
+    broadcast('board.changed', slug);
+    return c.json(redactJobLease(completed));
   });
 
   // Streamable HTTP MCP Endpoint (/mcp) — authenticated by authMiddleware
@@ -917,13 +1165,18 @@ export function createApp(options: AppOptions): {
           ? candidate
           : path.join(resolvedDist, 'index.html');
       const data = await fsp.readFile(target);
+      const contentType = guessStaticMime(target);
+      const headers: Record<string, string> = {
+        'Content-Type': contentType,
+        'Referrer-Policy': 'no-referrer',
+        'X-Content-Type-Options': 'nosniff',
+      };
+      if (contentType.startsWith('text/html')) {
+        headers['Content-Security-Policy'] = WEB_UI_CSP;
+      }
       return new Response(data, {
         status: 200,
-        headers: {
-          'Content-Type': guessStaticMime(target),
-          'Referrer-Policy': 'no-referrer',
-          'X-Content-Type-Options': 'nosniff',
-        },
+        headers,
       });
     });
   }

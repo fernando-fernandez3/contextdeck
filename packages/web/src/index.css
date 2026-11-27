@@ -1,46 +1,196 @@
 @import "tailwindcss";
-@import "@xyflow/react/dist/style.css";
-@import "@excalidraw/excalidraw/index.css";
+
+/* Semantic surface, border, text, and single accent tokens (H14, C7: solid surfaces, 1px borders, no gradients) */
+:root,
+html.dark {
+  color-scheme: dark;
+  --cd-bg: #09090b;
+  --cd-surface: #18181b;
+  --cd-surface-2: #27272a;
+  --cd-border: #27272a;
+  --cd-border-strong: #3f3f46;
+  --cd-text: #f4f4f5;
+  --cd-text-secondary: #d4d4d8;
+  --cd-text-muted: #a1a1aa;
+  --cd-text-subtle: #71717a;
+  --cd-accent: #4f46e5;
+  --cd-accent-hover: #6366f1;
+  --cd-accent-text: #a5b4fc;
+  --cd-amber-text: #fcd34d;
+  --cd-emerald-text: #6ee7b7;
+  --cd-rose-text: #fda4af;
+  --cd-code-bg: #27272a;
+  --cd-pre-bg: #18181b;
+}
+
+html.light {
+  color-scheme: light;
+  --cd-bg: #f8f9fa;
+  --cd-surface: #ffffff;
+  --cd-surface-2: #f1f3f5;
+  --cd-border: #e4e4e7;
+  --cd-border-strong: #d4d4d8;
+  --cd-text: #18181b;
+  --cd-text-secondary: #27272a;
+  --cd-text-muted: #52525b;
+  --cd-text-subtle: #52525b;
+  --cd-accent: #4f46e5;
+  --cd-accent-hover: #4338ca;
+  --cd-accent-text: #4338ca;
+  --cd-amber-text: #92400e;
+  --cd-emerald-text: #065f46;
+  --cd-rose-text: #9f1239;
+  --cd-code-bg: #eef2ff;
+  --cd-pre-bg: #f1f3f5;
+}
 
 @layer base {
+  html,
   body {
     font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    overflow-x: clip;
+    background-color: var(--cd-bg);
+    color: var(--cd-text);
   }
 }
 
-/* Clean Markdown prose styling */
+.cd-app-shell {
+  background-color: var(--cd-bg);
+  color: var(--cd-text);
+}
+
+/* Light-theme semantic overrides for utility classes across shell, cards, tabs, badges, and inputs */
+html.light .bg-zinc-950 {
+  background-color: var(--cd-bg);
+}
+html.light .bg-zinc-900 {
+  background-color: var(--cd-surface);
+}
+html.light .bg-zinc-800 {
+  background-color: var(--cd-surface-2);
+}
+html.light .hover\:bg-zinc-800:hover {
+  background-color: var(--cd-surface-2);
+}
+html.light .hover\:bg-zinc-700:hover {
+  background-color: var(--cd-border-strong);
+}
+html.light .border-zinc-900,
+html.light .border-zinc-800 {
+  border-color: var(--cd-border);
+}
+html.light .border-zinc-700 {
+  border-color: var(--cd-border-strong);
+}
+html.light .divide-zinc-800 > :not(:last-child) {
+  border-color: var(--cd-border);
+}
+html.light .text-zinc-100,
+html.light .text-zinc-200 {
+  color: var(--cd-text);
+}
+html.light .text-zinc-300 {
+  color: var(--cd-text-secondary);
+}
+html.light .text-zinc-400,
+html.light .text-zinc-500 {
+  color: var(--cd-text-muted);
+}
+html.light .text-zinc-700 {
+  color: var(--cd-border-strong);
+}
+html.light .hover\:text-zinc-100:hover,
+html.light .hover\:text-zinc-200:hover,
+html.light .hover\:text-white:hover {
+  color: var(--cd-text);
+}
+html.light .hover\:text-indigo-300:hover {
+  color: var(--cd-accent-text);
+}
+html.light .hover\:text-rose-400:hover {
+  color: var(--cd-rose-text);
+}
+html.light .text-amber-100,
+html.light .text-amber-200,
+html.light .text-amber-300,
+html.light .text-amber-400 {
+  color: var(--cd-amber-text);
+}
+html.light .text-emerald-100,
+html.light .text-emerald-200,
+html.light .text-emerald-300,
+html.light .text-emerald-400 {
+  color: var(--cd-emerald-text);
+}
+html.light .text-indigo-100,
+html.light .text-indigo-200,
+html.light .text-indigo-300,
+html.light .text-indigo-400 {
+  color: var(--cd-accent-text);
+}
+html.light .text-rose-100,
+html.light .text-rose-200,
+html.light .text-rose-300,
+html.light .text-rose-400 {
+  color: var(--cd-rose-text);
+}
+
+/* Theme-aware React Flow controls (R2-8) */
+.cd-flow-controls {
+  background-color: var(--cd-surface);
+  border: 1px solid var(--cd-border-strong);
+  box-shadow: none;
+}
+.cd-flow-controls .react-flow__controls-button {
+  background-color: var(--cd-surface);
+  border-bottom: 1px solid var(--cd-border);
+  color: var(--cd-text);
+  fill: var(--cd-text);
+}
+.cd-flow-controls .react-flow__controls-button:hover {
+  background-color: var(--cd-surface-2);
+}
+.cd-flow-controls .react-flow__controls-button svg {
+  fill: currentColor;
+}
+
+/* Clean Markdown prose styling (C7: subtle 1px neutral borders, no colored rails) */
+.md-prose {
+  overflow-wrap: anywhere;
+  color: var(--cd-text-secondary);
+}
 .md-prose h1 {
-  font-size: 1.5rem;
+  font-size: 1.35rem;
   font-weight: 700;
   margin-bottom: 0.75rem;
-  color: #f4f4f5;
+  color: var(--cd-text);
 }
 .md-prose h2 {
-  font-size: 1.125rem;
+  font-size: 1.075rem;
   font-weight: 600;
   margin-top: 1.25rem;
   margin-bottom: 0.5rem;
-  color: #e4e4e7;
-  border-bottom: 1px solid #27272a;
+  color: var(--cd-text);
+  border-bottom: 1px solid var(--cd-border);
   padding-bottom: 0.25rem;
 }
 .md-prose h3 {
-  font-size: 0.975rem;
+  font-size: 0.95rem;
   font-weight: 600;
   margin-top: 1rem;
   margin-bottom: 0.35rem;
-  color: #d4d4d8;
+  color: var(--cd-text);
 }
 .md-prose p {
   margin-bottom: 0.75rem;
   line-height: 1.65;
-  color: #d4d4d8;
+  color: var(--cd-text-secondary);
 }
 .md-prose ul,
 .md-prose ol {
   margin-bottom: 0.75rem;
   padding-left: 1.25rem;
-  color: #d4d4d8;
+  color: var(--cd-text-secondary);
 }
 .md-prose ul {
   list-style-type: disc;
@@ -53,31 +203,32 @@
   line-height: 1.6;
 }
 .md-prose code {
-  background: #27272a;
-  color: #a5b4fc;
+  background: var(--cd-code-bg);
+  color: var(--cd-accent-text);
   padding: 0.1rem 0.35rem;
-  border-radius: 0.3rem;
+  border-radius: 0.25rem;
   font-size: 0.85em;
 }
 .md-prose pre {
-  background: #18181b;
-  border: 1px solid #27272a;
+  background: var(--cd-pre-bg);
+  border: 1px solid var(--cd-border);
   border-radius: 0.5rem;
   padding: 0.85rem 1rem;
   overflow-x: auto;
+  max-width: 100%;
   margin-bottom: 0.9rem;
 }
 .md-prose pre code {
   background: transparent;
   padding: 0;
-  color: #e4e4e7;
+  color: var(--cd-text);
 }
 .md-prose blockquote {
-  border-left: 3px solid #6366f1;
+  border-left: 1px solid var(--cd-border-strong);
   padding-left: 0.85rem;
-  color: #a1a1aa;
+  color: var(--cd-text-muted);
   margin-bottom: 0.75rem;
 }
 .md-prose strong {
-  color: #fafafa;
+  color: var(--cd-text);
 }

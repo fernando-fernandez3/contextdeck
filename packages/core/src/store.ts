@@ -1,17 +1,23 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { existsSync, type Dirent } from 'node:fs';
+import { createReadStream, existsSync, type Dirent } from 'node:fs';
 import yaml from 'js-yaml';
 import chokidar, { type FSWatcher } from 'chokidar';
 import type { ZodType, ZodTypeDef } from 'zod';
 import {
   ActorSchema,
+  ArtifactConfirmationSchema,
+  ArtifactVersionEntrySchema,
   BoardConfigSchema,
   BoardEventSchema,
+  ClaimJobInputSchema,
+  CompleteJobInputSchema,
+  ConfirmArtifactInputSchema,
   ContextUpdatePayloadSchema,
   CreateBoardInputSchema,
   CreateQuizInputSchema,
+  CreateRefreshJobInputSchema,
   DEFAULT_LENSES,
   DecisionSchema,
   DiagramSchema,
@@ -20,8 +26,13 @@ import {
   PatchTaskInputSchema,
   QuizAttemptSchema,
   QuizSchema,
+  ReaderCursorFileSchema,
   RecordDecisionInputSchema,
+  RefreshJobArtifactTypeSchema,
+  RefreshJobSchema,
   RegisterSessionInputSchema,
+  ReleaseJobInputSchema,
+  RenewJobInputSchema,
   SessionCursorSchema,
   SessionMetadataSchema,
   SessionSchema,
@@ -32,13 +43,18 @@ import {
   UpdateBriefInputSchema,
   UpdateDecisionPatchSchema,
   UpdateMediaPatchSchema,
+  UpdateQuizPatchSchema,
   UpdateSessionPatchSchema,
   UpsertDiagramInputSchema,
   UpsertTaskInputSchema,
   type Actor,
+  type ArtifactConfirmation,
+  type ArtifactVersionEntry,
   type BoardConfig,
   type BoardEvent,
   type BoardSnapshot,
+  type CatchUpReport,
+  type ClaimedRefreshJob,
   type ContextUpdatePayload,
   type Decision,
   type DecisionStatus,
@@ -48,9 +64,17 @@ import {
   type LensConfig,
   type MediaArtifact,
   type MediaKind,
+  type PublicRefreshJob,
   type Quiz,
   type QuizAttempt,
   type QuizQuestion,
+  type ReaderBoardCursor,
+  type ReaderCursorFile,
+  type RefreshJob,
+  type RefreshJobArtifactType,
+  type RefreshJobStatus,
+  redactJobLease,
+  redactJobsLeases,
   type Session,
   type SessionCursor,
   type SessionMetadata,
@@ -70,6 +94,7 @@ import {
 } from './errors.js';
 import {
   BOARD_SLUG_REGEX,
+  ENTITY_ID_REGEX,
   nextSequentialId,
   nowIso,
   shortId,
@@ -90,9 +115,13 @@ import { parseFrontmatter, stringifyFrontmatter } from './markdown.js';
 import {
   buildSessionDriftDigest,
   computeDriftReport,
+  computeStaleArtifacts,
+  evaluateDecisionStaleness,
   isMeaningfulEvent,
+  resolveLatestDecision,
   type SessionDigestResult,
 } from './drift.js';
+import { computeCatchUp, resolveDefaultReaderId } from './catchup.js';
 import {
   TXN_FILENAME,
   atomicWriteFile,
@@ -109,6 +138,47 @@ import {
 } from './txn.js';
 
 export const DEFAULT_MAX_MEDIA_BYTES = 500 * 1024 * 1024; // 500 MB
+export const DEFAULT_JOB_LEASE_TTL_MS = 15 * 60 * 1000; // 15 minutes (D19)
+const MAX_ARTIFACT_HISTORY = 10; // AC7.6
+
+function appendArtifactHistory(
+  existing: {
+    version: number;
+    updatedAt: string;
+    boardRevisionAtUpdate: number;
+    basedOnDecisions: string[];
+    filePath?: string;
+    history: ArtifactVersionEntry[];
+  },
+  nextEntry: ArtifactVersionEntry,
+): ArtifactVersionEntry[] {
+  const base: ArtifactVersionEntry[] =
+    existing.history.length > 0
+      ? [...existing.history]
+      : [
+          ArtifactVersionEntrySchema.parse({
+            version: existing.version,
+            updatedAt: existing.updatedAt,
+            boardRevision: existing.boardRevisionAtUpdate,
+            basedOnDecisions: existing.basedOnDecisions,
+            ...(existing.filePath ? { filePath: existing.filePath } : {}),
+          }),
+        ];
+  base.push(ArtifactVersionEntrySchema.parse(nextEntry));
+  return base.slice(-MAX_ARTIFACT_HISTORY);
+}
+
+function retainRelevantConfirmations(
+  confirmations: Record<string, ArtifactConfirmation>,
+  basedOnDecisions: string[],
+): Record<string, ArtifactConfirmation> {
+  const allowed = new Set(basedOnDecisions);
+  const out: Record<string, ArtifactConfirmation> = {};
+  for (const [k, v] of Object.entries(confirmations)) {
+    if (allowed.has(k)) out[k] = v;
+  }
+  return out;
+}
 
 export interface ContextDeckStoreOptions {
   deckDir: string;
@@ -296,6 +366,7 @@ export class ContextDeckStore {
   public readonly boardsDir: string;
   public readonly sessionsDir: string;
   public readonly cursorsDir: string;
+  public readonly readersDir: string;
   public readonly pointerPath?: string;
   private _defaultBoardHint?: string;
   public readonly maxMediaBytes: number;
@@ -329,6 +400,7 @@ export class ContextDeckStore {
     this.boardsDir = path.join(this.deckDir, 'boards');
     this.sessionsDir = path.join(this.deckDir, 'sessions');
     this.cursorsDir = path.join(this.runtimeDir, 'cursors');
+    this.readersDir = path.join(this.runtimeDir, 'readers');
   }
 
   public isInitialized(): boolean {
@@ -493,6 +565,220 @@ export class ContextDeckStore {
   private async deleteSessionCursor(sessionId: string): Promise<void> {
     const cursorPath = await this.safeCursorFilePath(sessionId);
     await fs.rm(cursorPath, { force: true });
+  }
+
+  private async assertReadersDirSafe(): Promise<string> {
+    let canonicalDeckDir: string;
+    let canonicalRuntimeDir: string;
+    let canonicalReadersDir: string;
+    try {
+      [canonicalDeckDir, canonicalRuntimeDir, canonicalReadersDir] = await Promise.all([
+        canonicalizePath(this.deckDir),
+        canonicalizePath(this.runtimeDir),
+        canonicalizePath(this.readersDir),
+      ]);
+    } catch (err) {
+      if (err instanceof SecurityError) {
+        throw new CorruptDataError(err.message);
+      }
+      throw err;
+    }
+    const expectedRuntimeDir = path.join(canonicalDeckDir, '.runtime');
+    if (canonicalRuntimeDir !== expectedRuntimeDir) {
+      throw new CorruptDataError(
+        `Unsafe runtime directory "${this.runtimeDir}": resolves outside workspace deck.`,
+      );
+    }
+    const expectedReadersDir = path.join(expectedRuntimeDir, 'readers');
+    if (canonicalReadersDir !== expectedReadersDir) {
+      throw new CorruptDataError(
+        `Unsafe readers directory "${this.readersDir}": resolves outside workspace deck.`,
+      );
+    }
+    return canonicalReadersDir;
+  }
+
+  private async safeReaderFilePath(readerId: string): Promise<string> {
+    const validId = validateEntityId(readerId, 'readerId');
+    const canonicalReadersDir = await this.assertReadersDirSafe();
+    const candidate = path.join(canonicalReadersDir, `${validId}.yaml`);
+    let resolved: string;
+    try {
+      resolved = await assertContainedPath(canonicalReadersDir, candidate, {
+        label: `reader "${validId}"`,
+      });
+    } catch (err) {
+      if (err instanceof SecurityError) {
+        throw new CorruptDataError(err.message);
+      }
+      throw err;
+    }
+    if (resolved !== candidate) {
+      throw new CorruptDataError(`Unsafe reader file: reader "${validId}" resolves to an aliased file.`);
+    }
+    return resolved;
+  }
+
+  public async readReaderCursorFile(readerId?: string): Promise<ReaderCursorFile | null> {
+    const id = readerId
+      ? validateEntityId(readerId, 'readerId')
+      : resolveDefaultReaderId({ projectRoot: this.projectRoot });
+    const filePath = await this.safeReaderFilePath(id);
+    return readYamlStrict(filePath, ReaderCursorFileSchema);
+  }
+
+  /**
+   * Read per-human, per-board reader cursor from `.runtime/readers/<readerId>.yaml` (AC7.1, D16).
+   */
+  public async getReaderCursor(
+    boardSlug?: string,
+    readerId?: string,
+  ): Promise<ReaderBoardCursor | null> {
+    const slug = await this.resolveBoardSlug(boardSlug);
+    const file = await this.readReaderCursorFile(readerId);
+    return file?.boards[slug] ?? null;
+  }
+
+  /**
+   * Acknowledge a displayed board revision for a human reader (AC7.1, AC7.2, D16).
+   * Writes ONLY `.runtime/readers/<readerId>.yaml` (never appends reader events to events.jsonl
+   * and never bumps board.yaml). Monotonically advances via max().
+   */
+  public async ackReaderCursor(
+    boardSlug: string | undefined,
+    ackRevision: number,
+    options: { readerId?: string; reviewedAt?: string; now?: string } = {},
+  ): Promise<ReaderBoardCursor> {
+    if (!Number.isInteger(ackRevision) || ackRevision < 0) {
+      throw new ValidationError('ackRevision must be a non-negative integer.');
+    }
+    const id = options.readerId
+      ? validateEntityId(options.readerId, 'readerId')
+      : resolveDefaultReaderId({ projectRoot: this.projectRoot });
+    const slug = await this.resolveBoardSlug(boardSlug);
+
+    return withWorkspaceLock(
+      this.runtimeDir,
+      async (assertActive) => {
+        const config = await this.readBoardConfig(slug);
+        const existingFile = await this.readReaderCursorFile(id);
+        const prev = existingFile?.boards[slug];
+        const clamped = Math.min(ackRevision, config.revision);
+        const nextRev = Math.max(prev?.lastReviewedRevision ?? 0, clamped);
+        const nowStr = options.now ?? nowIso();
+        // H12: Store min(reviewedAt, now) so sessions created between Catch up display and click
+        // are never swallowed, while remaining monotonic against any previous lastReviewedAt.
+        let effectiveReviewedAt = nowStr;
+        if (options.reviewedAt) {
+          const revMs = Date.parse(options.reviewedAt);
+          const nowMs = Date.parse(nowStr);
+          if (Number.isFinite(revMs) && Number.isFinite(nowMs)) {
+            effectiveReviewedAt = revMs <= nowMs ? options.reviewedAt : nowStr;
+          }
+        }
+        if (prev?.lastReviewedAt) {
+          const prevMs = Date.parse(prev.lastReviewedAt);
+          const effMs = Date.parse(effectiveReviewedAt);
+          if (Number.isFinite(prevMs) && Number.isFinite(effMs) && effMs < prevMs) {
+            effectiveReviewedAt = prev.lastReviewedAt;
+          }
+        }
+        const nextEntry: ReaderBoardCursor = {
+          lastReviewedRevision: nextRev,
+          lastReviewedAt: effectiveReviewedAt,
+        };
+        const nextFile: ReaderCursorFile = ReaderCursorFileSchema.parse({
+          readerId: id,
+          boards: {
+            ...(existingFile?.boards ?? {}),
+            [slug]: nextEntry,
+          },
+          updatedAt: nowStr,
+        });
+        const filePath = await this.safeReaderFilePath(id);
+        await ensureDir(path.dirname(filePath));
+        assertActive();
+        await atomicWriteFile(filePath, dumpYaml(nextFile));
+        return nextEntry;
+      },
+      this.deckDir,
+    );
+  }
+
+  public async getCatchUp(
+    boardSlug?: string,
+    options: { readerId?: string } = {},
+  ): Promise<CatchUpReport> {
+    const slug = await this.resolveBoardSlug(boardSlug);
+    const evaluatedAt = nowIso();
+    const [config, cursor] = await Promise.all([
+      this.readBoardConfig(slug),
+      this.getReaderCursor(slug, options.readerId),
+    ]);
+    const fromRevision = cursor?.lastReviewedRevision ?? 0;
+
+    // H13: Fast short-circuit when already caught up at the board's current revision:
+    // skip events, decisions, tasks, diagrams, media, quizzes, jobs, session cursors, and drift,
+    // reading ONLY raw session metadata (for hook-created sessions newer than lastReviewedAt).
+    if (cursor !== null && fromRevision >= config.revision) {
+      const sessions = (await this.listAllRawSessions()).filter((s) => s.board === slug);
+      return computeCatchUp(
+        {
+          config,
+          sessions,
+          decisions: [],
+          tasks: [],
+          diagrams: [],
+          media: [],
+          quizzes: [],
+          jobs: [],
+          events: [],
+          drift: { staleArtifacts: [] },
+        },
+        cursor,
+        { evaluatedAt },
+      );
+    }
+
+    // H13: Lightweight delta read — readEventsSince (tail only), loadContent: false,
+    // raw session metadata (no per-session cursors), and computeStaleArtifacts only (no 40x5000 drift).
+    const [events, rawSessions, decisions, tasks, diagrams, media, quizzes, jobs] = await Promise.all([
+      this.readEventsSince(slug, fromRevision, config.revision),
+      this.listAllRawSessions(),
+      this.listDecisions(slug),
+      this.listTasks(slug),
+      this.listDiagrams(slug, { loadContent: false }),
+      this.listMedia(slug, { loadContent: false }),
+      this.listQuizzes(slug),
+      this.listJobs(slug),
+    ]);
+    const sessions = rawSessions.filter((s) => s.board === slug);
+
+    const staleArtifacts = computeStaleArtifacts({
+      decisions,
+      tasks,
+      diagrams,
+      media,
+      quizzes,
+      includeTasks: false,
+    });
+
+    return computeCatchUp(
+      {
+        config,
+        sessions,
+        decisions,
+        tasks,
+        diagrams,
+        media,
+        quizzes,
+        jobs,
+        events,
+        drift: { staleArtifacts },
+      },
+      cursor,
+      { evaluatedAt },
+    );
   }
 
   private sessionMetadataFingerprint(meta: SessionMetadata): string {
@@ -732,6 +1018,7 @@ export class ContextDeckStore {
       ensureDir(path.join(dir, 'diagrams')),
       ensureDir(path.join(dir, 'media')),
       ensureDir(path.join(dir, 'quizzes')),
+      ensureDir(path.join(dir, 'jobs')),
     ]);
     return dir;
   }
@@ -1254,6 +1541,45 @@ export class ContextDeckStore {
     return cfg;
   }
 
+  private static fastParseBoardEvent(parsedJson: unknown, eventsPath: string): BoardEvent {
+    if (parsedJson && typeof parsedJson === 'object' && !Array.isArray(parsedJson)) {
+      const obj = parsedJson as Record<string, unknown>;
+      const actor = obj.actor as Record<string, unknown> | undefined;
+      if (
+        typeof obj.id === 'string' &&
+        ENTITY_ID_REGEX.test(obj.id) &&
+        typeof obj.revision === 'number' &&
+        Number.isInteger(obj.revision) &&
+        obj.revision >= 1 &&
+        typeof obj.timestamp === 'string' &&
+        obj.timestamp.length >= 10 &&
+        typeof obj.kind === 'string' &&
+        obj.kind.length >= 1 &&
+        typeof obj.summary === 'string' &&
+        (obj.entityId === undefined || typeof obj.entityId === 'string') &&
+        (obj.details === undefined ||
+          (typeof obj.details === 'object' && obj.details !== null && !Array.isArray(obj.details))) &&
+        actor !== undefined &&
+        typeof actor === 'object' &&
+        actor !== null &&
+        (actor.type === 'human' || actor.type === 'agent' || actor.type === 'system') &&
+        (actor.harness === undefined || typeof actor.harness === 'string') &&
+        (actor.sessionId === undefined ||
+          (typeof actor.sessionId === 'string' && ENTITY_ID_REGEX.test(actor.sessionId))) &&
+        (actor.label === undefined || typeof actor.label === 'string')
+      ) {
+        return obj as unknown as BoardEvent;
+      }
+    }
+    const parsed = BoardEventSchema.safeParse(parsedJson);
+    if (!parsed.success) {
+      throw new CorruptDataError(
+        `Invalid event schema in ${eventsPath}: ${formatZodError(parsed.error)}`,
+      );
+    }
+    return parsed.data;
+  }
+
   public async readEvents(slug: string, maxRevision?: number): Promise<BoardEvent[]> {
     const validSlug = validateBoardSlug(slug);
     const eventsPath = await this.safeBoardFilePath(validSlug, 'events.jsonl');
@@ -1272,14 +1598,9 @@ export class ContextDeckStore {
           `Corrupt JSONL line in ${eventsPath}: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
-      const parsed = BoardEventSchema.safeParse(parsedJson);
-      if (!parsed.success) {
-        throw new CorruptDataError(
-          `Invalid event schema in ${eventsPath}: ${formatZodError(parsed.error)}`,
-        );
-      }
-      if (maxRevision === undefined || parsed.data.revision <= maxRevision) {
-        events.push(parsed.data);
+      const ev = ContextDeckStore.fastParseBoardEvent(parsedJson, eventsPath);
+      if (maxRevision === undefined || ev.revision <= maxRevision) {
+        events.push(ev);
       }
     }
     return events;
@@ -1287,7 +1608,7 @@ export class ContextDeckStore {
 
   /**
    * Lightweight reverse-chunk tail reader for events.jsonl (E3 amended).
-   * Reads backwards from EOF in 32 KB chunks and stops as soon as it sees
+   * Reads backwards from EOF in 64 KB chunks and stops as soon as it sees
    * an event with revision <= afterRevision, keeping hook/digest latency
    * well under 300ms even with 5,000+ events.
    */
@@ -1308,7 +1629,7 @@ export class ContextDeckStore {
       throw err;
     }
 
-    const CHUNK_SIZE = 32 * 1024;
+    const CHUNK_SIZE = 64 * 1024;
     const collected: BoardEvent[] = [];
 
     const parseEventLine = (lineBuf: Buffer): BoardEvent | null => {
@@ -1322,13 +1643,7 @@ export class ContextDeckStore {
           `Corrupt JSONL line in ${eventsPath}: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
-      const parsed = BoardEventSchema.safeParse(parsedJson);
-      if (!parsed.success) {
-        throw new CorruptDataError(
-          `Invalid event schema in ${eventsPath}: ${formatZodError(parsed.error)}`,
-        );
-      }
-      return parsed.data;
+      return ContextDeckStore.fastParseBoardEvent(parsedJson, eventsPath);
     };
 
     try {
@@ -1545,28 +1860,52 @@ export class ContextDeckStore {
   }): Promise<Array<LegacySessionFile & { board: string }>> {
     const skipCorrupt = Boolean(options?.skipCorrupt);
     const byId = new Map<string, LegacySessionFile & { board: string }>();
+    let cachedDefaultBoard: string | undefined;
+    const resolveDefault = async (): Promise<string> => {
+      if (cachedDefaultBoard === undefined) {
+        cachedDefaultBoard = await this.getDefaultBoardSlug();
+      }
+      return cachedDefaultBoard;
+    };
 
-    // 1. Workspace-scoped sessions in `<deck>/sessions/*.yaml` (canonical D11 location)
+    // 1. Workspace-scoped sessions in `<deck>/sessions/*.yaml` (canonical D11 location), read in parallel (H13)
     const canonicalSessionsDir = await this.assertSessionsDirSafe();
-    const wsFiles = await listFilesStrict(canonicalSessionsDir, '.yaml');
-    for (const file of wsFiles) {
-      const filePath = await assertContainedPath(
-        canonicalSessionsDir,
-        path.join(canonicalSessionsDir, file),
-        { label: `session ${file}` },
-      );
-      let parsed: LegacySessionFile | null;
-      try {
-        parsed = await readYamlStrict(filePath, LegacySessionFileSchema);
-      } catch (err) {
-        if (skipCorrupt && err instanceof CorruptDataError) {
-          options?.onCorrupt?.(filePath, err);
-          continue;
-        }
+    let wsEntries: Dirent[] = [];
+    try {
+      wsEntries = await fs.readdir(canonicalSessionsDir, { withFileTypes: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
         throw err;
       }
+    }
+    const wsYamlEntries = wsEntries
+      .filter((e) => e.name.endsWith('.yaml') && !e.name.startsWith('.'))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const wsResults = await Promise.all(
+      wsYamlEntries.map(async (entry) => {
+        const candidatePath = path.join(canonicalSessionsDir, entry.name);
+        // Fast path for non-symlink regular files inside already-canonicalized sessions dir;
+        // any symlink or unusual entry still goes through full assertContainedPath!
+        const filePath =
+          entry.isFile() && !entry.isSymbolicLink()
+            ? candidatePath
+            : await assertContainedPath(canonicalSessionsDir, candidatePath, {
+                label: `session ${entry.name}`,
+              });
+        try {
+          return await readYamlStrict(filePath, LegacySessionFileSchema);
+        } catch (err) {
+          if (skipCorrupt && err instanceof CorruptDataError) {
+            options?.onCorrupt?.(filePath, err);
+            return null;
+          }
+          throw err;
+        }
+      }),
+    );
+    for (const parsed of wsResults) {
       if (parsed) {
-        const board = parsed.board ?? (await this.getDefaultBoardSlug());
+        const board = parsed.board ?? (await resolveDefault());
         byId.set(parsed.id, { ...parsed, board });
       }
     }
@@ -1588,20 +1927,23 @@ export class ContextDeckStore {
       if (!existsSync(legacyDir)) continue;
       const safeDir = await this.safeBoardFilePath(entry.name, 'sessions');
       const legacyFiles = await listFilesStrict(safeDir, '.yaml');
-      for (const file of legacyFiles) {
-        const filePath = await assertContainedPath(safeDir, path.join(safeDir, file), {
-          label: `legacy session ${file}`,
-        });
-        let parsed: LegacySessionFile | null;
-        try {
-          parsed = await readYamlStrict(filePath, LegacySessionFileSchema);
-        } catch (err) {
-          if (skipCorrupt && err instanceof CorruptDataError) {
-            options?.onCorrupt?.(filePath, err);
-            continue;
+      const legacyResults = await Promise.all(
+        legacyFiles.map(async (file) => {
+          const filePath = await assertContainedPath(safeDir, path.join(safeDir, file), {
+            label: `legacy session ${file}`,
+          });
+          try {
+            return await readYamlStrict(filePath, LegacySessionFileSchema);
+          } catch (err) {
+            if (skipCorrupt && err instanceof CorruptDataError) {
+              options?.onCorrupt?.(filePath, err);
+              return null;
+            }
+            throw err;
           }
-          throw err;
-        }
+        }),
+      );
+      for (const parsed of legacyResults) {
         if (parsed && !byId.has(parsed.id)) {
           byId.set(parsed.id, { ...parsed, board: parsed.board ?? entry.name });
         }
@@ -2012,6 +2354,78 @@ export class ContextDeckStore {
     return quizParsed.data;
   }
 
+  private async listJobsRaw(
+    slug: string,
+    filter?: { status?: RefreshJobStatus; artifactType?: RefreshJobArtifactType },
+  ): Promise<RefreshJob[]> {
+    const dir = await this.safeBoardFilePath(slug, 'jobs');
+    const files = await listFilesStrict(dir, '.yaml');
+    const out: RefreshJob[] = [];
+    for (const file of files) {
+      const filePath = await assertContainedPath(dir, path.join(dir, file), { label: `job ${file}` });
+      const parsed = await readYamlStrict(filePath, RefreshJobSchema);
+      if (!parsed) continue;
+      if (filter?.status && parsed.status !== filter.status) continue;
+      if (filter?.artifactType && parsed.artifactType !== filter.artifactType) continue;
+      out.push(parsed);
+    }
+    return out.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  public async listJobs(
+    boardSlug?: string,
+    filter?: { status?: RefreshJobStatus; artifactType?: RefreshJobArtifactType },
+  ): Promise<PublicRefreshJob[]> {
+    const slug = await this.resolveBoardSlug(boardSlug);
+    const jobs = await this.listJobsRaw(slug, filter);
+    return redactJobsLeases(jobs);
+  }
+
+  private async readJobById(slug: string, jobId: string): Promise<RefreshJob | null> {
+    const validId = validateEntityId(jobId, 'jobId');
+    const jobPath = await this.safeBoardFilePath(slug, 'jobs', `${validId}.yaml`);
+    return readYamlStrict(jobPath, RefreshJobSchema);
+  }
+
+  public async getJob(boardSlug: string | undefined, jobId: string): Promise<PublicRefreshJob | null> {
+    const slug = await this.resolveBoardSlug(boardSlug);
+    const job = await this.readJobById(slug, jobId);
+    return job ? redactJobLease(job) : null;
+  }
+
+  /**
+   * Lightweight loader for `cdeck worker` handlers: reads ONLY the board config, brief,
+   * decisions, and the single target artifact — never sessions, full event logs, or drift (H4, H13).
+   */
+  public async getWorkerJobContext(
+    boardSlug: string | undefined,
+    job: Pick<RefreshJob, 'artifactType' | 'artifactId'>,
+  ): Promise<{
+    config: BoardConfig;
+    brief: string;
+    decisions: Decision[];
+    artifact: Diagram | MediaArtifact | Quiz | null;
+  }> {
+    const slug = await this.resolveBoardSlug(boardSlug);
+    const briefPath = await this.safeBoardFilePath(slug, 'brief.md');
+    const [config, briefRaw, decisions, artifact] = await Promise.all([
+      this.readBoardConfig(slug),
+      readFileStrict(briefPath),
+      this.listDecisions(slug),
+      job.artifactType === 'diagram'
+        ? this.readDiagramById(slug, job.artifactId)
+        : job.artifactType === 'media'
+          ? this.readMediaById(slug, job.artifactId, { loadContent: true })
+          : this.readQuizById(slug, job.artifactId),
+    ]);
+    return {
+      config,
+      brief: briefRaw ?? '',
+      decisions,
+      artifact,
+    };
+  }
+
   private async txnJournalExists(txnPath: string): Promise<boolean> {
     try {
       await fs.access(txnPath);
@@ -2029,13 +2443,14 @@ export class ContextDeckStore {
     const briefPath = await this.safeBoardFilePath(slug, 'brief.md');
     const brief = (await readFileStrict(briefPath)) ?? '';
 
-    const [sessions, decisions, tasks, diagrams, media, quizzes, events] = await Promise.all([
+    const [sessions, decisions, tasks, diagrams, media, quizzes, jobs, events] = await Promise.all([
       this.listSessions(slug),
       this.listDecisions(slug),
       this.listTasks(slug),
       this.listDiagrams(slug),
       this.listMedia(slug),
       this.listQuizzes(slug),
+      this.listJobs(slug),
       this.readEvents(slug, config.revision),
     ]);
 
@@ -2059,6 +2474,7 @@ export class ContextDeckStore {
       diagrams,
       media,
       quizzes,
+      jobs,
       events,
       drift,
     };
@@ -2108,13 +2524,14 @@ export class ContextDeckStore {
       );
     };
 
-    const [sessions, decisions, tasks, diagrams, media, quizzes, events] = await Promise.all([
+    const [sessions, decisions, tasks, diagrams, media, quizzes, jobs, events] = await Promise.all([
       loadLightweightSessions(),
       this.listDecisions(validSlug),
       this.listTasks(validSlug),
       this.listDiagrams(validSlug, { loadContent: false }),
       this.listMedia(validSlug, { loadContent: false }),
       this.listQuizzes(validSlug),
+      this.listJobs(validSlug),
       this.readRecentEvents(validSlug, options.maxRecentEvents ?? 16, config.revision),
     ]);
 
@@ -2142,6 +2559,7 @@ export class ContextDeckStore {
       diagrams,
       media,
       quizzes,
+      jobs,
       events,
       drift,
     };
@@ -2797,6 +3215,91 @@ export class ContextDeckStore {
     return task;
   }
 
+  private static sha256Hex(value: string): string {
+    return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
+  }
+
+  private static hashFileSha256(filePath: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const hash = crypto.createHash('sha256');
+      const stream = createReadStream(filePath);
+      stream.on('data', (chunk) => hash.update(chunk));
+      stream.on('end', () => resolve(hash.digest('hex')));
+      stream.on('error', reject);
+    });
+  }
+
+  private static getStoredLeaseHash(job: RefreshJob): string | null {
+    if (job.leaseTokenHash) return job.leaseTokenHash;
+    // R2-4 read-compat: accept legacy job files that stored a raw leaseToken without a hash
+    if (job.leaseToken) return ContextDeckStore.sha256Hex(job.leaseToken);
+    return null;
+  }
+
+  private static verifyLeaseToken(job: RefreshJob, presentedToken: string): string | null {
+    const storedHash = ContextDeckStore.getStoredLeaseHash(job);
+    if (!storedHash || !presentedToken) return null;
+    const presentedHash = ContextDeckStore.sha256Hex(presentedToken);
+    const a = Buffer.from(storedHash, 'hex');
+    const b = Buffer.from(presentedHash, 'hex');
+    if (a.length !== b.length || a.length !== 32) return null;
+    return crypto.timingSafeEqual(a, b) ? storedHash : null;
+  }
+
+  private static computeClaimFingerprintFromHash(leaseTokenHash: string): string {
+    return leaseTokenHash.slice(0, 16);
+  }
+
+  private static serializeJobForDisk(job: RefreshJob): string {
+    // R2-4: Never write raw leaseToken to git-trackable board YAML; persist only leaseTokenHash.
+    const { leaseToken: _omitted, ...diskJob } = job;
+    return dumpYaml(diskJob);
+  }
+
+  private async validateActiveJobClaim(
+    slug: string,
+    jobId: string | undefined,
+    leaseToken: string | undefined,
+    artifactType: RefreshJobArtifactType,
+    artifactId: string,
+    nowMs: number,
+  ): Promise<{ job: RefreshJob; claimFingerprint: string } | null> {
+    if (!jobId) {
+      if (leaseToken !== undefined) {
+        throw new ValidationError('leaseToken can only be supplied together with jobId.');
+      }
+      return null;
+    }
+    if (!leaseToken) {
+      throw new ValidationError(`Refresh job write for "${jobId}" requires an active leaseToken.`);
+    }
+    const job = await this.readJobById(slug, jobId);
+    if (!job) {
+      throw new NotFoundError(`Refresh job "${jobId}" not found on board "${slug}".`);
+    }
+    if (job.artifactType !== artifactType || job.artifactId !== artifactId) {
+      throw new ValidationError(
+        `Refresh job "${jobId}" targets ${job.artifactType}/${job.artifactId}, not ${artifactType}/${artifactId}.`,
+      );
+    }
+    if (job.status !== 'claimed' || !ContextDeckStore.getStoredLeaseHash(job)) {
+      throw new ConflictError(
+        `Refresh job "${jobId}" is not actively claimed (status: ${job.status}).`,
+      );
+    }
+    const verifiedHash = ContextDeckStore.verifyLeaseToken(job, leaseToken);
+    if (!verifiedHash) {
+      throw new ConflictError(`Invalid lease token for refresh job "${jobId}".`);
+    }
+    if (job.leaseExpiresAt && Date.parse(job.leaseExpiresAt) <= nowMs) {
+      throw new ConflictError(`Lease for refresh job "${jobId}" has expired.`);
+    }
+    return {
+      job,
+      claimFingerprint: ContextDeckStore.computeClaimFingerprintFromHash(verifiedHash),
+    };
+  }
+
   private async upsertDiagramUnlocked(
     tx: MutationContext,
     rawInput: {
@@ -2807,17 +3310,37 @@ export class ContextDeckStore {
       description?: string;
       basedOnDecisions?: string[];
       sessionId?: string | null;
+      jobId?: string;
+      leaseToken?: string;
+      note?: string;
+      now?: Date;
     },
     actorOverride?: Actor,
   ): Promise<Diagram> {
-    const input = parseStrict(UpsertDiagramInputSchema.omit({ actor: true }), rawInput, 'diagram');
+    const { now: nowOpt, ...schemaInput } = rawInput;
+    const input = parseStrict(UpsertDiagramInputSchema.omit({ actor: true }), schemaInput, 'diagram');
     const effActor = actorOverride ?? tx.actor;
     const existing = input.id ? ((await this.readDiagramById(tx.slug, input.id)) ?? undefined) : undefined;
-    const now = nowIso();
+    const nowDate = nowOpt ?? new Date();
+    const now = nowDate.toISOString();
 
     const kind = input.kind ?? existing?.kind ?? 'mermaid';
     const id = existing?.id ?? input.id ?? `diag_${slugify(input.title)}_${shortId('x').slice(2, 6)}`;
     validateEntityId(id, 'diagramId');
+
+    const activeClaim = await this.validateActiveJobClaim(
+      tx.slug,
+      input.jobId,
+      input.leaseToken,
+      'diagram',
+      id,
+      nowDate.getTime(),
+    );
+    if (activeClaim && existing && input.content.trim() === existing.content.trim()) {
+      throw new ValidationError(
+        'Cannot record refresh job version without changing diagram content.',
+      );
+    }
 
     // H10: Attribute the event ONLY to the actual caller's sessionId (never existing.sessionId),
     // while keeping existing.sessionId preserved as diagram metadata.
@@ -2825,12 +3348,37 @@ export class ContextDeckStore {
     const diagramSessionId =
       input.sessionId !== undefined ? input.sessionId : (effActor.sessionId ?? existing?.sessionId ?? null);
     const eventActor: Actor = actorSessionId ? { ...effActor, sessionId: actorSessionId } : effActor;
+    const nextVersion = existing ? existing.version + 1 : 1;
+    const nextBasedOn = input.basedOnDecisions ?? existing?.basedOnDecisions ?? [];
     const ev = tx.addEvent({
       kind: existing ? 'diagram.updated' : 'diagram.created',
       entityId: id,
-      summary: `${existing ? 'Updated' : 'Created'} ${kind} diagram "${input.title}"`,
+      summary: `${existing ? 'Updated' : 'Created'} ${kind} diagram "${input.title}" (v${nextVersion})`,
       actor: eventActor,
     });
+
+    const versionEntry: ArtifactVersionEntry = ArtifactVersionEntrySchema.parse({
+      version: nextVersion,
+      updatedAt: now,
+      boardRevision: ev.revision,
+      actor: eventActor,
+      basedOnDecisions: nextBasedOn,
+      contentHash: ContextDeckStore.sha256Hex(input.content),
+      ...(activeClaim
+        ? { createdByJob: activeClaim.job.id, createdByClaim: activeClaim.claimFingerprint }
+        : {}),
+      ...(input.note ? { note: input.note } : {}),
+    });
+
+    const nextHistory = existing
+      ? appendArtifactHistory(existing, versionEntry)
+      : [versionEntry];
+
+    const contentChanged = !existing || input.content !== existing.content;
+    const nextConfirmations =
+      existing && !contentChanged
+        ? retainRelevantConfirmations(existing.confirmations, nextBasedOn)
+        : {};
 
     const diagram = DiagramSchema.parse({
       id,
@@ -2838,7 +3386,10 @@ export class ContextDeckStore {
       kind,
       content: input.content,
       description: input.description ?? existing?.description ?? '',
-      basedOnDecisions: input.basedOnDecisions ?? existing?.basedOnDecisions ?? [],
+      basedOnDecisions: nextBasedOn,
+      version: nextVersion,
+      history: nextHistory,
+      confirmations: nextConfirmations,
       sessionId: diagramSessionId,
       boardRevisionAtUpdate: ev.revision,
       createdAt: existing?.createdAt ?? now,
@@ -2860,50 +3411,185 @@ export class ContextDeckStore {
     mediaId: string,
     rawPatch: Record<string, unknown>,
     actorOverride?: Actor,
+    stagedBinary?: { tmpPath: string; ext: string; mimeType?: string },
+    nowOpt?: Date,
   ): Promise<MediaArtifact> {
     validateEntityId(mediaId, 'mediaId');
     const patch = parseStrict(UpdateMediaPatchSchema.omit({ actor: true }), rawPatch, 'media patch');
     const effActor = actorOverride ?? tx.actor;
+    const nowDate = nowOpt ?? new Date();
+    const now = nowDate.toISOString();
 
     const existing = await this.readMediaById(tx.slug, mediaId, { loadContent: true });
     if (!existing) {
       throw new NotFoundError(`Media artifact "${mediaId}" not found on board "${tx.slug}".`);
     }
 
+    const isTextMediaKind =
+      existing.kind === 'doc' || existing.kind === 'html' || existing.kind === 'json';
+    const MAX_INLINE_TEXT_MEDIA_BYTES = 512 * 1024;
+    let stagedTextContent: string | undefined;
+    let stagedContentHash: string | undefined;
+    if (isTextMediaKind && stagedBinary) {
+      const st = await fs.stat(stagedBinary.tmpPath);
+      if (st.size <= MAX_INLINE_TEXT_MEDIA_BYTES) {
+        stagedTextContent = await fs.readFile(stagedBinary.tmpPath, 'utf8');
+        stagedContentHash = ContextDeckStore.sha256Hex(stagedTextContent);
+      } else {
+        stagedTextContent = undefined;
+        stagedContentHash = await ContextDeckStore.hashFileSha256(stagedBinary.tmpPath);
+      }
+    }
+
+    const existingContentHash =
+      existing.content !== undefined
+        ? ContextDeckStore.sha256Hex(existing.content)
+        : existing.history.at(-1)?.contentHash;
+    const nextContentHash =
+      isTextMediaKind && stagedBinary
+        ? stagedContentHash
+        : patch.content !== undefined
+          ? ContextDeckStore.sha256Hex(patch.content)
+          : existingContentHash;
+
+    const activeClaim = await this.validateActiveJobClaim(
+      tx.slug,
+      patch.jobId,
+      patch.leaseToken,
+      'media',
+      existing.id,
+      nowDate.getTime(),
+    );
+    if (activeClaim) {
+      const hasNewBinary = Boolean(stagedBinary);
+      const hasNewContent = patch.content !== undefined && patch.content !== existing.content;
+      const hasNewTranscript =
+        patch.transcript !== undefined && patch.transcript !== existing.transcript;
+      const hasNewUrl =
+        patch.externalUrl !== undefined && patch.externalUrl !== existing.externalUrl;
+      if (existing.kind === 'video' || existing.kind === 'audio') {
+        if (existing.filePath) {
+          if (!hasNewBinary) {
+            throw new ValidationError(
+              'Cannot record refresh job version for file-backed video/audio without a new media file.',
+            );
+          }
+        } else if (!hasNewBinary && !hasNewUrl) {
+          throw new ValidationError(
+            'Cannot record refresh job version for video/audio without a new media file or URL.',
+          );
+        }
+      }
+      if (isTextMediaKind) {
+        const textContentChanged =
+          (hasNewBinary || hasNewContent) &&
+          (existingContentHash === undefined || nextContentHash !== existingContentHash);
+        if (!textContentChanged) {
+          throw new ValidationError(
+            'Cannot record refresh job version for document/html/json without changed content or a new file.',
+          );
+        }
+      }
+      if (!hasNewBinary && !hasNewContent && !hasNewTranscript && !hasNewUrl) {
+        throw new ValidationError(
+          'Cannot record refresh job version without updated media content or file.',
+        );
+      }
+    }
+
+    const nextVersion = existing.version + 1;
+    const mediaDir = await this.safeBoardFilePath(tx.slug, 'media');
+    let nextFilePath = existing.filePath;
+    let nextMimeType = stagedBinary?.mimeType ?? existing.mimeType;
+
+    // D19: Immutable versioned media files `<id>.v<N>.<ext>` (keep previous versions on disk!)
+    if (stagedBinary) {
+      nextFilePath = `${existing.id}.v${nextVersion}${stagedBinary.ext}`;
+      const finalFilePath = await assertContainedPath(
+        mediaDir,
+        path.join(mediaDir, nextFilePath),
+        { label: `media file "${nextFilePath}"` },
+      );
+      if (existsSync(finalFilePath)) {
+        throw new ConflictError(`Immutable media version "${nextFilePath}" already exists.`);
+      }
+      tx.stagePreStagedFile(stagedBinary.tmpPath, finalFilePath);
+    } else if (
+      patch.content !== undefined &&
+      isTextMediaKind
+    ) {
+      const ext = existing.kind === 'html' ? '.html' : existing.kind === 'json' ? '.json' : '.md';
+      nextFilePath = `${existing.id}.v${nextVersion}${ext}`;
+      const targetContentPath = await assertContainedPath(
+        mediaDir,
+        path.join(mediaDir, nextFilePath),
+        { label: `media file "${nextFilePath}"` },
+      );
+      if (existsSync(targetContentPath)) {
+        throw new ConflictError(`Immutable media version "${nextFilePath}" already exists.`);
+      }
+      tx.stageFile(targetContentPath, patch.content);
+    }
+
+    const nextBasedOn = patch.basedOnDecisions ?? existing.basedOnDecisions;
     const ev = tx.addEvent({
       kind: 'media.updated',
       entityId: existing.id,
-      summary: `Updated ${existing.kind} artifact "${patch.title ?? existing.title}"`,
+      summary: `Updated ${existing.kind} artifact "${patch.title ?? existing.title}" (v${nextVersion})`,
       actor: effActor,
     });
+
+    const versionEntry: ArtifactVersionEntry = ArtifactVersionEntrySchema.parse({
+      version: nextVersion,
+      updatedAt: now,
+      boardRevision: ev.revision,
+      actor: effActor,
+      basedOnDecisions: nextBasedOn,
+      ...(nextFilePath ? { filePath: nextFilePath } : {}),
+      ...(nextContentHash !== undefined ? { contentHash: nextContentHash } : {}),
+      ...(activeClaim
+        ? { createdByJob: activeClaim.job.id, createdByClaim: activeClaim.claimFingerprint }
+        : {}),
+      ...(patch.note ? { note: patch.note } : {}),
+    });
+
+    const nextHistory = appendArtifactHistory(existing, versionEntry);
+    const substantiveChange =
+      Boolean(stagedBinary) ||
+      patch.content !== undefined ||
+      patch.transcript !== undefined ||
+      patch.externalUrl !== undefined;
+
+    const nextContent =
+      isTextMediaKind && stagedBinary
+        ? stagedTextContent
+        : patch.content !== undefined
+          ? patch.content
+          : existing.content;
 
     const updated = MediaArtifactSchema.parse({
       ...existing,
       ...(patch.title !== undefined ? { title: patch.title } : {}),
-      ...(patch.content !== undefined ? { content: patch.content } : {}),
+      content: nextContent,
       ...(patch.transcript !== undefined ? { transcript: patch.transcript } : {}),
       ...(patch.chapters !== undefined ? { chapters: patch.chapters } : {}),
+      ...(patch.durationSec !== undefined ? { durationSec: patch.durationSec } : {}),
       ...(patch.tags !== undefined ? { tags: patch.tags } : {}),
       ...(patch.basedOnDecisions !== undefined ? { basedOnDecisions: patch.basedOnDecisions } : {}),
       ...(patch.externalUrl !== undefined ? { externalUrl: patch.externalUrl } : {}),
       ...(patch.metadata !== undefined ? { metadata: patch.metadata } : {}),
-      // Never allow storage-managed fields to be overwritten by patch
       id: existing.id,
-      filePath: existing.filePath,
+      mimeType: nextMimeType,
+      filePath: nextFilePath,
+      version: nextVersion,
+      history: nextHistory,
+      confirmations: substantiveChange
+        ? {}
+        : retainRelevantConfirmations(existing.confirmations, nextBasedOn),
       createdAt: existing.createdAt,
       boardRevisionAtUpdate: ev.revision,
-      updatedAt: nowIso(),
+      updatedAt: now,
     });
-
-    const mediaDir = await this.safeBoardFilePath(tx.slug, 'media');
-    if (patch.content !== undefined && updated.filePath) {
-      const targetContentPath = await assertContainedPath(
-        mediaDir,
-        path.join(mediaDir, updated.filePath),
-        { label: `media file for "${updated.id}"` },
-      );
-      tx.stageFile(targetContentPath, patch.content);
-    }
 
     const metaPath = await assertContainedPath(
       mediaDir,
@@ -2943,6 +3629,15 @@ export class ContextDeckStore {
     });
 
     const now = nowIso();
+    const basedOnDecisions = input.basedOnDecisions ?? [];
+    const versionEntry = ArtifactVersionEntrySchema.parse({
+      version: 1,
+      updatedAt: now,
+      boardRevision: ev.revision,
+      actor: eventActor,
+      basedOnDecisions,
+    });
+
     const quiz = QuizSchema.parse({
       id,
       title: input.title,
@@ -2950,7 +3645,10 @@ export class ContextDeckStore {
       description: input.description ?? '',
       questions: input.questions,
       attempts: [],
-      basedOnDecisions: input.basedOnDecisions ?? [],
+      basedOnDecisions,
+      version: 1,
+      history: [versionEntry],
+      confirmations: {},
       sessionId,
       boardRevisionAtUpdate: ev.revision,
       createdAt: now,
@@ -3409,7 +4107,14 @@ export class ContextDeckStore {
       params.onCorruptSession?.(filePath, err instanceof Error ? err.message : String(err));
     };
 
-    // --- Lock-free fast path (D12, H8, N3) ---
+    // --- Lock-free fast path (D12, H8, N3, H13) ---
+    let cachedFastDigest: {
+      sessionId: string;
+      boardSlug: string;
+      lastSynced: number;
+      revision: number;
+      result: SessionDigestResult;
+    } | null = null;
     const fastMatch = (await this.listAllRawSessions({ skipCorrupt: true, onCorrupt })).find(
       (s) => s.externalRef === params.externalRef,
     );
@@ -3440,6 +4145,13 @@ export class ContextDeckStore {
             events: tailEvents,
             maxLines: params.maxDigestLines,
           });
+          cachedFastDigest = {
+            sessionId: fastMatch.id,
+            boardSlug,
+            lastSynced,
+            revision: config.revision,
+            result: fastDigest,
+          };
 
           if (fastDigest.behindBy === 0 || fastDigest.digest.length === 0) {
             // H8 + R2-2: Fast-forward runtime cursor via bounded locked commit (swallows lock timeout)
@@ -3561,14 +4273,20 @@ export class ContextDeckStore {
           return { action: 'noop' as const };
         }
 
-        const tailEvents = await this.readEventsSince(boardSlug, lastSynced, boardConfig.revision);
-        const digestResult = buildSessionDriftDigest({
-          sessionId: activeExisting.id,
-          lastSyncedRevision: lastSynced,
-          currentRevision: boardConfig.revision,
-          events: tailEvents,
-          maxLines: params.maxDigestLines,
-        });
+        const digestResult =
+          cachedFastDigest &&
+          cachedFastDigest.sessionId === activeExisting.id &&
+          cachedFastDigest.boardSlug === boardSlug &&
+          cachedFastDigest.lastSynced === lastSynced &&
+          cachedFastDigest.revision === boardConfig.revision
+            ? cachedFastDigest.result
+            : buildSessionDriftDigest({
+                sessionId: activeExisting.id,
+                lastSyncedRevision: lastSynced,
+                currentRevision: boardConfig.revision,
+                events: await this.readEventsSince(boardSlug, lastSynced, boardConfig.revision),
+                maxLines: params.maxDigestLines,
+              });
 
         if (digestResult.behindBy === 0 || digestResult.digest.length === 0) {
           // H8 + R2-2: Fast-forward runtime cursor using unlocked helper (workspace lock already held)
@@ -3958,6 +4676,10 @@ export class ContextDeckStore {
       description?: string;
       basedOnDecisions?: string[];
       sessionId?: string | null;
+      jobId?: string;
+      leaseToken?: string;
+      note?: string;
+      now?: Date;
     },
     actor: Actor = DEFAULT_ACTOR,
   ): Promise<Diagram> {
@@ -4038,10 +4760,10 @@ export class ContextDeckStore {
       const mediaDir = await this.safeBoardFilePath(slug, 'media');
       await ensureDir(mediaDir);
 
-      // Stage file bytes OUTSIDE the lock (D1)
+      // Stage file bytes OUTSIDE the lock (D1). Immutable `<id>.v1<ext>` naming (D19).
       if (input.stagedTempPath) {
         const ext = input.fileName ? safeExt(input.fileName) : safeExt(input.stagedTempPath);
-        storedFileName = `${id}${ext}`;
+        storedFileName = `${id}.v1${ext}`;
         // Ensure stagedTempPath lives inside mediaDir (same filesystem for atomic rename);
         // once validated, addMedia owns temp cleanup on every path (H2).
         const canonicalStagedTmp = await canonicalizePath(input.stagedTempPath);
@@ -4052,7 +4774,7 @@ export class ContextDeckStore {
         ownPreStagedTmp = true;
       } else if (input.sourceFilePath) {
         const ext = safeExt(input.sourceFilePath);
-        storedFileName = `${id}${ext}`;
+        storedFileName = `${id}.v1${ext}`;
         const staged = await streamFileToTempFsync(input.sourceFilePath, mediaDir, limit);
         preStagedTmp = staged.tmpPath;
         ownPreStagedTmp = true;
@@ -4061,7 +4783,7 @@ export class ContextDeckStore {
           throw new ValidationError(`Uploaded file exceeds limit of ${limit} bytes.`);
         }
         const ext = input.fileName ? safeExt(input.fileName) : '';
-        storedFileName = `${id}${ext}`;
+        storedFileName = `${id}.v1${ext}`;
         preStagedTmp = await writeTempFileFsync(mediaDir, input.fileBuffer, '.tmp-media-');
         ownPreStagedTmp = true;
       } else if (
@@ -4069,7 +4791,7 @@ export class ContextDeckStore {
         (input.kind === 'doc' || input.kind === 'html' || input.kind === 'json')
       ) {
         const ext = input.kind === 'html' ? '.html' : input.kind === 'json' ? '.json' : '.md';
-        storedFileName = `${id}${ext}`;
+        storedFileName = `${id}.v1${ext}`;
         preStagedTmp = await writeTempFileFsync(mediaDir, input.content, '.tmp-media-');
         ownPreStagedTmp = true;
       }
@@ -4085,6 +4807,16 @@ export class ContextDeckStore {
           summary: `Attached ${input.kind} artifact "${input.title}"`,
         });
 
+        const basedOnDecisions = input.basedOnDecisions ?? [];
+        const versionEntry = ArtifactVersionEntrySchema.parse({
+          version: 1,
+          updatedAt: now,
+          boardRevision: ev.revision,
+          actor: eventActor,
+          basedOnDecisions,
+          ...(storedFileName ? { filePath: storedFileName } : {}),
+        });
+
         const artifact = MediaArtifactSchema.parse({
           id,
           title: input.title,
@@ -4097,7 +4829,10 @@ export class ContextDeckStore {
           chapters: input.chapters ?? [],
           durationSec: input.durationSec,
           tags: input.tags ?? [],
-          basedOnDecisions: input.basedOnDecisions ?? [],
+          basedOnDecisions,
+          version: 1,
+          history: [versionEntry],
+          confirmations: {},
           sessionId,
           boardRevisionAtUpdate: ev.revision,
           customLensId: input.customLensId,
@@ -4167,17 +4902,90 @@ export class ContextDeckStore {
         | 'content'
         | 'transcript'
         | 'chapters'
+        | 'durationSec'
         | 'tags'
         | 'basedOnDecisions'
         | 'externalUrl'
         | 'metadata'
       >
-    >,
+    > & {
+      mimeType?: string;
+      sourceFilePath?: string;
+      stagedTempPath?: string;
+      fileBuffer?: Buffer;
+      fileName?: string;
+      maxBytes?: number;
+      jobId?: string;
+      leaseToken?: string;
+      note?: string;
+      now?: Date;
+    },
     actor: Actor = DEFAULT_ACTOR,
   ): Promise<MediaArtifact> {
-    return this.mutate(boardSlug, actor, (tx) =>
-      this.updateMediaUnlocked(tx, mediaId, patch as Record<string, unknown>),
-    );
+    validateEntityId(mediaId, 'mediaId');
+    const {
+      sourceFilePath,
+      stagedTempPath,
+      fileBuffer,
+      fileName,
+      mimeType,
+      maxBytes,
+      now: nowOpt,
+      ...metadataPatch
+    } = patch;
+    const limit = maxBytes ?? this.maxMediaBytes;
+
+    let preStagedTmp: string | undefined;
+    let stagedExt = '';
+    let ownPreStagedTmp = false;
+
+    const safeExt = (rawName: string): string => {
+      const ext = path.extname(rawName).toLowerCase();
+      return /^\.[a-z0-9]{1,12}$/.test(ext) ? ext : '';
+    };
+
+    try {
+      const slug = await this.resolveBoardSlug(boardSlug);
+      await this.readBoardConfig(slug);
+      const mediaDir = await this.safeBoardFilePath(slug, 'media');
+      await ensureDir(mediaDir);
+
+      // Stage big binary files OUTSIDE the workspace lock (D1, D17, D19)
+      if (stagedTempPath) {
+        stagedExt = fileName ? safeExt(fileName) : safeExt(stagedTempPath);
+        const canonicalStagedTmp = await canonicalizePath(stagedTempPath);
+        preStagedTmp = await assertContainedPath(mediaDir, canonicalStagedTmp, {
+          label: 'staged media update file',
+        });
+        ownPreStagedTmp = true;
+      } else if (sourceFilePath) {
+        stagedExt = safeExt(sourceFilePath);
+        const staged = await streamFileToTempFsync(sourceFilePath, mediaDir, limit);
+        preStagedTmp = staged.tmpPath;
+        ownPreStagedTmp = true;
+      } else if (fileBuffer) {
+        if (fileBuffer.length > limit) {
+          throw new ValidationError(`Uploaded file exceeds limit of ${limit} bytes.`);
+        }
+        stagedExt = fileName ? safeExt(fileName) : '';
+        preStagedTmp = await writeTempFileFsync(mediaDir, fileBuffer, '.tmp-media-');
+        ownPreStagedTmp = true;
+      }
+
+      const stagedBinary = preStagedTmp
+        ? { tmpPath: preStagedTmp, ext: stagedExt, mimeType }
+        : undefined;
+
+      return await this.mutate(slug, actor, (tx) =>
+        this.updateMediaUnlocked(tx, mediaId, metadataPatch as Record<string, unknown>, undefined, stagedBinary, nowOpt),
+      );
+    } catch (err) {
+      const txnExists = existsSync(path.join(this.runtimeDir, TXN_FILENAME));
+      if (!txnExists && ownPreStagedTmp && preStagedTmp) {
+        await fs.rm(preStagedTmp, { force: true }).catch(() => {});
+      }
+      throw err;
+    }
   }
 
   public async deleteMedia(
@@ -4195,20 +5003,138 @@ export class ContextDeckStore {
         { label: `media meta "${mediaId}"` },
       );
       tx.stageDelete(metaPath);
-      if (existing?.filePath) {
-        const assetPath = await assertContainedPath(
-          mediaDir,
-          path.join(mediaDir, existing.filePath),
-          { label: `media file "${mediaId}"` },
-        );
+
+      // D19: Delete removes ALL immutable versions `<id>.v<N>.<ext>` + current filePath + history filePaths
+      const filesToDelete = new Set<string>();
+      if (existing?.filePath) filesToDelete.add(existing.filePath);
+      for (const h of existing?.history ?? []) {
+        if (h.filePath) filesToDelete.add(h.filePath);
+      }
+      const allMediaFiles = await listFilesStrict(mediaDir);
+      const versionRegex = new RegExp(`^${mediaId}\\.v\\d+(?:\\.[a-z0-9]{1,12})?$`);
+      for (const file of allMediaFiles) {
+        if (versionRegex.test(file)) {
+          filesToDelete.add(file);
+        }
+      }
+
+      for (const relFile of filesToDelete) {
+        const assetPath = await assertContainedPath(mediaDir, path.join(mediaDir, relFile), {
+          label: `media file "${relFile}"`,
+        });
         tx.stageDelete(assetPath);
       }
+
       tx.addEvent({
         kind: 'media.deleted',
         entityId: mediaId,
         summary: `Removed media artifact ${mediaId}`,
       });
     });
+  }
+
+  /**
+   * Prune historical `<id>.v<N>.<ext>` media files (AC7.6, D19).
+   * Keeps the active `filePath`, the newest `keepVersions` files per artifact, and
+   * NEVER removes versions referenced by open (`queued` or `claimed`) jobs.
+   */
+  public async pruneMedia(
+    boardSlug?: string,
+    options: { keepVersions?: number; dryRun?: boolean } = {},
+  ): Promise<{ prunedFiles: string[]; keptFiles: string[]; freedBytes: number }> {
+    const keepVersions = Math.max(1, options.keepVersions ?? 1);
+    const dryRun = Boolean(options.dryRun);
+    const slug = await this.resolveBoardSlug(boardSlug);
+
+    return withWorkspaceLock(
+      this.runtimeDir,
+      async (assertActive) => {
+        await this.readBoardConfig(slug);
+        const mediaDir = await this.safeBoardFilePath(slug, 'media');
+        const [artifacts, jobs, allFiles] = await Promise.all([
+          this.listMedia(slug, { loadContent: false }),
+          this.listJobsRaw(slug),
+          listFilesStrict(mediaDir),
+        ]);
+
+        const openJobsByMedia = new Map<string, RefreshJob[]>();
+        for (const job of jobs) {
+          if (job.artifactType !== 'media') continue;
+          if (job.status !== 'queued' && job.status !== 'claimed') continue;
+          const arr = openJobsByMedia.get(job.artifactId) ?? [];
+          arr.push(job);
+          openJobsByMedia.set(job.artifactId, arr);
+        }
+
+        const protectedFiles = new Set<string>();
+        const candidateVersionFiles: Array<{ file: string; mediaId: string; version: number }> = [];
+        const versionPattern = /^([A-Za-z0-9][A-Za-z0-9_-]{0,80})\.v([1-9]\d*)(?:\.[a-z0-9]{1,12})?$/;
+
+        for (const art of artifacts) {
+          if (art.filePath) protectedFiles.add(art.filePath);
+          const openJobs = openJobsByMedia.get(art.id) ?? [];
+          const openJobIds = new Set(openJobs.map((j) => j.id));
+          for (const openJob of openJobs) {
+            if (openJob.inputFilePath) {
+              protectedFiles.add(openJob.inputFilePath);
+            }
+          }
+          const minProtectedVer =
+            openJobs.length > 0 ? Math.min(...openJobs.map((j) => j.baseVersion)) : Infinity;
+
+          for (const h of art.history) {
+            if (!h.filePath) continue;
+            if (h.version >= minProtectedVer || (h.createdByJob && openJobIds.has(h.createdByJob))) {
+              protectedFiles.add(h.filePath);
+            }
+          }
+
+          const versionsOnDisk: Array<{ file: string; version: number }> = [];
+          for (const file of allFiles) {
+            if (file.endsWith('.meta.yaml')) continue;
+            const m = file.match(versionPattern);
+            if (!m || m[1] !== art.id) continue;
+            const ver = Number.parseInt(m[2], 10);
+            if (ver >= minProtectedVer) {
+              protectedFiles.add(file);
+            }
+            versionsOnDisk.push({ file, version: ver });
+          }
+
+          versionsOnDisk.sort((a, b) => b.version - a.version);
+          for (const keep of versionsOnDisk.slice(0, keepVersions)) {
+            protectedFiles.add(keep.file);
+          }
+          for (const item of versionsOnDisk) {
+            candidateVersionFiles.push({ file: item.file, mediaId: art.id, version: item.version });
+          }
+        }
+
+        const prunedFiles: string[] = [];
+        const keptFiles: string[] = [];
+        let freedBytes = 0;
+
+        for (const cand of candidateVersionFiles) {
+          if (protectedFiles.has(cand.file)) {
+            keptFiles.push(cand.file);
+            continue;
+          }
+          const absPath = await assertContainedPath(mediaDir, path.join(mediaDir, cand.file), {
+            label: `prune media "${cand.file}"`,
+          });
+          const st = await fs.stat(absPath).catch(() => null);
+          if (!dryRun) {
+            assertActive();
+            await fs.rm(absPath, { force: true });
+          }
+          prunedFiles.push(cand.file);
+          if (st) freedBytes += st.size;
+        }
+
+        return { prunedFiles: prunedFiles.sort(), keptFiles: keptFiles.sort(), freedBytes };
+      },
+      this.deckDir,
+    );
   }
 
   public async resolveMediaFilePath(
@@ -4244,12 +5170,118 @@ export class ContextDeckStore {
     return this.mutate(boardSlug, actor, (tx) => this.createQuizUnlocked(tx, input));
   }
 
+  /**
+   * Update a quiz while preserving all existing attempts (AC7.6, D17).
+   * Bumps version and records history (capped at 10). Validates jobId if linked to a refresh job.
+   */
+  public async updateQuiz(
+    boardSlug: string | undefined,
+    quizId: string,
+    rawPatch: {
+      title?: string;
+      topic?: string;
+      description?: string;
+      questions?: QuizQuestion[];
+      basedOnDecisions?: string[];
+      jobId?: string;
+      leaseToken?: string;
+      note?: string;
+      now?: Date;
+    },
+    actor: Actor = DEFAULT_ACTOR,
+  ): Promise<Quiz> {
+    validateEntityId(quizId, 'quizId');
+    const { now: nowOpt, ...schemaPatch } = rawPatch;
+    const patch = parseStrict(UpdateQuizPatchSchema.omit({ actor: true }), schemaPatch, 'quiz update');
+    const nowDate = nowOpt ?? new Date();
+    const now = nowDate.toISOString();
+
+    return this.mutate(boardSlug, actor, async (tx) => {
+      const existing = await this.readQuizById(tx.slug, quizId);
+      if (!existing) {
+        throw new NotFoundError(`Quiz "${quizId}" not found on board "${tx.slug}".`);
+      }
+
+      const activeClaim = await this.validateActiveJobClaim(
+        tx.slug,
+        patch.jobId,
+        patch.leaseToken,
+        'quiz',
+        existing.id,
+        nowDate.getTime(),
+      );
+      if (activeClaim) {
+        if (
+          !patch.questions ||
+          JSON.stringify(patch.questions) === JSON.stringify(existing.questions)
+        ) {
+          throw new ValidationError(
+            'Cannot record refresh job version for quiz without updated questions.',
+          );
+        }
+      }
+
+      const nextVersion = existing.version + 1;
+      const nextQuestions = patch.questions ?? existing.questions;
+      const nextBasedOn = patch.basedOnDecisions ?? existing.basedOnDecisions;
+      const ev = tx.addEvent({
+        kind: 'quiz.updated',
+        entityId: existing.id,
+        summary: `Updated quiz "${patch.title ?? existing.title}" (v${nextVersion})`,
+      });
+
+      const versionEntry = ArtifactVersionEntrySchema.parse({
+        version: nextVersion,
+        updatedAt: now,
+        boardRevision: ev.revision,
+        actor: tx.actor,
+        basedOnDecisions: nextBasedOn,
+        contentHash: ContextDeckStore.sha256Hex(JSON.stringify(nextQuestions)),
+        ...(activeClaim
+          ? { createdByJob: activeClaim.job.id, createdByClaim: activeClaim.claimFingerprint }
+          : {}),
+        ...(patch.note ? { note: patch.note } : {}),
+      });
+
+      const questionsChanged =
+        patch.questions !== undefined &&
+        JSON.stringify(patch.questions) !== JSON.stringify(existing.questions);
+      const allowedConfDecisions = [
+        ...nextBasedOn,
+        ...nextQuestions.flatMap((q) => q.relatedDecisionIds ?? []),
+      ];
+
+      const updated = QuizSchema.parse({
+        ...existing,
+        ...(patch.title !== undefined ? { title: patch.title } : {}),
+        ...(patch.topic !== undefined ? { topic: patch.topic } : {}),
+        ...(patch.description !== undefined ? { description: patch.description } : {}),
+        questions: nextQuestions,
+        // D17: Always preserve attempts across quiz updates
+        attempts: existing.attempts,
+        basedOnDecisions: nextBasedOn,
+        version: nextVersion,
+        history: appendArtifactHistory(existing, versionEntry),
+        confirmations: questionsChanged
+          ? {}
+          : retainRelevantConfirmations(existing.confirmations, allowedConfDecisions),
+        boardRevisionAtUpdate: ev.revision,
+        updatedAt: now,
+      });
+
+      const quizPath = await this.safeBoardFilePath(tx.slug, 'quizzes', `${updated.id}.quiz.json`);
+      tx.stageFile(quizPath, `${JSON.stringify(updated, null, 2)}\n`);
+      return updated;
+    });
+  }
+
   public async submitQuizAttempt(
     boardSlug: string | undefined,
     quizId: string,
     rawInput: {
       answers: Record<string, number | string | boolean>;
       confidence?: number;
+      quizVersion?: number;
     },
     actor: Actor = { type: 'human', label: 'user' },
   ): Promise<{ quiz: Quiz; attempt: QuizAttempt }> {
@@ -4261,11 +5293,36 @@ export class ContextDeckStore {
       if (!quiz) {
         throw new NotFoundError(`Quiz "${quizId}" not found on board "${tx.slug}".`);
       }
+      // R2-5: Bind submission to displayed quizVersion under the mutation lock so
+      // answers from an older version can never be silently graded against newer keys.
+      const currentVersion = quiz.version ?? 1;
+      if (input.quizVersion !== undefined) {
+        if (input.quizVersion !== currentVersion) {
+          throw new ConflictError(
+            `Quiz "${quiz.id}" is now at version ${currentVersion}, not version ${input.quizVersion}. Reload the quiz before submitting.`,
+            {
+              reason: 'quiz_version_mismatch',
+              currentVersion,
+              submittedVersion: input.quizVersion,
+            },
+          );
+        }
+      } else if (currentVersion > 1) {
+        throw new ConflictError(
+          `Quiz "${quiz.id}" is at version ${currentVersion}; quizVersion is required when submitting answers to an updated quiz.`,
+          {
+            reason: 'quiz_version_mismatch',
+            currentVersion,
+          },
+        );
+      }
+
       const quizPath = await this.safeBoardFilePath(tx.slug, 'quizzes', `${quiz.id}.quiz.json`);
       const { score, total, percentage } = scoreQuizAttempt(quiz.questions, input.answers);
       const attempt = QuizAttemptSchema.parse({
         id: shortId('att'),
         takenAt: nowIso(),
+        quizVersion: currentVersion,
         score,
         total,
         percentage,
@@ -4290,87 +5347,729 @@ export class ContextDeckStore {
     });
   }
 
-  public async refreshArtifactDecisions(
+  /**
+   * Record a confirmation that a stale artifact (diagram, media, or quiz) is still accurate
+   * against the current superseding decision(s), WITHOUT rewriting `basedOnDecisions` (AC7.3, D14, D17).
+   * Drift clears only while the latest replacement equals `againstDecisionId` (auto re-stale on next supersede).
+   * Tasks are NOT refresh/confirm targets (D17).
+   */
+  public async confirmArtifact(
     boardSlug: string | undefined,
-    artifactType: 'diagram' | 'media' | 'quiz' | 'task',
+    artifactType: RefreshJobArtifactType,
     artifactId: string,
+    rawInput: {
+      note?: string;
+      decisionIds?: string[];
+      artifactVersion?: number;
+      expectedAgainst?: Record<string, string>;
+    } = {},
     actor: Actor = DEFAULT_ACTOR,
-  ): Promise<void> {
+  ): Promise<Diagram | MediaArtifact | Quiz> {
+    const validType = parseStrict(RefreshJobArtifactTypeSchema, artifactType, 'artifactType');
     validateEntityId(artifactId, 'artifactId');
+    const input = parseStrict(ConfirmArtifactInputSchema.omit({ actor: true }), rawInput, 'artifact confirmation');
 
-    await this.mutate(boardSlug, actor, async (tx) => {
+    return this.mutate(boardSlug, actor, async (tx) => {
       const decisions = await this.listDecisions(tx.slug);
-      const map = new Map(decisions.map((d) => [d.id, d]));
+      const decisionMap = new Map(decisions.map((d) => [d.id, d]));
+      const now = nowIso();
+      const actorType: 'human' | 'agent' = tx.actor.type === 'human' ? 'human' : 'agent';
+      const confirmedBy =
+        tx.actor.label ??
+        (tx.actor.harness ? `${tx.actor.harness}${tx.actor.sessionId ? `:${tx.actor.sessionId}` : ''}` : undefined) ??
+        tx.actor.sessionId ??
+        actorType;
 
-      const upgradeDecisionIds = (ids: string[]): string[] => {
-        const next = new Set<string>();
-        for (const id of ids) {
-          let cur = map.get(id);
-          const seen = new Set<string>();
-          while (cur?.supersededBy && !seen.has(cur.id)) {
-            seen.add(cur.id);
-            const replacement = map.get(cur.supersededBy);
-            if (!replacement) break;
-            cur = replacement;
+      const buildConfirmations = (
+        currentVersion: number,
+        existingConfirmations: Record<string, ArtifactConfirmation>,
+        referencedDecisionIds: string[],
+      ): {
+        nextConfirmations: Record<string, ArtifactConfirmation>;
+        confirmedAgainst: Array<{ staleId: string; againstId: string }>;
+      } => {
+        // H9: Reject confirmation if the artifact changed since display
+        if (input.artifactVersion !== undefined && currentVersion !== input.artifactVersion) {
+          throw new ConflictError(
+            `Artifact "${artifactId}" is now at version ${currentVersion}, not displayed version ${input.artifactVersion}. Refetch before confirming.`,
+          );
+        }
+
+        const { staleIds } = evaluateDecisionStaleness(
+          referencedDecisionIds,
+          decisionMap,
+          existingConfirmations,
+        );
+        const targetIds = input.decisionIds
+          ? staleIds.filter((id) => input.decisionIds!.includes(id))
+          : staleIds;
+
+        // H10: Never bump board revision or append events when nothing is stale
+        if (targetIds.length === 0) {
+          throw new ValidationError(
+            `Artifact "${artifactId}" has no stale decisions to confirm.`,
+          );
+        }
+
+        const nextConfirmations: Record<string, ArtifactConfirmation> = { ...existingConfirmations };
+        const confirmedAgainst: Array<{ staleId: string; againstId: string }> = [];
+        const resolvedMap = new Map<string, string>();
+
+        for (const staleId of targetIds) {
+          const dec = decisionMap.get(staleId);
+          if (!dec) continue;
+          const latest =
+            dec.status === 'superseded' ? resolveLatestDecision(dec.id, decisionMap) : dec;
+          const againstId = latest?.id ?? dec.id;
+          resolvedMap.set(staleId, againstId);
+          nextConfirmations[staleId] = ArtifactConfirmationSchema.parse({
+            againstDecisionId: againstId,
+            confirmedBy,
+            actorType,
+            confirmedAt: now,
+            note: input.note ?? '',
+          });
+          confirmedAgainst.push({ staleId, againstId });
+        }
+
+        if (confirmedAgainst.length === 0) {
+          throw new ValidationError(
+            `Artifact "${artifactId}" has no stale decisions to confirm.`,
+          );
+        }
+
+        // H9: Reject if any stale decision now resolves to a newer replacement than what the caller displayed
+        if (input.expectedAgainst !== undefined) {
+          for (const [staleId, actualAgainstId] of resolvedMap.entries()) {
+            const expectedId = input.expectedAgainst[staleId];
+            if (expectedId !== actualAgainstId) {
+              throw new ConflictError(
+                `Stale decision "${staleId}" now resolves to "${actualAgainstId}", not expected "${expectedId ?? 'none'}". Refetch before confirming.`,
+              );
+            }
           }
-          if (cur && cur.status !== 'deprecated') {
-            next.add(cur.id);
+          for (const expectedStaleId of Object.keys(input.expectedAgainst)) {
+            if (!resolvedMap.has(expectedStaleId)) {
+              throw new ConflictError(
+                `Expected stale decision "${expectedStaleId}" is no longer pending confirmation on "${artifactId}". Refetch before confirming.`,
+              );
+            }
           }
         }
-        return Array.from(next);
+
+        return { nextConfirmations, confirmedAgainst };
       };
 
-      if (artifactType === 'diagram') {
+      if (validType === 'diagram') {
         const item = await this.readDiagramById(tx.slug, artifactId);
         if (!item) throw new NotFoundError(`Diagram "${artifactId}" not found.`);
-        await this.upsertDiagramUnlocked(tx, {
-          id: item.id,
-          title: item.title,
-          kind: item.kind,
-          content: item.content,
-          description: item.description,
-          basedOnDecisions: upgradeDecisionIds(item.basedOnDecisions),
+        const { nextConfirmations, confirmedAgainst } = buildConfirmations(
+          item.version,
+          item.confirmations,
+          item.basedOnDecisions,
+        );
+        const updated = DiagramSchema.parse({
+          ...item,
+          confirmations: nextConfirmations,
+          updatedAt: now,
         });
-        return;
+        const { content: _content, ...meta } = updated;
+        const metaPath = await this.safeBoardFilePath(tx.slug, 'diagrams', `${updated.id}.meta.yaml`);
+        tx.stageFile(metaPath, dumpYaml(meta));
+        tx.addEvent({
+          kind: 'artifact.confirmed',
+          entityId: updated.id,
+          summary: `Confirmed diagram "${updated.title}" still accurate (${actorType}: ${confirmedBy})`,
+          details: {
+            artifactType: 'diagram',
+            artifactId: updated.id,
+            actorType,
+            confirmedBy,
+            confirmedAgainst,
+            note: input.note ?? '',
+          },
+        });
+        return updated;
       }
 
-      if (artifactType === 'media') {
-        const item = await this.readMediaById(tx.slug, artifactId, { loadContent: false });
+      if (validType === 'media') {
+        const item = await this.readMediaById(tx.slug, artifactId, { loadContent: true });
         if (!item) throw new NotFoundError(`Media "${artifactId}" not found.`);
-        await this.updateMediaUnlocked(tx, artifactId, {
-          basedOnDecisions: upgradeDecisionIds(item.basedOnDecisions),
+        const { nextConfirmations, confirmedAgainst } = buildConfirmations(
+          item.version,
+          item.confirmations,
+          item.basedOnDecisions,
+        );
+        const updated = MediaArtifactSchema.parse({
+          ...item,
+          confirmations: nextConfirmations,
+          updatedAt: now,
         });
-        return;
+        const mediaDir = await this.safeBoardFilePath(tx.slug, 'media');
+        const metaPath = await assertContainedPath(
+          mediaDir,
+          path.join(mediaDir, `${updated.id}.meta.yaml`),
+          { label: `media meta "${updated.id}"` },
+        );
+        const { content: _inlineContent, ...metaOnly } = updated;
+        tx.stageFile(metaPath, dumpYaml(updated.filePath ? metaOnly : updated));
+        tx.addEvent({
+          kind: 'artifact.confirmed',
+          entityId: updated.id,
+          summary: `Confirmed ${updated.kind} "${updated.title}" still accurate (${actorType}: ${confirmedBy})`,
+          details: {
+            artifactType: 'media',
+            artifactId: updated.id,
+            actorType,
+            confirmedBy,
+            confirmedAgainst,
+            note: input.note ?? '',
+          },
+        });
+        return updated;
       }
 
-      if (artifactType === 'task') {
-        const item = await this.readTaskById(tx.slug, artifactId);
-        if (!item) throw new NotFoundError(`Task "${artifactId}" not found.`);
-        await this.upsertTaskUnlocked(tx, {
-          id: item.id,
-          title: item.title,
-          linkedDecisionIds: upgradeDecisionIds(item.linkedDecisionIds),
-        });
-        return;
+      const quiz = await this.readQuizById(tx.slug, artifactId);
+      if (!quiz) throw new NotFoundError(`Quiz "${artifactId}" not found.`);
+      const allQuizDecs = [
+        ...quiz.basedOnDecisions,
+        ...quiz.questions.flatMap((q) => q.relatedDecisionIds ?? []),
+      ];
+      const { nextConfirmations, confirmedAgainst } = buildConfirmations(
+        quiz.version,
+        quiz.confirmations,
+        allQuizDecs,
+      );
+      const updated = QuizSchema.parse({
+        ...quiz,
+        confirmations: nextConfirmations,
+        updatedAt: now,
+      });
+      const quizPath = await this.safeBoardFilePath(tx.slug, 'quizzes', `${updated.id}.quiz.json`);
+      tx.stageFile(quizPath, `${JSON.stringify(updated, null, 2)}\n`);
+      tx.addEvent({
+        kind: 'artifact.confirmed',
+        entityId: updated.id,
+        summary: `Confirmed quiz "${updated.title}" still accurate (${actorType}: ${confirmedBy})`,
+        details: {
+          artifactType: 'quiz',
+          artifactId: updated.id,
+          actorType,
+          confirmedBy,
+          confirmedAgainst,
+          note: input.note ?? '',
+        },
+      });
+      return updated;
+    });
+  }
+
+  /**
+   * Queue a refresh job for a stale artifact (diagram, media, or quiz) with active-job dedupe (AC7.4, D19).
+   */
+  public async createRefreshJob(
+    boardSlug: string | undefined,
+    rawInput: {
+      artifactType: RefreshJobArtifactType;
+      artifactId: string;
+      reason?: string;
+    },
+    actor: Actor = DEFAULT_ACTOR,
+  ): Promise<{ job: PublicRefreshJob; deduplicated: boolean }> {
+    const input = parseStrict(CreateRefreshJobInputSchema.omit({ actor: true }), rawInput, 'refresh job');
+
+    return this.mutate(boardSlug, actor, async (tx) => {
+      // Dedupe active (queued or claimed) jobs per artifact (D19, R2-3: always redact lease fields)
+      const existingJobs = await this.listJobsRaw(tx.slug);
+      const active = existingJobs.find(
+        (j) =>
+          j.artifactType === input.artifactType &&
+          j.artifactId === input.artifactId &&
+          (j.status === 'queued' || j.status === 'claimed'),
+      );
+      if (active) {
+        return { job: redactJobLease(active), deduplicated: true };
       }
 
-      if (artifactType === 'quiz') {
-        const quiz = await this.readQuizById(tx.slug, artifactId);
-        if (!quiz) throw new NotFoundError(`Quiz "${artifactId}" not found.`);
-        const quizPath = await this.safeBoardFilePath(tx.slug, 'quizzes', `${quiz.id}.quiz.json`);
-        const ev = tx.addEvent({
-          kind: 'artifact.refreshed',
-          entityId: quiz.id,
-          summary: `Marked quiz "${quiz.title}" aligned with latest decisions`,
-        });
-        const updated: Quiz = {
-          ...quiz,
-          basedOnDecisions: upgradeDecisionIds(quiz.basedOnDecisions),
-          boardRevisionAtUpdate: ev.revision,
-          updatedAt: nowIso(),
-        };
-        tx.stageFile(quizPath, `${JSON.stringify(updated, null, 2)}\n`);
+      const decisions = await this.listDecisions(tx.slug);
+      const decisionMap = new Map(decisions.map((d) => [d.id, d]));
+
+      let artifactTitle: string;
+      let baseVersion: number;
+      let basedOnDecisions: string[];
+      let mediaKind: MediaKind | undefined;
+      let diagramKind: DiagramKind | undefined;
+      let inputFilePath: string | undefined;
+      let inputContentHash: string | undefined;
+      let kindLabel: string = input.artifactType;
+
+      if (input.artifactType === 'diagram') {
+        const diag = await this.readDiagramById(tx.slug, input.artifactId);
+        if (!diag) throw new NotFoundError(`Diagram "${input.artifactId}" not found.`);
+        artifactTitle = diag.title;
+        baseVersion = diag.version;
+        basedOnDecisions = diag.basedOnDecisions;
+        diagramKind = diag.kind;
+        inputContentHash = ContextDeckStore.sha256Hex(diag.content);
+        kindLabel = `${diag.kind} diagram`;
+      } else if (input.artifactType === 'media') {
+        const media = await this.readMediaById(tx.slug, input.artifactId, { loadContent: true });
+        if (!media) throw new NotFoundError(`Media "${input.artifactId}" not found.`);
+        artifactTitle = media.title;
+        baseVersion = media.version;
+        basedOnDecisions = media.basedOnDecisions;
+        mediaKind = media.kind;
+        inputFilePath = media.filePath;
+        if (media.content !== undefined) {
+          inputContentHash = ContextDeckStore.sha256Hex(media.content);
+        } else if (media.history.at(-1)?.contentHash) {
+          inputContentHash = media.history.at(-1)?.contentHash;
+        }
+        kindLabel = media.kind;
+      } else {
+        const quiz = await this.readQuizById(tx.slug, input.artifactId);
+        if (!quiz) throw new NotFoundError(`Quiz "${input.artifactId}" not found.`);
+        artifactTitle = quiz.title;
+        baseVersion = quiz.version;
+        basedOnDecisions = [
+          ...quiz.basedOnDecisions,
+          ...quiz.questions.flatMap((q) => q.relatedDecisionIds ?? []),
+        ];
+        inputContentHash = ContextDeckStore.sha256Hex(JSON.stringify(quiz.questions));
+        kindLabel = 'quiz';
       }
+
+      const { staleIds } = evaluateDecisionStaleness(basedOnDecisions, decisionMap);
+      const decisionsBefore = staleIds.length > 0 ? staleIds : Array.from(new Set(basedOnDecisions));
+      const decisionsNowSet = new Set<string>();
+      for (const decId of decisionsBefore) {
+        const latest = resolveLatestDecision(decId, decisionMap);
+        if (latest) decisionsNowSet.add(latest.id);
+      }
+      const decisionsNow = Array.from(decisionsNowSet);
+
+      const defaultReason =
+        decisionsNow.length > 0
+          ? `regenerate ${kindLabel} "${artifactTitle}" for ${decisionsNow.join(', ')}`
+          : `regenerate ${kindLabel} "${artifactTitle}"`;
+      const reason = input.reason?.trim() || defaultReason;
+
+      const now = nowIso();
+      const id = shortId('job');
+      const job = RefreshJobSchema.parse({
+        id,
+        kind: 'refresh',
+        artifactType: input.artifactType,
+        artifactId: input.artifactId,
+        artifactTitle,
+        ...(mediaKind ? { mediaKind } : {}),
+        ...(diagramKind ? { diagramKind } : {}),
+        reason,
+        decisionsBefore,
+        decisionsNow,
+        baseVersion,
+        ...(inputFilePath ? { inputFilePath } : {}),
+        ...(inputContentHash ? { inputContentHash } : {}),
+        status: 'queued',
+        claimedBy: null,
+        leaseTokenHash: null,
+        claimedAt: null,
+        leaseExpiresAt: null,
+        result: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const jobsDir = await this.safeBoardFilePath(tx.slug, 'jobs');
+      await ensureDir(jobsDir);
+      const jobPath = await assertContainedPath(jobsDir, path.join(jobsDir, `${job.id}.yaml`), {
+        label: `job "${job.id}"`,
+      });
+      tx.stageFile(jobPath, ContextDeckStore.serializeJobForDisk(job), { noClobber: true });
+      tx.addEvent({
+        kind: 'job.created',
+        entityId: job.id,
+        summary: `Refresh job waiting: ${reason}`,
+        details: {
+          artifactType: job.artifactType,
+          artifactId: job.artifactId,
+          artifactTitle: job.artifactTitle,
+          decisionsBefore: job.decisionsBefore,
+          decisionsNow: job.decisionsNow,
+          baseVersion: job.baseVersion,
+        },
+      });
+
+      return { job: redactJobLease(job), deduplicated: false };
+    });
+  }
+
+  /**
+   * Atomically claim a queued (or lease-expired) refresh job with a lease token and 15 min TTL (AC7.4, D19, R2-4).
+   * Persists only `leaseTokenHash` on disk and returns the raw `leaseToken` once to the caller.
+   */
+  public async claimJob(
+    boardSlug: string | undefined,
+    rawInput: {
+      jobId?: string;
+      artifactType?: RefreshJobArtifactType;
+      mediaKind?: MediaKind;
+      claimedBy: string;
+      ttlMs?: number;
+      now?: Date;
+    },
+    actor: Actor = DEFAULT_ACTOR,
+  ): Promise<ClaimedRefreshJob | null> {
+    const { now: nowOpt, ...schemaInput } = rawInput;
+    const input = parseStrict(ClaimJobInputSchema.omit({ actor: true }), schemaInput, 'job claim');
+    const nowDate = nowOpt ?? new Date();
+    const nowMs = nowDate.getTime();
+    const nowStr = nowDate.toISOString();
+    const ttlMs = input.ttlMs ?? DEFAULT_JOB_LEASE_TTL_MS;
+
+    const isClaimable = (job: RefreshJob): boolean => {
+      if (job.status === 'queued') return true;
+      if (job.status === 'claimed' && job.leaseExpiresAt) {
+        const expMs = Date.parse(job.leaseExpiresAt);
+        return Number.isFinite(expMs) && expMs <= nowMs;
+      }
+      return false;
+    };
+
+    return this.mutate(boardSlug, actor, async (tx) => {
+      let target: RefreshJob | null = null;
+      if (input.jobId) {
+        const found = await this.readJobById(tx.slug, input.jobId);
+        if (!found) {
+          throw new NotFoundError(`Refresh job "${input.jobId}" not found on board "${tx.slug}".`);
+        }
+        if (!isClaimable(found)) {
+          throw new ConflictError(
+            `Refresh job "${found.id}" cannot be claimed (status: ${found.status}, active lease until ${found.leaseExpiresAt ?? 'n/a'}).`,
+          );
+        }
+        target = found;
+      } else {
+        const allJobs = await this.listJobsRaw(tx.slug);
+        target =
+          allJobs.find((j) => {
+            if (!isClaimable(j)) return false;
+            if (input.artifactType && j.artifactType !== input.artifactType) return false;
+            if (input.mediaKind && j.mediaKind !== input.mediaKind) return false;
+            return true;
+          }) ?? null;
+        if (!target) return null;
+      }
+
+      const leaseToken = crypto.randomBytes(16).toString('hex');
+      const leaseTokenHash = ContextDeckStore.sha256Hex(leaseToken);
+      const leaseExpiresAt = new Date(nowMs + ttlMs).toISOString();
+      const { leaseToken: _legacyToken, ...cleanTarget } = target;
+      const updated = RefreshJobSchema.parse({
+        ...cleanTarget,
+        status: 'claimed',
+        claimedBy: input.claimedBy,
+        leaseTokenHash,
+        claimedAt: nowStr,
+        leaseExpiresAt,
+        updatedAt: nowStr,
+      });
+
+      const jobPath = await this.safeBoardFilePath(tx.slug, 'jobs', `${updated.id}.yaml`);
+      tx.stageFile(jobPath, ContextDeckStore.serializeJobForDisk(updated));
+      tx.addEvent({
+        kind: 'job.claimed',
+        entityId: updated.id,
+        summary: `Claimed refresh job ${updated.id} by ${input.claimedBy}`,
+      });
+      return { ...redactJobLease(updated), leaseToken };
+    });
+  }
+
+  /**
+   * Renew an active job lease with a matching lease token (D19, R2-4).
+   */
+  public async renewJob(
+    boardSlug: string | undefined,
+    jobId: string,
+    rawInput: { leaseToken: string; ttlMs?: number; now?: Date },
+    actor: Actor = DEFAULT_ACTOR,
+  ): Promise<ClaimedRefreshJob> {
+    validateEntityId(jobId, 'jobId');
+    const { now: nowOpt, ...schemaInput } = rawInput;
+    const input = parseStrict(RenewJobInputSchema.omit({ actor: true }), schemaInput, 'job renew');
+    const nowDate = nowOpt ?? new Date();
+    const nowMs = nowDate.getTime();
+    const nowStr = nowDate.toISOString();
+    const ttlMs = input.ttlMs ?? DEFAULT_JOB_LEASE_TTL_MS;
+
+    return this.mutate(boardSlug, actor, async (tx) => {
+      const existing = await this.readJobById(tx.slug, jobId);
+      if (!existing) {
+        throw new NotFoundError(`Refresh job "${jobId}" not found on board "${tx.slug}".`);
+      }
+      const verifiedHash =
+        existing.status === 'claimed'
+          ? ContextDeckStore.verifyLeaseToken(existing, input.leaseToken)
+          : null;
+      if (!verifiedHash) {
+        throw new ConflictError(`Invalid lease token or job "${jobId}" is not actively claimed.`);
+      }
+      if (existing.leaseExpiresAt && Date.parse(existing.leaseExpiresAt) <= nowMs) {
+        throw new ConflictError(`Lease for refresh job "${jobId}" has already expired.`);
+      }
+
+      const { leaseToken: _legacyToken, ...cleanExisting } = existing;
+      const updated = RefreshJobSchema.parse({
+        ...cleanExisting,
+        leaseTokenHash: verifiedHash,
+        leaseExpiresAt: new Date(nowMs + ttlMs).toISOString(),
+        updatedAt: nowStr,
+      });
+      const jobPath = await this.safeBoardFilePath(tx.slug, 'jobs', `${updated.id}.yaml`);
+      tx.stageFile(jobPath, ContextDeckStore.serializeJobForDisk(updated));
+      tx.addEvent({
+        kind: 'job.renewed',
+        entityId: updated.id,
+        summary: `Renewed lease for refresh job ${updated.id}`,
+      });
+      return { ...redactJobLease(updated), leaseToken: input.leaseToken };
+    });
+  }
+
+  /**
+   * Release a claimed job back to `queued` using its lease token (D19, R2-3, R2-4).
+   */
+  public async releaseJob(
+    boardSlug: string | undefined,
+    jobId: string,
+    rawInput: { leaseToken: string; reason?: string },
+    actor: Actor = DEFAULT_ACTOR,
+  ): Promise<PublicRefreshJob> {
+    validateEntityId(jobId, 'jobId');
+    const input = parseStrict(ReleaseJobInputSchema.omit({ actor: true }), rawInput, 'job release');
+
+    return this.mutate(boardSlug, actor, async (tx) => {
+      const existing = await this.readJobById(tx.slug, jobId);
+      if (!existing) {
+        throw new NotFoundError(`Refresh job "${jobId}" not found on board "${tx.slug}".`);
+      }
+      const verifiedHash =
+        existing.status === 'claimed'
+          ? ContextDeckStore.verifyLeaseToken(existing, input.leaseToken)
+          : null;
+      if (!verifiedHash) {
+        throw new ConflictError(`Invalid lease token or job "${jobId}" is not claimed.`);
+      }
+
+      const { leaseToken: _legacyToken, ...cleanExisting } = existing;
+      const updated = RefreshJobSchema.parse({
+        ...cleanExisting,
+        status: 'queued',
+        claimedBy: null,
+        leaseTokenHash: null,
+        claimedAt: null,
+        leaseExpiresAt: null,
+        updatedAt: nowIso(),
+      });
+      const jobPath = await this.safeBoardFilePath(tx.slug, 'jobs', `${updated.id}.yaml`);
+      tx.stageFile(jobPath, ContextDeckStore.serializeJobForDisk(updated));
+      tx.addEvent({
+        kind: 'job.released',
+        entityId: updated.id,
+        summary: input.reason
+          ? `Released refresh job ${updated.id}: ${input.reason}`
+          : `Released refresh job ${updated.id} back to queue`,
+      });
+      return redactJobLease(updated);
+    });
+  }
+
+  /**
+   * Complete (or fail) a claimed refresh job (AC7.4, D19, R2-3, R2-4).
+   * When completing as `done`, strictly requires that the target artifact has a new version
+   * (`version > baseVersion`) whose history entry has `createdByJob === job.id`.
+   */
+  public async completeJob(
+    boardSlug: string | undefined,
+    jobId: string,
+    rawInput: {
+      leaseToken: string;
+      status?: 'done' | 'failed';
+      artifactVersion?: number;
+      summary?: string;
+      error?: string;
+      now?: Date;
+    },
+    actor: Actor = DEFAULT_ACTOR,
+  ): Promise<PublicRefreshJob> {
+    validateEntityId(jobId, 'jobId');
+    const { now: nowOpt, ...schemaInput } = rawInput;
+    const input = parseStrict(CompleteJobInputSchema.omit({ actor: true }), schemaInput, 'job complete');
+    const nowDate = nowOpt ?? new Date();
+    const nowMs = nowDate.getTime();
+    const nowStr = nowDate.toISOString();
+    const targetStatus = input.status ?? 'done';
+
+    return this.mutate(boardSlug, actor, async (tx) => {
+      const existing = await this.readJobById(tx.slug, jobId);
+      if (!existing) {
+        throw new NotFoundError(`Refresh job "${jobId}" not found on board "${tx.slug}".`);
+      }
+      const verifiedHash =
+        existing.status === 'claimed'
+          ? ContextDeckStore.verifyLeaseToken(existing, input.leaseToken)
+          : null;
+      if (!verifiedHash) {
+        throw new ConflictError(`Invalid lease token or job "${jobId}" is not claimed.`);
+      }
+      if (existing.leaseExpiresAt && Date.parse(existing.leaseExpiresAt) <= nowMs) {
+        throw new ConflictError(`Lease for refresh job "${jobId}" has expired; reclaim before completing.`);
+      }
+
+      const { leaseToken: _legacyToken, ...cleanExisting } = existing;
+
+      if (targetStatus === 'failed') {
+        const failed = RefreshJobSchema.parse({
+          ...cleanExisting,
+          status: 'failed',
+          leaseTokenHash: null,
+          leaseExpiresAt: null,
+          result: {
+            ...(input.error ? { error: input.error } : {}),
+            ...(input.summary ? { summary: input.summary } : {}),
+          },
+          updatedAt: nowStr,
+        });
+        const jobPath = await this.safeBoardFilePath(tx.slug, 'jobs', `${failed.id}.yaml`);
+        tx.stageFile(jobPath, ContextDeckStore.serializeJobForDisk(failed));
+        tx.addEvent({
+          kind: 'job.failed',
+          entityId: failed.id,
+          summary: `Refresh job ${failed.id} failed${input.error ? `: ${input.error}` : ''}`,
+        });
+        return redactJobLease(failed);
+      }
+
+      // D19 / AC7.4 strict verification: artifact must have version > baseVersion,
+      // createdByJob === job.id AND createdByClaim === fingerprint(leaseTokenHash),
+      // and must have changed the underlying media file / diagram content / quiz questions.
+      const expectedClaim = ContextDeckStore.computeClaimFingerprintFromHash(verifiedHash);
+      let artifactVersion: number;
+      let history: ArtifactVersionEntry[];
+      let currentDiagram: Diagram | null = null;
+      let currentMedia: MediaArtifact | null = null;
+      let currentQuiz: Quiz | null = null;
+      if (existing.artifactType === 'diagram') {
+        const diag = await this.readDiagramById(tx.slug, existing.artifactId);
+        if (!diag) throw new NotFoundError(`Target diagram "${existing.artifactId}" no longer exists.`);
+        currentDiagram = diag;
+        artifactVersion = diag.version;
+        history = diag.history;
+      } else if (existing.artifactType === 'media') {
+        const media = await this.readMediaById(tx.slug, existing.artifactId, { loadContent: true });
+        if (!media) throw new NotFoundError(`Target media "${existing.artifactId}" no longer exists.`);
+        currentMedia = media;
+        artifactVersion = media.version;
+        history = media.history;
+      } else {
+        const quiz = await this.readQuizById(tx.slug, existing.artifactId);
+        if (!quiz) throw new NotFoundError(`Target quiz "${existing.artifactId}" no longer exists.`);
+        currentQuiz = quiz;
+        artifactVersion = quiz.version;
+        history = quiz.history;
+      }
+
+      const claimedVersion = input.artifactVersion ?? artifactVersion;
+      if (artifactVersion <= existing.baseVersion || claimedVersion <= existing.baseVersion) {
+        throw new ValidationError(
+          `Cannot complete refresh job "${existing.id}": artifact version (${claimedVersion}) must be greater than baseVersion (${existing.baseVersion}).`,
+        );
+      }
+
+      const matchingEntry = history.find(
+        (h) =>
+          h.version === claimedVersion &&
+          h.createdByJob === existing.id &&
+          h.createdByClaim === expectedClaim,
+      );
+      if (!matchingEntry) {
+        throw new ValidationError(
+          `Cannot complete refresh job "${existing.id}": artifact version ${claimedVersion} was not created by the active claim for job "${existing.id}".`,
+        );
+      }
+
+      if (currentMedia) {
+        const isFileBackedAv =
+          (currentMedia.kind === 'video' || currentMedia.kind === 'audio') &&
+          Boolean(existing.inputFilePath || currentMedia.filePath);
+        if (isFileBackedAv) {
+          if (!matchingEntry.filePath || matchingEntry.filePath === existing.inputFilePath) {
+            throw new ValidationError(
+              `Cannot complete refresh job "${existing.id}": file-backed ${currentMedia.kind} version ${claimedVersion} did not produce a new media file.`,
+            );
+          }
+        } else if (
+          currentMedia.kind === 'doc' ||
+          currentMedia.kind === 'html' ||
+          currentMedia.kind === 'json'
+        ) {
+          // R2-6: Compare contentHash unconditionally (without filePath equality gate)
+          // so A -> Temp -> A and identical-file doc/html/json refreshes are always rejected.
+          const currentHash =
+            matchingEntry.contentHash ??
+            (currentMedia.content !== undefined
+              ? ContextDeckStore.sha256Hex(currentMedia.content)
+              : undefined);
+          if (existing.inputContentHash && currentHash === existing.inputContentHash) {
+            throw new ValidationError(
+              `Cannot complete refresh job "${existing.id}": ${currentMedia.kind} content is unchanged.`,
+            );
+          }
+        }
+      } else if (currentDiagram && existing.inputContentHash) {
+        const currentHash =
+          matchingEntry.contentHash ?? ContextDeckStore.sha256Hex(currentDiagram.content);
+        if (currentHash === existing.inputContentHash) {
+          throw new ValidationError(
+            `Cannot complete refresh job "${existing.id}": diagram content is unchanged from base version.`,
+          );
+        }
+      } else if (currentQuiz && existing.inputContentHash) {
+        const currentHash =
+          matchingEntry.contentHash ??
+          ContextDeckStore.sha256Hex(JSON.stringify(currentQuiz.questions));
+        if (currentHash === existing.inputContentHash) {
+          throw new ValidationError(
+            `Cannot complete refresh job "${existing.id}": quiz questions are unchanged from base version.`,
+          );
+        }
+      }
+
+      const completed = RefreshJobSchema.parse({
+        ...cleanExisting,
+        status: 'done',
+        leaseTokenHash: null,
+        leaseExpiresAt: null,
+        result: {
+          artifactVersion: claimedVersion,
+          ...(input.summary ? { summary: input.summary } : {}),
+        },
+        updatedAt: nowStr,
+      });
+      const jobPath = await this.safeBoardFilePath(tx.slug, 'jobs', `${completed.id}.yaml`);
+      tx.stageFile(jobPath, ContextDeckStore.serializeJobForDisk(completed));
+      tx.addEvent({
+        kind: 'job.completed',
+        entityId: completed.id,
+        summary: `Completed refresh job ${completed.id} (${completed.artifactType} "${completed.artifactTitle}" → v${claimedVersion})`,
+        details: {
+          artifactType: completed.artifactType,
+          artifactId: completed.artifactId,
+          artifactVersion: claimedVersion,
+        },
+      });
+      return redactJobLease(completed);
     });
   }
 
