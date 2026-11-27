@@ -145,4 +145,91 @@ describe('B3 Hardening Round 2 G2: QuizRunner version change & 409 handling (R2-
     const statusEl = container!.querySelector('[role="status"]');
     expect(statusEl?.textContent).toMatch(/changed|updated|newer version/i);
   });
+
+  it('N11: shows newer-version notice only for quiz-version ConflictError and shows own message for other 409s', async () => {
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+
+    const quizV2: Quiz = {
+      id: 'quiz_n11_test',
+      title: 'Conflict Narrowing Quiz',
+      topic: 'Sync',
+      description: '',
+      basedOnDecisions: [],
+      attempts: [],
+      version: 2,
+      questions: [
+        {
+          id: 'q1',
+          prompt: 'Which letter is first?',
+          type: 'multiple_choice',
+          options: ['A', 'B'],
+          correctIndex: 0,
+          explanation: 'A is first',
+          relatedDecisionIds: [],
+        },
+      ],
+      boardRevisionAtUpdate: 2,
+      createdAt: '2026-11-26T00:00:00.000Z',
+      updatedAt: '2026-11-26T00:00:00.000Z',
+    };
+
+    const onRefresh = vi.fn();
+
+    await act(async () => {
+      root!.render(<MediaMasteryLens snapshot={makeSnapshot(quizV2)} onRefresh={onRefresh} />);
+    });
+
+    const getOptionButtons = () =>
+      Array.from(container!.querySelectorAll('[data-question-id="q1"] button'));
+    const getSubmitBtn = () =>
+      Array.from(container!.querySelectorAll('button')).find((b) =>
+        b.textContent?.includes('Submit answers'),
+      ) as HTMLButtonElement;
+
+    // Select option A
+    await act(async () => {
+      (getOptionButtons()[0] as HTMLButtonElement).click();
+    });
+    expect(getOptionButtons()[0].className).toContain('border-indigo-500');
+
+    // Non-version 409 -> must show its own message, NOT the "newer version" notice, and keep answers intact
+    vi.spyOn(api, 'submitQuizAttempt').mockRejectedValueOnce(
+      new ApiError('Board is locked for maintenance', 409, 'CONFLICT', {
+        reason: 'board_locked',
+      }),
+    );
+
+    await act(async () => {
+      getSubmitBtn().click();
+    });
+
+    expect(container!.textContent).toContain('Board is locked for maintenance');
+    expect(container!.textContent).not.toMatch(/newer version/i);
+    expect(onRefresh).not.toHaveBeenCalled();
+    expect(getOptionButtons()[0].className).toContain('border-indigo-500');
+
+    // Quiz-version 409 (with structured reason) -> shows "newer version" notice, clears answers, triggers reload
+    vi.spyOn(api, 'submitQuizAttempt').mockRejectedValueOnce(
+      new ApiError(
+        'Quiz "quiz_n11_test" is now at version 3, not version 2. Reload the quiz before submitting.',
+        409,
+        'CONFLICT',
+        { reason: 'quiz_version_mismatch', currentVersion: 3, submittedVersion: 2 },
+      ),
+    );
+
+    await act(async () => {
+      getSubmitBtn().click();
+    });
+
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+    const statusEl = container!.querySelector('[role="status"]');
+    expect(statusEl?.textContent).toMatch(/newer version/i);
+    expect(container!.textContent).not.toContain('Board is locked for maintenance');
+    for (const btn of getOptionButtons()) {
+      expect(btn.className).not.toContain('border-indigo-500');
+    }
+  });
 });

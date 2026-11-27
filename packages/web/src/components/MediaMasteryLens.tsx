@@ -103,6 +103,20 @@ function MasteryTrendBadge({ quiz }: { quiz: Quiz }) {
   );
 }
 
+function isQuizVersionConflict(err: ApiError): boolean {
+  if (err.status !== 409) return false;
+  if (err.data?.reason !== undefined) {
+    return err.data.reason === 'quiz_version_mismatch';
+  }
+  if (typeof err.data?.currentVersion === 'number') {
+    return true;
+  }
+  return (
+    (err.code === undefined || err.code === 'CONFLICT') &&
+    /\bquiz\b.*\bversion\b|\bquizVersion\b/i.test(err.message)
+  );
+}
+
 function QuizRunner({
   slug,
   quiz,
@@ -128,6 +142,7 @@ function QuizRunner({
     percentage: number;
   } | null>(null);
   const [versionNotice, setVersionNotice] = useState<string | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
   const currentVersion = quiz.version ?? 1;
@@ -141,6 +156,7 @@ function QuizRunner({
 
   useEffect(() => {
     setVersionNotice(null);
+    setSubmitError(null);
   }, [quiz.id]);
 
   const handleSubmit = async () => {
@@ -148,6 +164,7 @@ function QuizRunner({
     try {
       const res = await api.submitQuizAttempt(slug, quiz.id, answers, confidence, currentVersion);
       setVersionNotice(null);
+      setSubmitError(null);
       setSubmittedResult({
         score: res.attempt.score,
         total: res.attempt.total,
@@ -156,10 +173,16 @@ function QuizRunner({
       onSubmitted();
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) {
-        setAnswers({});
-        setSubmittedResult(null);
-        setVersionNotice('Quiz changed to a newer version. Reloaded.');
-        onSubmitted();
+        if (isQuizVersionConflict(err)) {
+          setAnswers({});
+          setSubmittedResult(null);
+          setSubmitError(null);
+          setVersionNotice('Quiz changed to a newer version. Reloaded.');
+          onSubmitted();
+          return;
+        }
+        setVersionNotice(null);
+        setSubmitError(err.message);
         return;
       }
       throw err;
@@ -192,6 +215,15 @@ function QuizRunner({
           className="rounded-lg border border-amber-500/40 bg-zinc-950 px-3 py-2 text-xs text-amber-300"
         >
           {versionNotice}
+        </div>
+      )}
+
+      {submitError && (
+        <div
+          role="alert"
+          className="rounded-lg border border-rose-500/40 bg-zinc-950 px-3 py-2 text-xs text-rose-300"
+        >
+          {submitError}
         </div>
       )}
 
@@ -275,6 +307,7 @@ function QuizRunner({
                         type="button"
                         onClick={() => {
                           setVersionNotice(null);
+                          setSubmitError(null);
                           setSubmittedResult(null);
                           setAnswers((prev) => ({ ...prev, [q.id]: optIdx }));
                         }}
@@ -300,6 +333,7 @@ function QuizRunner({
                         type="button"
                         onClick={() => {
                           setVersionNotice(null);
+                          setSubmitError(null);
                           setSubmittedResult(null);
                           setAnswers((prev) => ({ ...prev, [q.id]: val }));
                         }}
@@ -321,6 +355,7 @@ function QuizRunner({
                   value={String(chosen ?? '')}
                   onChange={(e) => {
                     setVersionNotice(null);
+                    setSubmitError(null);
                     setSubmittedResult(null);
                     setAnswers((prev) => ({ ...prev, [q.id]: e.target.value }));
                   }}

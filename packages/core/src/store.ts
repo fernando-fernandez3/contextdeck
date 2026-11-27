@@ -5300,11 +5300,20 @@ export class ContextDeckStore {
         if (input.quizVersion !== currentVersion) {
           throw new ConflictError(
             `Quiz "${quiz.id}" is now at version ${currentVersion}, not version ${input.quizVersion}. Reload the quiz before submitting.`,
+            {
+              reason: 'quiz_version_mismatch',
+              currentVersion,
+              submittedVersion: input.quizVersion,
+            },
           );
         }
       } else if (currentVersion > 1) {
         throw new ConflictError(
           `Quiz "${quiz.id}" is at version ${currentVersion}; quizVersion is required when submitting answers to an updated quiz.`,
+          {
+            reason: 'quiz_version_mismatch',
+            currentVersion,
+          },
         );
       }
 
