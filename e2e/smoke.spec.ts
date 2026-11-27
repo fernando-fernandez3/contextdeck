@@ -924,4 +924,204 @@ test.describe.serial('ContextDeck v0.2 Playwright Smoke & Isolation', () => {
     expect(errors).toEqual([]);
     await context.close();
   });
+
+  test('R5-1: Mermaid media labels trigger zero external requests under WEB_UI_CSP', async ({
+    browser,
+  }) => {
+    const authHeaders = {
+      Authorization: `Bearer ${bearerToken}`,
+      'Content-Type': 'application/json',
+    };
+
+    const variants = [
+      {
+        title: 'R5-1 Mermaid Video Audio',
+        marker: 'Safe',
+        content: [
+          'flowchart LR',
+          '  A["<video src=https://evil.example/mmd-video.mp4></video><audio src=https://evil.example/mmd-audio.mp3></audio>"] --> B[Safe]',
+          '  B --> N["<b>BoldLabel</b><br>LineTwo"]',
+          '  N --> M["`**MdBold**`"]',
+        ].join('\n'),
+      },
+      {
+        title: 'R5-1 Mermaid Video Source',
+        marker: 'Safe Source',
+        content: [
+          'flowchart LR',
+          '  A["<video><source src=https://evil.example/mmd-src.mp4></video>"] --> B[Safe Source]',
+        ].join('\n'),
+      },
+      {
+        title: 'R5-1 Mermaid Markdown Media',
+        marker: 'Safe Markdown',
+        content: [
+          'flowchart LR',
+          '  A["`<video src=https://evil.example/mmd-mdvid.mp4></video>`"] --> B[Safe Markdown]',
+        ].join('\n'),
+      },
+      {
+        title: 'R5-1 Mermaid Init Override',
+        marker: 'Safe Init',
+        content: [
+          '%%{init: {"dompurifyConfig": {"FORBID_TAGS": []}}}%%',
+          'flowchart LR',
+          '  A["<video src=https://evil.example/mmd-init-video.mp4></video><audio src=https://evil.example/mmd-init-audio.mp3></audio>"] --> B[Safe Init]',
+          '  C["<video><source src=https://evil.example/mmd-init-src.mp4></video>"] --> B',
+          '  D["`<video src=https://evil.example/mmd-init-mdvid.mp4></video>`"] --> B',
+        ].join('\n'),
+      },
+      {
+        title: 'R5-1 Mermaid YAML Override',
+        marker: 'Safe YAML',
+        content: [
+          '---',
+          'config:',
+          '  dompurifyConfig:',
+          '    FORBID_TAGS: []',
+          '---',
+          'flowchart LR',
+          '  A["<video src=https://evil.example/mmd-yaml-video.mp4></video>"] --> B[Safe YAML]',
+        ].join('\n'),
+      },
+    ];
+
+    for (const v of variants) {
+      const res = await fetch(`${BASE_URL}/api/boards/realtime-sync-v2/diagrams`, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({
+          title: v.title,
+          kind: 'mermaid',
+          content: v.content,
+        }),
+      });
+      expect(res.status).toBe(201);
+    }
+
+    const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const page = await context.newPage();
+    const externalRequests: string[] = [];
+    const errors: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') errors.push(`console.error: ${msg.text()}`);
+    });
+    page.on('pageerror', (err) => errors.push(`pageerror: ${err.message}`));
+
+    await page.route('**/*', async (route) => {
+      const reqUrl = route.request().url();
+      if (
+        reqUrl.startsWith(BASE_URL) ||
+        reqUrl.startsWith('data:') ||
+        reqUrl.startsWith('blob:') ||
+        reqUrl.startsWith('about:')
+      ) {
+        await route.continue();
+        return;
+      }
+      externalRequests.push(reqUrl);
+      await route.abort();
+    });
+
+    await authenticateViaLaunchUrl(page);
+    await waitForLensReady(page, 'decisions');
+
+    for (const v of variants) {
+      await page.getByRole('button', { name: new RegExp(v.title) }).click();
+      const svg = page.locator('[data-mermaid-rendered="true"] svg').first();
+      await expect(svg).toContainText(v.marker, { timeout: 15_000 });
+      await expect(svg).toContainText('Safe');
+      if (v.title === 'R5-1 Mermaid Video Audio') {
+        await expect(svg).toContainText('BoldLabel');
+        await expect(svg).toContainText('LineTwo');
+        await expect(svg).toContainText('MdBold');
+        expect(await svg.locator('b').count()).toBeGreaterThanOrEqual(1);
+        expect(await svg.locator('br').count()).toBeGreaterThanOrEqual(1);
+        expect(await svg.locator('strong').count()).toBeGreaterThanOrEqual(1);
+      }
+      await page.waitForTimeout(250);
+    }
+
+    expect(
+      externalRequests.filter((u) => u.includes('evil.example')),
+      `External evil.example requests triggered during Mermaid render: ${JSON.stringify(externalRequests)}`,
+    ).toEqual([]);
+    expect(externalRequests).toEqual([]);
+    expect(await getCspViolations(page)).toEqual([]);
+    expect(errors).toEqual([]);
+    await context.close();
+  });
+
+  test('R5-2: Markdown brief media triggers zero external requests', async ({ browser }) => {
+    const authHeaders = {
+      Authorization: `Bearer ${bearerToken}`,
+      'Content-Type': 'application/json',
+    };
+
+    const snapRes = await fetch(`${BASE_URL}/api/boards/realtime-sync-v2`, {
+      headers: { Authorization: `Bearer ${bearerToken}` },
+    });
+    expect(snapRes.status).toBe(200);
+    const snap = (await snapRes.json()) as { brief: string };
+
+    const maliciousBrief = [
+      '# Untrusted Brief',
+      '',
+      '<video src="https://evil.example/brief-video.mp4"></video>',
+      '<audio src="https://evil.example/brief-audio.mp3"></audio>',
+    ].join('\n');
+
+    const putRes = await fetch(`${BASE_URL}/api/boards/realtime-sync-v2/brief`, {
+      method: 'PUT',
+      headers: authHeaders,
+      body: JSON.stringify({ brief: maliciousBrief }),
+    });
+    expect(putRes.status).toBe(200);
+
+    const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const page = await context.newPage();
+    try {
+      const externalRequests: string[] = [];
+      const errors: string[] = [];
+      page.on('console', (msg) => {
+        if (msg.type() === 'error') errors.push(`console.error: ${msg.text()}`);
+      });
+      page.on('pageerror', (err) => errors.push(`pageerror: ${err.message}`));
+
+      await page.route('**/*', async (route) => {
+        const reqUrl = route.request().url();
+        if (
+          reqUrl.startsWith(BASE_URL) ||
+          reqUrl.startsWith('data:') ||
+          reqUrl.startsWith('blob:') ||
+          reqUrl.startsWith('about:')
+        ) {
+          await route.continue();
+          return;
+        }
+        externalRequests.push(reqUrl);
+        await route.abort();
+      });
+
+      await authenticateViaLaunchUrl(page);
+      await page.locator('button[data-lens="brief"]').click();
+      await expect(page.locator('main')).toContainText('Untrusted Brief', { timeout: 10_000 });
+      await page.waitForTimeout(400);
+
+      expect(
+        externalRequests.filter((u) => u.includes('evil.example')),
+        `External evil.example requests triggered by Markdown brief: ${JSON.stringify(externalRequests)}`,
+      ).toEqual([]);
+      expect(externalRequests).toEqual([]);
+      expect(await getCspViolations(page)).toEqual([]);
+      expect(errors).toEqual([]);
+    } finally {
+      await context.close();
+      await fetch(`${BASE_URL}/api/boards/realtime-sync-v2/brief`, {
+        method: 'PUT',
+        headers: authHeaders,
+        body: JSON.stringify({ brief: snap.brief }),
+      });
+    }
+  });
 });

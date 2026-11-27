@@ -9,8 +9,43 @@ export const MERMAID_CONFIG = {
   theme: 'dark' as const,
   securityLevel: 'strict' as const,
   fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
-  // R4-2: Prevent untrusted %%{init: ...}%% directives from injecting raw themeCSS
-  // into document.body during mermaid.render() before sanitizeMermaidSvg runs.
+  // R5-1: Forbid media/resource tags and attributes inside Mermaid's own DOMPurify
+  // pass before mermaid.render() mounts temporary SVG/HTML labels into document.body.
+  // Keep 'style' forbidden as well (Mermaid's default when dompurifyConfig is omitted).
+  dompurifyConfig: {
+    FORBID_TAGS: [
+      'style',
+      'video',
+      'audio',
+      'source',
+      'track',
+      'img',
+      'image',
+      'feimage',
+      'iframe',
+      'object',
+      'embed',
+      'form',
+      'input',
+      'textarea',
+      'button',
+      'link',
+      'meta',
+      'base',
+    ],
+    FORBID_ATTR: [
+      'src',
+      'srcset',
+      'poster',
+      'background',
+      'ping',
+      'data',
+      'action',
+      'formaction',
+    ],
+  },
+  // R4-2 / R5-1: Prevent untrusted %%{init: ...}%% or YAML frontmatter directives from
+  // injecting raw themeCSS or clearing dompurifyConfig before mermaid.render() mounts.
   secure: [
     'secure',
     'securityLevel',
@@ -21,6 +56,7 @@ export const MERMAID_CONFIG = {
     'themeCSS',
     'fontFamily',
     'altFontFamily',
+    'dompurifyConfig',
   ],
 };
 
@@ -422,7 +458,21 @@ export function sanitizeMarkdownHtml(markdown: string): string {
   const rawHtml = marked.parse(markdown || '', { async: false, breaks: true }) as string;
   return DOMPurify.sanitize(rawHtml, {
     USE_PROFILES: { html: true },
-    FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'style', 'form', 'input', 'textarea', 'button'],
+    FORBID_TAGS: [
+      'script',
+      'iframe',
+      'object',
+      'embed',
+      'style',
+      'form',
+      'input',
+      'textarea',
+      'button',
+      'video',
+      'audio',
+      'source',
+      'track',
+    ],
     FORBID_ATTR: [
       'onerror',
       'onload',
@@ -432,6 +482,7 @@ export function sanitizeMarkdownHtml(markdown: string): string {
       'onblur',
       'onmouseenter',
       'style',
+      'poster',
     ],
     ALLOWED_URI_REGEXP: SAFE_URI_REGEX,
   });
@@ -517,6 +568,7 @@ export function sanitizeMermaidSvg(svg: string): string {
         'video',
         'audio',
         'source',
+        'track',
         'link',
         'meta',
         'base',

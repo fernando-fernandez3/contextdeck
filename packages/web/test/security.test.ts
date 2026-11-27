@@ -34,6 +34,65 @@ describe('@contextdeck/web content security (Bug 7, AC2.7, AC2.9, D5)', () => {
     expect(MERMAID_CONFIG.secure).toContain('themeCSS');
   });
 
+  it('R5-1: MERMAID_CONFIG forbids media tags and locks dompurifyConfig', () => {
+    const cfg = MERMAID_CONFIG.dompurifyConfig;
+    expect(cfg).toBeDefined();
+    expect(cfg?.FORBID_TAGS).toEqual(
+      expect.arrayContaining([
+        'style',
+        'video',
+        'audio',
+        'source',
+        'track',
+        'img',
+        'image',
+        'feimage',
+        'iframe',
+        'object',
+        'embed',
+        'form',
+        'input',
+        'textarea',
+        'button',
+        'link',
+        'meta',
+        'base',
+      ]),
+    );
+    expect(cfg?.FORBID_ATTR).toEqual(
+      expect.arrayContaining([
+        'src',
+        'srcset',
+        'poster',
+        'background',
+        'ping',
+        'data',
+        'action',
+        'formaction',
+      ]),
+    );
+    expect(MERMAID_CONFIG.secure).toContain('dompurifyConfig');
+  });
+
+  it('R5-2: sanitizeMarkdownHtml strips video/audio/source/track', () => {
+    const payload = [
+      '# Untrusted Brief',
+      '',
+      '<video src="https://evil.example/brief-video.mp4" poster="https://evil.example/poster.jpg"><source src="https://evil.example/brief-src.mp4" type="video/mp4"><track src="https://evil.example/sub.vtt" kind="subtitles"></video>',
+      '<audio src="https://evil.example/brief-audio.mp3"></audio>',
+    ].join('\n');
+
+    const sanitized = sanitizeMarkdownHtml(payload);
+    expect(sanitized).toContain('<h1>Untrusted Brief</h1>');
+    const lower = sanitized.toLowerCase();
+    expect(lower).not.toContain('<video');
+    expect(lower).not.toContain('<audio');
+    expect(lower).not.toContain('<source');
+    expect(lower).not.toContain('<track');
+    expect(lower).not.toContain('poster=');
+    expect(lower).not.toContain('evil.example');
+  });
+
   it('sanitizes Mermaid rendered SVG to neutralize script tags, event handlers, and javascript: hrefs while preserving diagram geometry and foreignObject labels (D5)', () => {
     const evilSvg =
       '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100" width="100%"><g transform="translate(10,10)" onload="alert(1)"><path d="M10,10L50,50" marker-end="url(#arrow)"></path><rect x="-10" y="-10" width="120" height="40"></rect><foreignObject width="120" height="40"><div xmlns="http://www.w3.org/1999/xhtml"><span>Server Node</span><img src="x" onerror="alert(4)"/></div></foreignObject><script>alert(2)</script><a href="javascript:alert(3)"><text>Node</text></a></g></svg>';

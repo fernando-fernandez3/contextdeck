@@ -1,10 +1,11 @@
-// R3-1 / R4-1 defense-in-depth CSP for SPA HTML responses (shared between
+// R3-1 / R4-1 / R5-1 defense-in-depth CSP for SPA HTML responses (shared between
 // @contextdeck/server and the @contextdeck/web Vite dev server): blocks all remote
 // subresource fetches (img/font/connect/script/style) while permitting inline styles
 // (Mermaid/Excalidraw), inline scripts needed by inherited-CSP srcdoc HTML artifacts,
 // and https: media-src for explicit external video/audio artifacts. Only <video>/<audio>
-// use media-src; the diagram sanitizer already forbids <video>/<audio>/<source> tags
-// and src/poster attributes, so allowing https: media-src does not reopen R3-1.
+// use media-src; media/resource tags and attributes are forbidden inside Mermaid's own
+// locked DOMPurify pass (before temporary DOM mount) as well as in Markdown sanitization
+// and post-render SVG sanitization, so allowing https: media-src does not reopen R3-1.
 export const WEB_UI_CSP = [
   "default-src 'self'",
   "script-src 'self' 'unsafe-inline'",
