@@ -4,6 +4,15 @@ import '@excalidraw/excalidraw/index.css';
 import { Save } from 'lucide-react';
 import type { Diagram } from '../types';
 
+// R3-1: Self-host Excalidraw fonts from same-origin /excalidraw-assets/ so strict
+// font-src 'self' data: CSP triggers zero third-party CDN requests or console violations.
+if (typeof window !== 'undefined') {
+  const win = window as unknown as { EXCALIDRAW_ASSET_PATH?: string | string[] };
+  if (!win.EXCALIDRAW_ASSET_PATH) {
+    win.EXCALIDRAW_ASSET_PATH = '/excalidraw-assets/';
+  }
+}
+
 const DARK_DEFAULT_BACKGROUNDS = new Set(['#09090b', '#0f172a', '#18181b', '#121212']);
 
 function resolveCanvasBackground(savedBg: unknown, isLight: boolean): string {

@@ -682,3 +682,39 @@ describe('B3 Hardening Round 2 G2: REST quiz version conflict (R2-5)', () => {
     }
   });
 });
+
+describe('B3 Hardening Round 3 G1: Server SPA Content-Security-Policy (R3-1)', () => {
+  it('R3-1: SPA HTML response includes strict Content-Security-Policy blocking remote subresources', async () => {
+    const dir = await makeTempDir('cdeck-r3-1-csp-');
+    const webDist = path.join(dir, 'web-dist');
+    await fs.mkdir(webDist, { recursive: true });
+    await fs.writeFile(
+      path.join(webDist, 'index.html'),
+      '<!doctype html><html><body><div id="root"></div></body></html>',
+      'utf8',
+    );
+    const store = new ContextDeckStore(dir);
+    await store.createBoard({ title: 'CSP Test', slug: 'main' });
+
+    const { app, close } = createApp({ store, webDistDir: webDist, port: 4312 });
+    try {
+      for (const reqPath of ['/', '/decisions']) {
+        const res = await app.request(`http://127.0.0.1:4312${reqPath}`);
+        expect(res.status).toBe(200);
+        const csp = res.headers.get('content-security-policy');
+        expect(csp, `Missing CSP header on ${reqPath}`).toBeTruthy();
+        expect(csp!).toContain("default-src 'self'");
+        expect(csp!).toMatch(/img-src\s+'self'\s+data:\s+blob:/);
+        expect(csp!).not.toMatch(/img-src[^;]*(?:\*|https?:)/i);
+        expect(csp!).toMatch(/media-src\s+'self'\s+blob:/);
+        expect(csp!).toMatch(/font-src\s+'self'\s+data:/);
+        expect(csp!).toMatch(/connect-src\s+'self'/);
+        expect(csp!).toContain("object-src 'none'");
+        expect(csp!).toContain("base-uri 'none'");
+        expect(csp!).toContain("frame-ancestors 'none'");
+      }
+    } finally {
+      await close();
+    }
+  });
+});

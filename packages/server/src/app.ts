@@ -96,6 +96,25 @@ type AppVariables = {
   auth?: AuthContext;
 };
 
+// R3-1 defense-in-depth CSP for SPA HTML responses: blocks all remote subresource
+// fetches (img/media/font/connect/script/style) while permitting inline styles
+// (Mermaid/Excalidraw) and inline scripts needed by inherited-CSP srcdoc HTML artifacts.
+export const WEB_UI_CSP = [
+  "default-src 'self'",
+  "script-src 'self' 'unsafe-inline'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob:",
+  "media-src 'self' blob:",
+  "font-src 'self' data:",
+  "connect-src 'self'",
+  "worker-src 'self' blob:",
+  "frame-src 'self' blob:",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "frame-ancestors 'none'",
+  "form-action 'self'",
+].join('; ');
+
 const STATIC_MIME_MAP: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'application/javascript; charset=utf-8',
@@ -1162,13 +1181,18 @@ export function createApp(options: AppOptions): {
           ? candidate
           : path.join(resolvedDist, 'index.html');
       const data = await fsp.readFile(target);
+      const contentType = guessStaticMime(target);
+      const headers: Record<string, string> = {
+        'Content-Type': contentType,
+        'Referrer-Policy': 'no-referrer',
+        'X-Content-Type-Options': 'nosniff',
+      };
+      if (contentType.startsWith('text/html')) {
+        headers['Content-Security-Policy'] = WEB_UI_CSP;
+      }
       return new Response(data, {
         status: 200,
-        headers: {
-          'Content-Type': guessStaticMime(target),
-          'Referrer-Policy': 'no-referrer',
-          'X-Content-Type-Options': 'nosniff',
-        },
+        headers,
       });
     });
   }

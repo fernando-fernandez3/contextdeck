@@ -36,6 +36,13 @@ function getFreshLaunchUrl(): string {
 }
 
 async function authenticateViaLaunchUrl(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const w = window as unknown as { __cspViolations?: string[] };
+    w.__cspViolations = [];
+    document.addEventListener('securitypolicyviolation', (e) => {
+      w.__cspViolations?.push(`${e.violatedDirective}: ${e.blockedURI}`);
+    });
+  });
   const launchUrl = getFreshLaunchUrl();
   await page.goto(launchUrl, { waitUntil: 'domcontentloaded' });
   await expect(page).toHaveURL(`${BASE_URL}/`);
@@ -46,6 +53,12 @@ async function authenticateViaLaunchUrl(page: Page): Promise<void> {
   expect(page.url()).not.toContain('token');
   const localStorageKeys = await page.evaluate(() => Object.keys(window.localStorage));
   expect(localStorageKeys).toEqual([]);
+}
+
+async function getCspViolations(page: Page): Promise<string[]> {
+  return page.evaluate(
+    () => (window as unknown as { __cspViolations?: string[] }).__cspViolations ?? [],
+  );
 }
 
 async function waitForLensReady(page: Page, lensId: (typeof LENS_IDS)[number]): Promise<void> {
@@ -232,6 +245,7 @@ test.describe.serial('ContextDeck v0.2 Playwright Smoke & Isolation', () => {
     await expect(desktopPage.locator('html')).toHaveClass(/\blight\b/);
 
     expect(desktopErrors).toEqual([]);
+    expect(await getCspViolations(desktopPage)).toEqual([]);
     await desktopContext.close();
 
     // --- Phone 390x844 ---
@@ -290,6 +304,7 @@ test.describe.serial('ContextDeck v0.2 Playwright Smoke & Isolation', () => {
     }
 
     expect(phoneErrors).toEqual([]);
+    expect(await getCspViolations(phonePage)).toEqual([]);
     await phoneContext.close();
   });
 
@@ -366,6 +381,7 @@ test.describe.serial('ContextDeck v0.2 Playwright Smoke & Isolation', () => {
     await expect(page.locator('svg[aria-label="Mastery score trend"]')).toBeVisible();
 
     expect(errors).toEqual([]);
+    expect(await getCspViolations(page)).toEqual([]);
     await context.close();
   });
 
@@ -620,6 +636,7 @@ test.describe.serial('ContextDeck v0.2 Playwright Smoke & Isolation', () => {
     }
 
     expect(errors).toEqual([]);
+    expect(await getCspViolations(desktopPage)).toEqual([]);
     await desktopCtx.close();
 
     // --- Phone 390x844 light-theme screenshots & overflow checks ---
@@ -677,6 +694,120 @@ test.describe.serial('ContextDeck v0.2 Playwright Smoke & Isolation', () => {
     }
 
     expect(phoneErrors).toEqual([]);
+    expect(await getCspViolations(phonePage)).toEqual([]);
     await phoneCtx.close();
+  });
+
+  test('R3-1: sanitized Mermaid SVG triggers zero external requests', async ({ browser }) => {
+    const authHeaders = {
+      Authorization: `Bearer ${bearerToken}`,
+      'Content-Type': 'application/json',
+    };
+
+    // Seed an adversarial Mermaid diagram with CSS escape directives via REST API
+    const diagRes = await fetch(`${BASE_URL}/api/boards/realtime-sync-v2/diagrams`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({
+        title: 'R3-1 Adversarial Mermaid',
+        kind: 'mermaid',
+        content: [
+          '%%{init: {"themeCSS": ".node rect { background: \\\\\\\\75rl(\\"https://evil.example/mmd-themecss\\"); }"}}%%',
+          'flowchart LR',
+          '  A[Alpha] --> B[Beta]',
+        ].join('\n'),
+      }),
+    });
+    expect(diagRes.status).toBe(201);
+
+    const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const page = await context.newPage();
+    const externalRequests: string[] = [];
+    const errors: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') errors.push(`console.error: ${msg.text()}`);
+    });
+    page.on('pageerror', (err) => errors.push(`pageerror: ${err.message}`));
+
+    await page.route('**/*', async (route) => {
+      const reqUrl = route.request().url();
+      if (reqUrl.startsWith(BASE_URL) || reqUrl.startsWith('data:') || reqUrl.startsWith('blob:') || reqUrl.startsWith('about:')) {
+        await route.continue();
+        return;
+      }
+      externalRequests.push(reqUrl);
+      await route.abort();
+    });
+
+    await authenticateViaLaunchUrl(page);
+
+    // Render the adversarial Mermaid diagram through the real Decisions lens
+    await waitForLensReady(page, 'decisions');
+    await page.getByRole('button', { name: /R3-1 Adversarial Mermaid/ }).click();
+    await expect(page.locator('[data-mermaid-rendered="true"] svg').first()).toContainText('Alpha', {
+      timeout: 15_000,
+    });
+    await page.waitForTimeout(250);
+
+    // Also run all 7 Neon R3-1 vectors + custom property + non-<a> external href through sanitizeMermaidSvg
+    // and render the sanitized SVGs inside the real page (using JSDOM-backed DOMPurify matching unit tests)
+    const { JSDOM } = await import('../packages/web/node_modules/jsdom/lib/api.js');
+    const dom = new JSDOM('<!doctype html><html><body></body></html>');
+    const prevGlobals = {
+      window: (globalThis as Record<string, unknown>).window,
+      document: (globalThis as Record<string, unknown>).document,
+      DOMParser: (globalThis as Record<string, unknown>).DOMParser,
+      Node: (globalThis as Record<string, unknown>).Node,
+      Element: (globalThis as Record<string, unknown>).Element,
+    };
+    Object.assign(globalThis, {
+      window: dom.window,
+      document: dom.window.document,
+      DOMParser: dom.window.DOMParser,
+      Node: dom.window.Node,
+      Element: dom.window.Element,
+    });
+    let sanitizedSvgs: string[] = [];
+    try {
+      const { sanitizeMermaidSvg } = await import('../packages/web/src/security.ts');
+      const vectors = [
+        '<svg width="100" height="100"><style>.a{background:\\\\75rl("https://evil.example/hit-style-url")}</style><foreignObject width="100" height="100"><div class="a">x</div></foreignObject></svg>',
+        '<svg width="100" height="100"><style>@\\\\69mport "https://evil.example/hit-at-import";</style></svg>',
+        '<svg width="100" height="100"><foreignObject width="100" height="100"><div style="background:\\\\75rl(https://evil.example/hit-inline-style)">x</div></foreignObject></svg>',
+        '<svg width="100" height="100"><style>.b{background-image:\\\\69mage-set("https://evil.example/hit-image-set" 1x)}</style><foreignObject width="100" height="100"><div class="b">x</div></foreignObject></svg>',
+        '<svg width="100" height="100"><style>@import "https://evil.example/hit-brace}css";</style></svg>',
+        '<svg width="100" height="100"><foreignObject width="100" height="100"><table background="https://evil.example/hit-table-bg"><tr><td background="https://evil.example/hit-td-bg">x</td></tr></table></foreignObject></svg>',
+        '<svg width="100" height="100"><style>:root { --u: \\\\75rl("https://evil.example/hit-custom-prop"); } .c { background: var(--u); }</style><foreignObject width="100" height="100"><div class="c">x</div></foreignObject></svg>',
+        '<svg width="100" height="100"><defs><pattern id="p" href="https://evil.example/hit-pattern"/><linearGradient id="g" xlink:href="https://evil.example/hit-grad"/></defs><rect width="100" height="100" fill="url(#p)"/></svg>',
+      ];
+      sanitizedSvgs = vectors.map((v) => sanitizeMermaidSvg(v));
+    } finally {
+      for (const [k, v] of Object.entries(prevGlobals)) {
+        if (v === undefined) delete (globalThis as Record<string, unknown>)[k];
+        else (globalThis as Record<string, unknown>)[k] = v;
+      }
+    }
+
+    for (const html of sanitizedSvgs) {
+      await page.evaluate((markup) => {
+        const host = document.createElement('div');
+        host.setAttribute('data-r3-1-probe', 'true');
+        host.innerHTML = markup;
+        document.body.appendChild(host);
+      }, html);
+    }
+    await page.waitForTimeout(400);
+
+    expect(externalRequests, `External requests triggered: ${JSON.stringify(externalRequests)}`).toEqual([]);
+    expect(await getCspViolations(page)).toEqual([]);
+    expect(errors).toEqual([]);
+
+    // Check real SPA HTML response carries strict CSP header
+    const docRes = await page.request.get(`${BASE_URL}/`);
+    const csp = docRes.headers()['content-security-policy'] ?? '';
+    expect(csp, 'SPA HTML response missing Content-Security-Policy').toContain("default-src 'self'");
+    expect(csp).toMatch(/img-src\s+'self'\s+data:\s+blob:/);
+    expect(csp).not.toMatch(/img-src[^;]*(?:\*|https?:)/i);
+    await context.close();
   });
 });

@@ -180,6 +180,79 @@ describe('@contextdeck/web content security (Bug 7, AC2.7, AC2.9, D5)', () => {
     expect(cleanedSafe).toContain('data:image/png;base64,iVBORw0KGgo=');
   });
 
+  it('R3-1: blocks double-backslash CSS escapes, @import with braces, custom-property url(), legacy fetch attributes, and non-<a> external hrefs with zero surviving CSS backslashes', () => {
+    const vectors: Array<{ name: string; svg: string }> = [
+      {
+        name: '1: double-backslash style url()',
+        svg: '<svg width="100" height="100"><style>.a{background:\\\\75rl("https://evil.example/hit-style-url")}</style><foreignObject width="100" height="100"><div class="a">x</div></foreignObject></svg>',
+      },
+      {
+        name: '2: double-backslash @import',
+        svg: '<svg width="100" height="100"><style>@\\\\69mport "https://evil.example/hit-at-import";</style></svg>',
+      },
+      {
+        name: '3: double-backslash inline style url()',
+        svg: '<svg width="100" height="100"><foreignObject width="100" height="100"><div style="background:\\\\75rl(https://evil.example/hit-inline-style)">x</div></foreignObject></svg>',
+      },
+      {
+        name: '4: double-backslash image-set()',
+        svg: '<svg width="100" height="100"><style>.b{background-image:\\\\69mage-set("https://evil.example/hit-image-set" 1x)}</style><foreignObject width="100" height="100"><div class="b">x</div></foreignObject></svg>',
+      },
+      {
+        name: '5: @import URL containing closing brace }',
+        svg: '<svg width="100" height="100"><style>@import "https://evil.example/hit-brace}css"; .keep { fill: #fff; }</style></svg>',
+      },
+      {
+        name: '6: foreignObject table/td background attributes',
+        svg: '<svg width="100" height="100"><foreignObject width="100" height="100"><table background="https://evil.example/hit-table-bg"><tr><td background="https://evil.example/hit-td-bg">x</td></tr></table></foreignObject></svg>',
+      },
+      {
+        name: '7: custom property --u with double-backslash url()',
+        svg: '<svg width="100" height="100"><style>:root { --u: \\\\75rl("https://evil.example/hit-custom-prop"); } .a { background: var(--u); }</style><foreignObject width="100" height="100"><div class="a">x</div></foreignObject></svg>',
+      },
+      {
+        name: '8: non-<a> SVG external href/xlink:href on pattern, linearGradient, textPath',
+        svg: '<svg><defs><pattern id="p" href="https://evil.example/pat.svg#p"/><linearGradient id="g" xlink:href="https://evil.example/grad.svg#g"/></defs><text><textPath href="https://evil.example/path.svg#t">hi</textPath></text></svg>',
+      },
+      {
+        name: '9: deeply nested backslashes (>20 passes) fail closed with no surviving backslash',
+        svg: `<svg><style>.safe { fill: #123456; } .evil { background: ${'\\'.repeat(40)}75rl("https://evil.example/deep"); }</style></svg>`,
+      },
+      {
+        name: '10: legacy/resource-fetching HTML attributes stripped',
+        svg: '<svg><foreignObject><div srcset="https://evil.example/s" poster="https://evil.example/p" data="https://evil.example/d" ping="https://evil.example/pi" action="https://evil.example/a" formaction="https://evil.example/fa" cite="https://evil.example/c" dynsrc="https://evil.example/dy" lowsrc="https://evil.example/lo" longdesc="https://evil.example/ld" profile="https://evil.example/pr" codebase="https://evil.example/cb" archive="https://evil.example/ar">ok</div></foreignObject></svg>',
+      },
+    ];
+
+    for (const vec of vectors) {
+      const cleaned = sanitizeMermaidSvg(vec.svg);
+      expect(cleaned.toLowerCase(), `Vector leaked external URL: ${vec.name}`).not.toContain(
+        'evil.example',
+      );
+      expect(cleaned.toLowerCase(), `Vector leaked @import: ${vec.name}`).not.toContain('@import');
+      const doc = new DOMParser().parseFromString(cleaned, 'text/html');
+      for (const styleEl of Array.from(doc.querySelectorAll('style'))) {
+        expect(styleEl.textContent ?? '', `Surviving backslash in <style>: ${vec.name}`).not.toContain(
+          '\\',
+        );
+      }
+      for (const styledEl of Array.from(doc.querySelectorAll('[style]'))) {
+        expect(
+          styledEl.getAttribute('style') ?? '',
+          `Surviving backslash in style attr: ${vec.name}`,
+        ).not.toContain('\\');
+      }
+    }
+
+    // Safe <a> https href and safe #fragment href on <pattern>/<linearGradient>/<textPath> still work
+    const safeLinks = sanitizeMermaidSvg(
+      '<svg><defs><linearGradient id="g1"><stop offset="0%"/></linearGradient><linearGradient id="g2" href="#g1"/><path id="p1" d="M0,0 L10,10"/></defs><text><textPath href="#p1">ok</textPath></text><a href="https://example.com/docs"><text>Docs</text></a></svg>',
+    );
+    expect(safeLinks).toContain('href="#g1"');
+    expect(safeLinks).toContain('href="#p1"');
+    expect(safeLinks).toContain('href="https://example.com/docs"');
+  });
+
   it('wraps HTML artifact srcDoc with strict no-network CSP meta tag', () => {
     const rawFragment = '<h1>Widget</h1><script>console.log(1)</script>';
     const wrapped1 = wrapHtmlArtifactSrcDoc(rawFragment);

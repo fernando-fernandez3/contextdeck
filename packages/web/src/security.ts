@@ -22,6 +22,7 @@ const SVG_URI_ATTRS = new Set([
   'href',
   'xlink:href',
   'src',
+  'srcset',
   'action',
   'formaction',
   'poster',
@@ -29,6 +30,12 @@ const SVG_URI_ATTRS = new Set([
   'data',
   'background',
   'ping',
+  'dynsrc',
+  'lowsrc',
+  'longdesc',
+  'profile',
+  'codebase',
+  'archive',
 ]);
 
 const SVG_URL_PRESENTATION_ATTRS = new Set([
@@ -37,10 +44,23 @@ const SVG_URL_PRESENTATION_ATTRS = new Set([
   'filter',
   'clip-path',
   'mask',
+  'mask-image',
+  'marker',
   'marker-start',
   'marker-mid',
   'marker-end',
+  'cursor',
+  'shape-outside',
+  'offset-path',
 ]);
+
+const MAX_CSS_DECODE_PASSES = 16;
+
+function stripCssComments(css: string): string {
+  // Replace comments (including unclosed trailing /*) with a single space so
+  // adjacent tokens cannot concatenate into a new identifier/function token.
+  return css.replace(/\/\*[\s\S]*?(?:\*\/|$)/g, ' ');
+}
 
 function decodeCssEscapes(css: string): string {
   // CSS Syntax Level 3 §4.3.7: decode 1-6 hex digit escapes (with optional single
@@ -61,6 +81,161 @@ function decodeCssEscapes(css: string): string {
       return '';
     },
   );
+}
+
+function decodeCssToFixedPoint(cssText: string): string {
+  let current = stripCssComments(cssText);
+  for (let pass = 0; pass < MAX_CSS_DECODE_PASSES; pass += 1) {
+    const next = stripCssComments(decodeCssEscapes(current));
+    if (next === current) break;
+    current = next;
+  }
+  return current;
+}
+
+function dropSegmentsWithBackslash(css: string): string {
+  if (!css.includes('\\')) return css;
+
+  // Fail closed on any backslash surviving bounded fixed-point escape decoding:
+  // drop any rule block (stylesheet) or declaration (inline style) containing '\',
+  // and if any '\' remains afterwards, drop the entire CSS text.
+  if (css.includes('{') || css.includes('}')) {
+    const kept: string[] = [];
+    let start = 0;
+    let braceDepth = 0;
+    let quote: '"' | "'" | null = null;
+    for (let i = 0; i < css.length; i += 1) {
+      const ch = css[i];
+      if (quote) {
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+      } else if (ch === '{') {
+        braceDepth += 1;
+      } else if (ch === '}') {
+        if (braceDepth > 0) braceDepth -= 1;
+        if (braceDepth === 0) {
+          const rule = css.slice(start, i + 1);
+          if (!rule.includes('\\')) kept.push(rule);
+          start = i + 1;
+        }
+      } else if (ch === ';' && braceDepth === 0) {
+        const stmt = css.slice(start, i + 1);
+        if (!stmt.includes('\\')) kept.push(stmt);
+        start = i + 1;
+      }
+    }
+    if (start < css.length) {
+      const tail = css.slice(start);
+      if (!tail.includes('\\') && braceDepth === 0) kept.push(tail);
+    }
+    const joined = kept.join(' ');
+    return joined.includes('\\') ? '' : joined;
+  }
+
+  const keptDecls: string[] = [];
+  let start = 0;
+  let parenDepth = 0;
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < css.length; i += 1) {
+    const ch = css[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === '(') {
+      parenDepth += 1;
+    } else if (ch === ')' && parenDepth > 0) {
+      parenDepth -= 1;
+    } else if (ch === ';' && parenDepth === 0) {
+      const decl = css.slice(start, i + 1);
+      if (!decl.includes('\\')) keptDecls.push(decl);
+      start = i + 1;
+    }
+  }
+  if (start < css.length) {
+    const tail = css.slice(start);
+    if (!tail.includes('\\')) keptDecls.push(tail);
+  }
+  const joined = keptDecls.join(' ');
+  return joined.includes('\\') ? '' : joined;
+}
+
+function stripCssAtImports(css: string): string {
+  // Quote- and paren-aware scanner that removes every @import rule (even when
+  // its quoted URL contains '{', '}', or ';'). Fails closed if any @import remains.
+  let current = css;
+  for (let pass = 0; pass < 8; pass += 1) {
+    if (!/@import(?![a-z0-9_-])/i.test(current)) break;
+    let out = '';
+    let i = 0;
+    let quote: '"' | "'" | null = null;
+
+    while (i < current.length) {
+      const ch = current[i];
+      if (quote) {
+        out += ch;
+        if (ch === quote) quote = null;
+        i += 1;
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        out += ch;
+        i += 1;
+        continue;
+      }
+      if (ch === '@' && /^@import(?![a-z0-9_-])/i.test(current.slice(i))) {
+        out += ' ';
+        i += '@import'.length;
+        let importQuote: '"' | "'" | null = null;
+        let parenDepth = 0;
+        while (i < current.length) {
+          const c = current[i];
+          if (importQuote) {
+            if (c === importQuote) importQuote = null;
+            i += 1;
+            continue;
+          }
+          if (c === '"' || c === "'") {
+            importQuote = c;
+            i += 1;
+            continue;
+          }
+          if (c === '(') {
+            parenDepth += 1;
+            i += 1;
+            continue;
+          }
+          if (c === ')' && parenDepth > 0) {
+            parenDepth -= 1;
+            i += 1;
+            continue;
+          }
+          if (parenDepth === 0 && c === ';') {
+            i += 1;
+            break;
+          }
+          if (parenDepth === 0 && c === '}') {
+            break;
+          }
+          i += 1;
+        }
+        continue;
+      }
+      out += ch;
+      i += 1;
+    }
+
+    if (out === current) break;
+    current = out;
+  }
+
+  return /@import(?![a-z0-9_-])/i.test(current) ? '' : current;
 }
 
 function unwrapCssString(raw: string): string {
@@ -129,7 +304,8 @@ function isSafeImageSetInner(inner: string): boolean {
 }
 
 function sanitizeCssResourceFunctions(css: string): string {
-  const fnRe = /(^|[^a-z0-9_-])(url|image-set|-webkit-image-set|src)\s*\(/gi;
+  const fnRe =
+    /(^|[^a-z0-9_-])(url|image-set|-webkit-image-set|src|image|cross-fade|-webkit-cross-fade)\s*\(/gi;
   let out = '';
   let cursor = 0;
 
@@ -177,7 +353,9 @@ function sanitizeCssResourceFunctions(css: string): string {
     const safe =
       fnName === 'url' || fnName === 'src'
         ? isSafeCssResourceTarget(inner)
-        : isSafeImageSetInner(inner);
+        : fnName === 'image-set' || fnName === '-webkit-image-set'
+          ? isSafeImageSetInner(inner)
+          : false;
     out += safe ? css.slice(fnStart, i) : 'none';
     cursor = i;
   }
@@ -186,13 +364,25 @@ function sanitizeCssResourceFunctions(css: string): string {
 }
 
 function sanitizeSvgStyleText(cssText: string): string {
-  // R2-2 / H15 / D5: Strip comments, decode CSS escapes, strip comments again,
-  // remove @import rules, and neutralize any url()/image-set()/-webkit-image-set()/src()
-  // targeting anything other than a local #fragment or raster data:image/ URI.
-  const normalized = decodeCssEscapes(cssText.replace(/\/\*[\s\S]*?\*\//g, ''))
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/@import\b[^;{}]*(?:;|$)/gi, '');
-  return sanitizeCssResourceFunctions(normalized);
+  // R3-1 / R2-2 / H15 / D5: Strip comments and decode CSS escapes to a fixed point,
+  // fail closed on any remaining backslash, strip all @import rules with a
+  // quote/paren-aware scanner, and neutralize any url()/image-set()/src()/image()/cross-fade()
+  // targeting anything other than a local #fragment or raster data:image/ URI
+  // (including inside custom properties).
+  const decoded = dropSegmentsWithBackslash(decodeCssToFixedPoint(cssText));
+  if (!decoded) return '';
+  const withoutImports = stripCssAtImports(decoded);
+  if (!withoutImports) return '';
+  let result = sanitizeCssResourceFunctions(withoutImports);
+  for (let pass = 0; pass < 4; pass += 1) {
+    const next = sanitizeCssResourceFunctions(result);
+    if (next === result) break;
+    result = next;
+  }
+  if (result.includes('\\') || /@import(?![a-z0-9_-])/i.test(result)) {
+    return '';
+  }
+  return result;
 }
 
 export function isSafeHttpUrl(url: string | undefined | null): boolean {
@@ -241,8 +431,26 @@ export function sanitizeMermaidSvg(svg: string): string {
     }
 
     if (SVG_URL_PRESENTATION_ATTRS.has(attrName) && data.attrValue) {
-      if (/url\s*\(|image-set|src\s*\(|\\|\/\*/i.test(data.attrValue)) {
-        data.attrValue = sanitizeSvgStyleText(data.attrValue);
+      if (/[(\\/*@]/.test(data.attrValue)) {
+        const cleanedVal = sanitizeSvgStyleText(data.attrValue);
+        if (!cleanedVal.trim()) {
+          data.keepAttr = false;
+        } else {
+          data.attrValue = cleanedVal;
+        }
+      }
+      return;
+    }
+
+    if (attrName === 'href' || attrName === 'xlink:href') {
+      const val = (data.attrValue ?? '').replace(/[\u0000-\u001f\u007f]+/g, '').trim();
+      if (node.tagName.toLowerCase() === 'a') {
+        if (/^[/\\]{2}/.test(val) || !SAFE_SVG_URI_REGEX.test(val)) {
+          data.keepAttr = false;
+        }
+      } else if (!SAFE_CSS_FRAGMENT_REGEX.test(val)) {
+        // R3-1: Restrict href / xlink:href to local #fragment on every element except <a>
+        data.keepAttr = false;
       }
       return;
     }
@@ -251,12 +459,6 @@ export function sanitizeMermaidSvg(svg: string): string {
       const val = (data.attrValue ?? '').replace(/[\u0000-\u001f\u007f]+/g, '').trim();
       if (/^[/\\]{2}/.test(val) || !SAFE_SVG_URI_REGEX.test(val)) {
         data.keepAttr = false;
-        return;
-      }
-      if (node.tagName.toLowerCase() === 'use' && (attrName === 'href' || attrName === 'xlink:href')) {
-        if (!SAFE_CSS_FRAGMENT_REGEX.test(val)) {
-          data.keepAttr = false;
-        }
       }
     }
   };
@@ -304,6 +506,21 @@ export function sanitizeMermaidSvg(svg: string): string {
         'onfocus',
         'onblur',
         'onmouseenter',
+        'background',
+        'src',
+        'srcset',
+        'poster',
+        'data',
+        'ping',
+        'action',
+        'formaction',
+        'cite',
+        'dynsrc',
+        'lowsrc',
+        'longdesc',
+        'profile',
+        'codebase',
+        'archive',
       ],
       ALLOWED_URI_REGEXP: SAFE_SVG_URI_REGEX,
     });
