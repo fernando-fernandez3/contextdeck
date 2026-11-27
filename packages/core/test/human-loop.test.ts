@@ -1459,3 +1459,47 @@ describe('B3 Hardening Round 2 G2: Doc/HTML/JSON file updates and Quiz version b
     expect(ok.quiz.attempts[1].quizVersion).toBe(2);
   });
 });
+
+describe('B3 Hardening Round 3 G2: Paste Update diagram kind preservation (R3-2)', () => {
+  it('R3-2: applyContextUpdate preserves excalidraw kind when kind omitted', async () => {
+    const dir = await makeTempDir('cdeck-r3-2-core-');
+    const store = new core.ContextDeckStore(dir);
+    await store.createBoard({ title: 'R3-2 Core', slug: 'main' });
+
+    const created = await store.upsertDiagram('main', {
+      title: 'Whiteboard',
+      kind: 'excalidraw',
+      content: JSON.stringify({ type: 'excalidraw', version: 2, elements: [{ id: 'e1' }] }),
+    });
+    expect(created.kind).toBe('excalidraw');
+
+    const payload = core.parseContextUpdatePayload(
+      JSON.stringify({
+        diagrams: [
+          {
+            id: created.id,
+            title: 'Whiteboard Updated',
+            content: JSON.stringify({ type: 'excalidraw', version: 2, elements: [{ id: 'e2' }] }),
+          },
+          {
+            title: 'New Default Diagram',
+            content: 'flowchart LR\n  A --> B',
+          },
+        ],
+      }),
+    );
+
+    const applied = await store.applyContextUpdate('main', payload);
+    const updated = applied.snapshot.diagrams.find((d) => d.id === created.id);
+    expect(updated?.kind).toBe('excalidraw');
+    expect(updated?.version).toBe(2);
+
+    const diagramsDir = path.join(dir, '.contextdeck', 'boards', 'main', 'diagrams');
+    const files = await fs.readdir(diagramsDir);
+    expect(files).toContain(`${created.id}.excalidraw`);
+    expect(files).not.toContain(`${created.id}.mmd`);
+
+    const createdDefault = applied.snapshot.diagrams.find((d) => d.title === 'New Default Diagram');
+    expect(createdDefault?.kind).toBe('mermaid');
+  });
+});

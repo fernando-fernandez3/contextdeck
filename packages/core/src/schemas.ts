@@ -922,7 +922,7 @@ export const ContextUpdatePayloadSchema = z
           .object({
             id: EntityIdSchema.optional(),
             title: z.string().min(1).max(300),
-            kind: DiagramKindSchema.default('mermaid'),
+            kind: DiagramKindSchema.optional(),
             content: z.string().min(1).max(512 * 1024),
             description: z.string().max(20 * 1024).optional(),
             basedOnDecisions: z.array(EntityIdSchema).optional(),

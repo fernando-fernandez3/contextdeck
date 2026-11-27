@@ -718,3 +718,61 @@ describe('B3 Hardening Round 3 G1: Server SPA Content-Security-Policy (R3-1)', (
     }
   });
 });
+
+describe('B3 Hardening Round 3 G2: MCP diagram_upsert kind preservation (R3-2)', () => {
+  it('R3-2: MCP diagram_upsert preserves excalidraw kind and writes no .mmd when kind omitted', async () => {
+    const dir = await makeTempDir('cdeck-r3-2-mcp-');
+    const store = new ContextDeckStore(dir);
+    await store.createBoard({ title: 'R3-2 MCP', slug: 'main' });
+
+    const created = await store.upsertDiagram('main', {
+      title: 'Whiteboard',
+      kind: 'excalidraw',
+      content: JSON.stringify({ type: 'excalidraw', version: 2, elements: [{ id: 'e1' }] }),
+    });
+    expect(created.kind).toBe('excalidraw');
+
+    const mcpServer = createContextDeckMcpServer(store, { defaultBoard: 'main' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'r3-2-test', version: '1.0.0' });
+    await Promise.all([mcpServer.connect(serverTransport), client.connect(clientTransport)]);
+
+    try {
+      // Update existing excalidraw diagram without specifying kind -> must preserve excalidraw and write no .mmd
+      const updateRes = await client.callTool({
+        name: 'diagram_upsert',
+        arguments: {
+          id: created.id,
+          title: 'Whiteboard Updated',
+          content: JSON.stringify({ type: 'excalidraw', version: 2, elements: [{ id: 'e2' }] }),
+        },
+      });
+      const updated = JSON.parse(
+        ((updateRes.content as Array<{ type: string; text: string }>)[0] ?? { text: '{}' }).text,
+      ) as { id: string; kind: string; version: number };
+      expect(updated.kind).toBe('excalidraw');
+      expect(updated.version).toBe(2);
+
+      const diagramsDir = path.join(dir, '.contextdeck', 'boards', 'main', 'diagrams');
+      const files = await fs.readdir(diagramsDir);
+      expect(files).toContain(`${created.id}.excalidraw`);
+      expect(files).not.toContain(`${created.id}.mmd`);
+
+      // Creating a new diagram without kind -> must still default to mermaid
+      const createRes = await client.callTool({
+        name: 'diagram_upsert',
+        arguments: {
+          title: 'Fresh Flowchart',
+          content: 'flowchart LR\n  A --> B',
+        },
+      });
+      const fresh = JSON.parse(
+        ((createRes.content as Array<{ type: string; text: string }>)[0] ?? { text: '{}' }).text,
+      ) as { id: string; kind: string };
+      expect(fresh.kind).toBe('mermaid');
+    } finally {
+      await client.close();
+      await mcpServer.close();
+    }
+  });
+});

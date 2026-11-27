@@ -416,7 +416,7 @@ export function createContextDeckMcpServer(
           board: BoardSlugSchema.optional(),
           id: EntityIdSchema.optional(),
           title: z.string().min(1).max(300),
-          kind: DiagramKindSchema.default('mermaid'),
+          kind: DiagramKindSchema.optional(),
           content: z.string().min(1).max(MCP_MAX_TEXT_CHARS),
           description: z.string().max(MCP_MAX_TEXT_CHARS).optional(),
           basedOnDecisions: z.array(EntityIdSchema).max(100).optional(),
